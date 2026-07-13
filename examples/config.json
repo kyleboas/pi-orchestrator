@@ -16,7 +16,8 @@
     },
     "Reviewer": {
       "backend": "pi-rpc",
-      "thinking": "medium"
+      "model": "another-provider/review-model-placeholder",
+      "thinking": "low"
     },
     "Fable": {
       "backend": "claude-code",
