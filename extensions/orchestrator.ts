@@ -7,8 +7,7 @@ import {
 	catalogText,
 	workerDescription,
 	workerNames,
-	resolveWorkerModel,
-	workerRpcArgs,
+	piRpcWorkerArgs,
 	type WorkerCatalog,
 	type WorkerProfile,
 } from "./orchestrator-lib/orchestrator-core.ts";
@@ -281,17 +280,15 @@ function handleClaudeLine(worker: Worker, line: string): void {
 	for (const event of parsed.events) settleClaudeResult(worker, event);
 }
 
-function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, inheritedModel?: string): Worker | undefined {
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
-	const model = resolveWorkerModel(profile, inheritedModel);
-	if (!model) return undefined;
 	const child = profile.backend === "pi-rpc"
-		? spawn(config.commands.pi, workerRpcArgs(model, profile.thinking), {
+		? spawn(config.commands.pi, piRpcWorkerArgs(profile), {
 			cwd,
 			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
 			stdio: ["pipe", "pipe", "pipe"],
 		})
-		: spawn(config.commands.claude, claudeCodeArgs(model), {
+		: spawn(config.commands.claude, claudeCodeArgs(profile.model), {
 			cwd,
 			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
 			stdio: ["pipe", "pipe", "pipe"],
@@ -359,7 +356,6 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const catalog = config.workers;
 	const catalogNames = catalogText(catalog);
 	const delegateWorkerSchema = createWorkerSchema(catalog);
-	let inheritedModel: string | undefined;
 
 	// Workers are unref'd so a settled -p host can exit; make sure that exit
 	// also reaps any still-running worker processes instead of orphaning them.
@@ -373,8 +369,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 	let takeoverReason = "explicit user request";
 	const solToolMode = new SolToolMode();
 
-	const activate = async (ctx: { modelRegistry: { find(provider: string, id: string): unknown }; model?: { provider?: string; id?: string }; cwd: string }) => {
-		if (!inheritedModel && ctx.model?.provider && ctx.model?.id) inheritedModel = `${ctx.model.provider}/${ctx.model.id}`;
+	const activate = async (ctx: { modelRegistry: { find(provider: string, id: string): unknown }; cwd: string }) => {
 		if (config.coordinator.provider && config.coordinator.id) {
 			const coordinator = ctx.modelRegistry.find(config.coordinator.provider, config.coordinator.id);
 			if (coordinator) void pi.setModel(coordinator as never).catch(() => {});
@@ -531,9 +526,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const name = params.worker as string;
-			const profile = catalog[name];
-			const worker = profile && launchWorker(name, profile, params.task, ctx.cwd, config, inheritedModel);
-			if (!worker) return content(`Cannot start ${name}: no current coordinator model is available for this Pi worker.`);
+			const worker = launchWorker(name, catalog[name]!, params.task, ctx.cwd, config);
 			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id });
 		},
 	});

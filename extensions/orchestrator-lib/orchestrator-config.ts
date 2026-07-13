@@ -16,12 +16,13 @@ const NAME = /^[A-Za-z][A-Za-z0-9 -]{0,48}$/;
 const THINKING = new Set<PiThinkingLevel>(["low", "medium", "high"]);
 
 export const DEFAULT_WORKERS: Record<string, WorkerProfile> = {
-	"Pi-High": { backend: "pi-rpc", thinking: "high" },
-	"Pi-Medium": { backend: "pi-rpc", thinking: "medium" },
-	"Pi-Low": { backend: "pi-rpc", thinking: "low" },
+	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high" },
+	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
+	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low" },
 	Opus: { backend: "claude-code", model: "opus" },
 	Sonnet: { backend: "claude-code", model: "sonnet" },
 	Haiku: { backend: "claude-code", model: "haiku" },
+	Fable: { backend: "claude-code", model: "fable" },
 };
 
 function nonempty(value: unknown): value is string {
@@ -42,8 +43,8 @@ function piModel(value: unknown): value is string {
 function profile(value: unknown): WorkerProfile | undefined {
 	if (!object(value)) return undefined;
 	if (value.backend === "pi-rpc") {
-		if (!THINKING.has(value.thinking as PiThinkingLevel) || (value.model !== undefined && !piModel(value.model))) return undefined;
-		return { backend: "pi-rpc", ...(value.model ? { model: value.model.trim() } : {}), thinking: value.thinking as PiThinkingLevel };
+		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model)) return undefined;
+		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel };
 	}
 	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim() };
 	return undefined;
