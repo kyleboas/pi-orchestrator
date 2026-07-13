@@ -1,0 +1,595 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { Type } from "typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	SolToolMode,
+	catalogText,
+	workerDescription,
+	workerNames,
+	resolveWorkerModel,
+	workerRpcArgs,
+	type WorkerCatalog,
+	type WorkerProfile,
+} from "./orchestrator-lib/orchestrator-core.ts";
+import {
+	claudeCodeArgs,
+	claudeResultSettlement,
+	claudeUsageTokenTotal,
+	claudeUserEvent,
+	parseClaudeStreamLine,
+} from "./orchestrator-lib/orchestrator-claude.ts";
+import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
+import {
+	beginWorkerRun,
+	beginWorkerSettlement,
+	canSteerWorker,
+	finishWorkerSettlement,
+	selectFinalWorkerText,
+	stopWorker,
+} from "./orchestrator-lib/worker-lifecycle.ts";
+import {
+	bindOrchestratorApi,
+	bindOrchestratorSession,
+	deliverWorkerReport,
+	ensureOrchestratorExitHook,
+	getOrchestratorRuntime,
+	notifyOrchestratorStateChange,
+	releaseOrchestratorSession,
+	type OrchestratorWorker as Worker,
+} from "./orchestrator-lib/orchestrator-runtime.ts";
+import { renderBaseFooter } from "./orchestrator-lib/orchestrator-footer.ts";
+import {
+	hasAnimatingWorker,
+	renderWorkerFooterRows,
+	renderWorkerPanel,
+	WORKER_WIDGET_TICK_MS,
+} from "./orchestrator-lib/orchestrator-ui.ts";
+
+const LEGACY_WORKER_WIDGET_ID = "orchestrator-workers";
+
+export function createWorkerSchema(catalog: WorkerCatalog) {
+	return Type.Union(workerNames(catalog).map((name) => Type.Literal(name, { description: workerDescription(name, catalog[name]!) })));
+}
+
+export function coordinatorInstructions(catalog: WorkerCatalog): string {
+	const names = catalogText(catalog);
+	return `You are the orchestration lead. You investigate, think, and plan yourself, then hand implementation to workers; you never mutate anything.
+
+Before delegating, use your read-only tools to inspect the relevant files, locate the root cause, and decide the approach. Then delegate with orchestrator_delegate, choosing one of: ${names}. Give a precise implementation brief: files to change, the change and why, edge cases, and validation. Workers implement your plan — do not send them off to investigate what you could determine yourself. Configured names are intentional: natural requests such as ${workerNames(catalog).map((name) => `“ask ${name}”`).join(", ")} select that worker.
+
+Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Do not use /end or request an end-of-task summary.
+
+If the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
+}
+
+function workerWidgetLines(now = Date.now(), width = 80): string[] | undefined {
+	return renderWorkerPanel([...getOrchestratorRuntime().workers.values()], now, width);
+}
+
+
+const TAKEOVER_SYSTEM_INSTRUCTIONS = (reason: string) => `
+The user explicitly requested a one-task Sol takeover (${reason}). Implement
+this task yourself using the available normal implementation tools. Do not
+delegate or use orchestrator worker controls. Complete the work and validation
+directly; orchestration resumes after this task settles.`.trim();
+
+function workerSummary(worker: Worker): string {
+	const age = Math.max(0, Math.floor((Date.now() - worker.startedAt.getTime()) / 1000));
+	return `${worker.name} (${worker.id}) — ${worker.state}, ${age}s — ${worker.task}`;
+}
+
+function content(text: string, details: Record<string, unknown> = {}) {
+	return { content: [{ type: "text" as const, text }], details };
+}
+
+function getText(message: unknown): string | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const candidate = message as { role?: unknown; content?: unknown };
+	if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return undefined;
+	const text = candidate.content
+		.filter((part): part is { type: string; text: string } =>
+			typeof part === "object" && part !== null &&
+			(part as { type?: unknown }).type === "text" &&
+			typeof (part as { text?: unknown }).text === "string",
+		)
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+	return text || undefined;
+}
+
+function getUsageTokens(message: unknown): number | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const usage = (message as { usage?: unknown }).usage;
+	if (!usage || typeof usage !== "object") return undefined;
+	const totalTokens = (usage as { totalTokens?: unknown }).totalTokens;
+	return typeof totalTokens === "number" && Number.isFinite(totalTokens) ? totalTokens : undefined;
+}
+
+function failWorker(worker: Worker, message: string): void {
+	if (worker.state === "stopped" || worker.state === "failed") return;
+	worker.state = "failed";
+	worker.lastError = message;
+	reportWorkerResult(worker);
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+}
+
+function sendRpc(worker: Worker, message: Record<string, unknown>): boolean {
+	if (!canSteerWorker(worker, worker.process)) return false;
+	try {
+		worker.process.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+			if (error) failWorker(worker, "Pi RPC worker stdin failed.");
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
+	if (!canSteerWorker(worker, worker.process)) return false;
+	try {
+		worker.process.stdin.write(`${JSON.stringify(claudeUserEvent(instructions))}\n`, (error) => {
+			if (error) failWorker(worker, "Claude Code worker stdin failed.");
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function sendWorkerInstruction(worker: Worker, instructions: string, steering = false): boolean {
+	if (worker.profile.backend === "claude-code") return sendClaudeInstruction(worker, instructions);
+	return sendRpc(worker, {
+		type: "prompt",
+		id: `${worker.id}:${steering ? randomUUID().slice(0, 8) : "initial"}`,
+		message: instructions,
+		...(steering ? { streamingBehavior: "steer" } : {}),
+	});
+}
+
+function requestWorkerRpc(worker: Worker, message: Record<string, unknown>): Promise<unknown> {
+	if (worker.profile.backend !== "pi-rpc" || !canSteerWorker(worker, worker.process)) return Promise.reject(new Error("Worker is not live."));
+	const id = `${worker.id}:rpc-${++worker.rpcNextId}`;
+	return new Promise((resolve, reject) => {
+		worker.rpcPending.set(id, { resolve, reject });
+		try {
+			worker.process.stdin.write(`${JSON.stringify({ ...message, id })}\n`, (error) => {
+				if (!error) return;
+				worker.rpcPending.delete(id);
+				reject(error);
+			});
+		} catch (error) {
+			worker.rpcPending.delete(id);
+			reject(error instanceof Error ? error : new Error(String(error)));
+		}
+	});
+}
+
+function rejectPendingRpc(worker: Worker, error: Error): void {
+	for (const pending of worker.rpcPending.values()) pending.reject(error);
+	worker.rpcPending.clear();
+}
+
+function reapIfHeadless(worker: Worker): void {
+	const runtime = getOrchestratorRuntime();
+	if (!runtime.headlessReap || worker.reportedRun !== worker.run) return;
+	if (worker.state !== "idle" && worker.state !== "failed") return;
+	stopWorker(worker);
+	worker.process.kill();
+}
+
+function reportWorkerResult(worker: Worker): void {
+	const result = worker.lastResult ?? worker.lastError ?? "Worker settled without a final text response.";
+	deliverWorkerReport(
+		getOrchestratorRuntime(),
+		worker,
+		`[${worker.name} worker result — ${worker.id}]\n${result}\n\nReview this result. If work remains, steer this worker or delegate a follow-up.`,
+	);
+	reapIfHeadless(worker);
+}
+
+/** Retry reports deferred while /reload had no live ExtensionAPI target. */
+function flushDeferredWorkerReports(): void {
+	for (const worker of getOrchestratorRuntime().workers.values()) {
+		if (worker.state === "idle" || worker.state === "failed") reportWorkerResult(worker);
+	}
+}
+
+async function settleWorker(worker: Worker): Promise<void> {
+	const run = beginWorkerSettlement(worker);
+	if (run === undefined) return;
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+	const response = await requestWorkerRpc(worker, { type: "get_last_assistant_text" }).catch(() => undefined);
+	const latest = response && typeof response === "object" && typeof (response as { text?: unknown }).text === "string"
+		? (response as { text: string }).text
+		: undefined;
+	const text = selectFinalWorkerText(worker.lastResult, latest);
+	if (text) worker.lastResult = text;
+	if (finishWorkerSettlement(worker, run)) reportWorkerResult(worker);
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+}
+
+function settleClaudeResult(worker: Worker, event: Record<string, unknown>): void {
+	const settlement = claudeResultSettlement(event);
+	if (!settlement) return;
+	const run = beginWorkerSettlement(worker);
+	if (run === undefined) return;
+	worker.claudeSessionId = settlement.sessionId ?? worker.claudeSessionId;
+	const tokens = claudeUsageTokenTotal(settlement.usage);
+	if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
+	if (settlement.isError || !settlement.result) {
+		worker.settlingRun = undefined;
+		worker.state = "failed";
+		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
+		reportWorkerResult(worker);
+	} else {
+		worker.lastResult = settlement.result;
+		if (finishWorkerSettlement(worker, run)) reportWorkerResult(worker);
+	}
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+}
+
+function handleRpcLine(worker: Worker, line: string): void {
+	let event: Record<string, unknown>;
+	try {
+		event = JSON.parse(line) as Record<string, unknown>;
+	} catch {
+		failWorker(worker, "Invalid Pi RPC worker output.");
+		return;
+	}
+
+	if (event.type === "response" && typeof event.id === "string") {
+		const pending = worker.rpcPending.get(event.id);
+		if (pending) {
+			worker.rpcPending.delete(event.id);
+			if (event.success === false) pending.reject(new Error("Worker RPC failed."));
+			else pending.resolve(event.data);
+		}
+		return;
+	}
+
+	switch (event.type) {
+		case "agent_start":
+			if (worker.state !== "stopped" && worker.state !== "failed") worker.state = "working";
+			break;
+		case "message_end":
+		case "turn_end": {
+			const text = getText(event.message);
+			if (text) worker.lastResult = text;
+			const tokens = getUsageTokens(event.message);
+			if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
+			break;
+		}
+		case "agent_settled":
+			void settleWorker(worker);
+			break;
+		case "error":
+			failWorker(worker, "Pi RPC worker reported an error.");
+			break;
+	}
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+}
+
+function handleClaudeLine(worker: Worker, line: string): void {
+	const parsed = parseClaudeStreamLine(line);
+	if (!parsed.ok) {
+		failWorker(worker, "Invalid Claude Code stream JSON.");
+		return;
+	}
+	for (const event of parsed.events) settleClaudeResult(worker, event);
+}
+
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, inheritedModel?: string): Worker | undefined {
+	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
+	const model = resolveWorkerModel(profile, inheritedModel);
+	if (!model) return undefined;
+	const child = profile.backend === "pi-rpc"
+		? spawn(config.commands.pi, workerRpcArgs(model, profile.thinking), {
+			cwd,
+			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
+			stdio: ["pipe", "pipe", "pipe"],
+		})
+		: spawn(config.commands.claude, claudeCodeArgs(model), {
+			cwd,
+			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+	const worker: Worker = {
+		id,
+		name,
+		profile,
+		task,
+		cwd,
+		process: child,
+		state: "starting",
+		run: 1,
+		startedAt: new Date(),
+		buffer: "",
+		rpcNextId: 0,
+		rpcPending: new Map(),
+	};
+	getOrchestratorRuntime().workers.set(id, worker);
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+
+	child.stdout.on("data", (chunk: Buffer) => {
+		worker.buffer += chunk.toString("utf8");
+		let newline: number;
+		while ((newline = worker.buffer.indexOf("\n")) >= 0) {
+			const line = worker.buffer.slice(0, newline).trim();
+			worker.buffer = worker.buffer.slice(newline + 1);
+			if (line) {
+				if (worker.profile.backend === "pi-rpc") handleRpcLine(worker, line);
+				else handleClaudeLine(worker, line);
+			}
+		}
+	});
+	child.stderr.on("data", (chunk: Buffer) => {
+		// Do not retain stderr: it can include local auth/config details. Exit and
+		// stdin paths below report a safe, actionable status instead.
+		if (chunk.length && worker.state !== "stopped") worker.lastError ??= `${worker.profile.backend === "claude-code" ? "Claude Code" : "Pi RPC"} worker reported stderr.`;
+	});
+	child.on("error", () => {
+		rejectPendingRpc(worker, new Error("Worker process failed to start."));
+		failWorker(worker, "Worker process failed to start.");
+	});
+	child.on("exit", (code, signal) => {
+		rejectPendingRpc(worker, new Error("Worker process exited."));
+		if (worker.state !== "stopped" && worker.state !== "idle") {
+			failWorker(worker, code === 0
+				? "Worker process exited before returning a result."
+				: `Worker exited with code ${code ?? "null"} (${signal ?? "no signal"}).`);
+		}
+		notifyOrchestratorStateChange(getOrchestratorRuntime());
+	});
+
+	const prompt = `You are ${name}, an implementation worker. Work directly in ${cwd}.
+
+${task}
+
+Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Sol receives your final response directly and may send follow-up instructions while you work.`;
+	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
+	return worker;
+}
+
+export default function orchestrator(pi: ExtensionAPI) {
+	if (process.env.PI_ORCHESTRATOR_WORKER === "1") return;
+	const config = loadOrchestratorConfig();
+	const catalog = config.workers;
+	const catalogNames = catalogText(catalog);
+	const delegateWorkerSchema = createWorkerSchema(catalog);
+	let inheritedModel: string | undefined;
+
+	// Workers are unref'd so a settled -p host can exit; make sure that exit
+	// also reaps any still-running worker processes instead of orphaning them.
+	const runtime = getOrchestratorRuntime();
+	const generation = bindOrchestratorApi(runtime, pi);
+	ensureOrchestratorExitHook(runtime);
+	flushDeferredWorkerReports();
+
+	let refreshWorkerWidget = () => {};
+	let stopWorkerWidgetTimer = () => {};
+	let takeoverReason = "explicit user request";
+	const solToolMode = new SolToolMode();
+
+	const activate = async (ctx: { modelRegistry: { find(provider: string, id: string): unknown }; model?: { provider?: string; id?: string }; cwd: string }) => {
+		if (!inheritedModel && ctx.model?.provider && ctx.model?.id) inheritedModel = `${ctx.model.provider}/${ctx.model.id}`;
+		if (config.coordinator.provider && config.coordinator.id) {
+			const coordinator = ctx.modelRegistry.find(config.coordinator.provider, config.coordinator.id);
+			if (coordinator) void pi.setModel(coordinator as never).catch(() => {});
+		}
+		pi.setThinkingLevel(config.coordinator.thinking);
+		pi.setActiveTools(solToolMode.activate(pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)));
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		stopWorkerWidgetTimer();
+		refreshWorkerWidget = () => {};
+		await activate(ctx);
+		// RPC workers never create footer components or timers.
+		if (!ctx.hasUI || ctx.mode !== "tui") {
+			bindOrchestratorSession(runtime, generation, pi, () => {}, true, () => {});
+			flushDeferredWorkerReports();
+			return;
+		}
+
+		// Remove the old above-footer widget if this session was reloaded.
+		ctx.ui.setWidget(LEGACY_WORKER_WIDGET_ID, undefined);
+		let timer: ReturnType<typeof setInterval> | undefined;
+		let footerInstalled = false;
+		let requestFooterRender = () => {};
+		const stopTimer = () => {
+			if (timer !== undefined) clearInterval(timer);
+			timer = undefined;
+		};
+		const removeFooter = () => {
+			if (!footerInstalled) return;
+			footerInstalled = false;
+			requestFooterRender = () => {};
+			ctx.ui.setFooter(undefined); // Restore Pi's native footer when workers settle.
+		};
+		const installFooter = () => {
+			if (footerInstalled) {
+				requestFooterRender();
+				return;
+			}
+			footerInstalled = true;
+			ctx.ui.setFooter((tui, theme, footerData) => {
+				requestFooterRender = () => tui.requestRender();
+				const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
+				return {
+					render: (width: number) => [
+						...renderBaseFooter(ctx as never, footerData as never, theme as never, pi.getThinkingLevel(), width),
+						...renderWorkerFooterRows(workerWidgetLines(Date.now(), width), theme),
+					],
+					invalidate: () => tui.requestRender(),
+					dispose: unsubscribe,
+				};
+			});
+		};
+		const render = () => {
+			if (hasAnimatingWorker([...runtime.workers.values()])) installFooter();
+			else removeFooter();
+		};
+		const reconcileTimer = () => {
+			if (!hasAnimatingWorker([...runtime.workers.values()])) {
+				stopTimer();
+				return;
+			}
+			if (timer === undefined) {
+				timer = setInterval(() => {
+					// Only redraw local in-memory state; no I/O, RPC, subprocess, or model call.
+					render();
+					if (!hasAnimatingWorker([...runtime.workers.values()])) stopTimer();
+				}, WORKER_WIDGET_TICK_MS);
+			}
+		};
+		const disposeUi = () => {
+			stopTimer();
+			removeFooter();
+			ctx.ui.setWidget(LEGACY_WORKER_WIDGET_ID, undefined);
+		};
+		stopWorkerWidgetTimer = disposeUi;
+		refreshWorkerWidget = () => {
+			render(); // Lifecycle transitions are reflected immediately.
+			reconcileTimer();
+		};
+		if (!bindOrchestratorSession(runtime, generation, pi, refreshWorkerWidget, false, disposeUi)) return;
+		flushDeferredWorkerReports();
+		refreshWorkerWidget();
+	});
+
+	pi.on("session_shutdown", () => {
+		// A stale /reload callback cannot detach the newer generation's bindings.
+		releaseOrchestratorSession(runtime, generation);
+	});
+
+	pi.on("input", async (event) => {
+		// Worker-result follow-ups are extension messages, not a user asking Sol
+		// to take over. Only an explicit user/RPC request can enable this escape
+		// hatch, and agent_settled restores orchestration afterward.
+		if (event.source === "extension") return { action: "continue" };
+		const takeoverTools = solToolMode.beginTakeover(
+			event.text,
+			pi.getActiveTools(),
+			pi.getAllTools().map((tool) => tool.name),
+		);
+		if (!takeoverTools) return { action: "continue" };
+		pi.setActiveTools(takeoverTools);
+		return { action: "continue" };
+	});
+
+	pi.on("before_agent_start", async (event) => ({
+		systemPrompt: `${event.systemPrompt}\n\n${solToolMode.takeoverActive
+			? TAKEOVER_SYSTEM_INSTRUCTIONS(takeoverReason)
+			: coordinatorInstructions(catalog)}`,
+	}));
+
+	pi.on("agent_settled", async () => {
+		const restrictedTools = solToolMode.settle();
+		if (restrictedTools) pi.setActiveTools(restrictedTools);
+		// Do not let a stale generation reap workers after a reload. Deferred
+		// reports stay live until a current API target accepts them.
+		if (runtime.generation !== generation || !runtime.headlessReap) return;
+		for (const worker of runtime.workers.values()) reapIfHeadless(worker);
+	});
+
+	pi.registerCommand("orchestrator", {
+		description: `Activate orchestration mode (${catalogNames} are persistent workers)`,
+		handler: async (_args, ctx) => {
+			await activate(ctx);
+			ctx.ui.notify(`Orchestration mode is active. Delegate to ${catalogNames}.`, "info");
+		},
+	});
+
+	pi.registerTool({
+		name: "orchestrator_takeover",
+		label: "Take over implementation",
+		description: "Call once, exactly when the user has explicitly asked Sol to implement a task directly instead of delegating (any phrasing — 'do it yourself', 'fix it yourself', 'without delegating', etc). Judge intent yourself; do not wait for a fixed phrase. Enables normal implementation tools for exactly one task and starts a follow-up turn to do the work; orchestration resumes automatically once that task settles. Do not call this for routine implementation requests — those go through orchestrator_delegate.",
+		parameters: Type.Object({
+			reason: Type.String({ description: "Short paraphrase of the user's explicit request to skip delegation." }),
+		}),
+		execute: async (_toolCallId, params) => {
+			takeoverReason = params.reason;
+			pi.setActiveTools(solToolMode.beginTakeoverTool(pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)));
+			pi.sendUserMessage(
+				"Takeover enabled. Implement the task directly now with the available tools — do not delegate. Orchestration resumes automatically once this task settles.",
+				{ deliverAs: "followUp" },
+			);
+			return content(`Takeover enabled (${params.reason}). Continuing in a follow-up turn with direct implementation tools.`);
+		},
+	});
+
+	pi.registerTool({
+		name: "orchestrator_delegate",
+		label: "Delegate to worker",
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator.`,
+		parameters: Type.Object({
+			worker: delegateWorkerSchema,
+			task: Type.String({ description: "Implementation brief built from YOUR OWN investigation: state the root cause or design you already determined, the exact files and changes to make, edge cases, and the validation to run. Never ask the worker to 'diagnose', 'investigate', or 'find' something you already read — hand it your conclusions and acceptance criteria." }),
+		}),
+		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+			const name = params.worker as string;
+			const profile = catalog[name];
+			const worker = profile && launchWorker(name, profile, params.task, ctx.cwd, config, inheritedModel);
+			if (!worker) return content(`Cannot start ${name}: no current coordinator model is available for this Pi worker.`);
+			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id });
+		},
+	});
+
+	pi.registerTool({
+		name: "orchestrator_steer",
+		label: "Steer worker",
+		description: `Send immediate follow-up instructions to a live configured worker (${catalogNames}). Use this to correct scope, request tests, or review fixes without ending it.`,
+		parameters: Type.Object({
+			workerId: Type.String({ description: "Worker ID returned by orchestrator_delegate." }),
+			instructions: Type.String({ description: "Concrete follow-up instructions for the worker." }),
+		}),
+		execute: async (_toolCallId, params) => {
+			const worker = runtime.workers.get(params.workerId);
+			if (!worker) return content(`No worker exists with ID ${params.workerId}.`);
+			if (!canSteerWorker(worker, worker.process)) {
+				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
+			}
+			// A stream-json Claude turn (and a Pi RPC steer) belongs to a new
+			// lifecycle generation before it is written, so a late prior result
+			// cannot settle or report this follow-up.
+			beginWorkerRun(worker);
+			worker.lastResult = undefined;
+			worker.lastError = undefined;
+			if (!sendWorkerInstruction(worker, params.instructions, true)) {
+				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
+				return content(`${worker.id} could not accept follow-up instructions.`);
+			}
+			refreshWorkerWidget();
+			return content(`Sent follow-up instructions to ${worker.id}.`);
+		},
+	});
+
+	pi.registerTool({
+		name: "orchestrator_workers",
+		label: "Worker status",
+		description: `List persistent configured workers (${catalogNames}) and their current state.`,
+		parameters: Type.Object({}),
+		execute: async () => {
+			const active = [...runtime.workers.values()];
+			return content(active.length ? active.map(workerSummary).join("\n") : "No workers have been started.");
+		},
+	});
+
+	pi.registerTool({
+		name: "orchestrator_stop",
+		label: "Stop worker",
+		description: "Stop a persistent worker only when its work is no longer needed.",
+		parameters: Type.Object({ workerId: Type.String() }),
+		execute: async (_toolCallId, params) => {
+			const worker = runtime.workers.get(params.workerId);
+			if (!worker) return content(`No worker exists with ID ${params.workerId}.`);
+			stopWorker(worker);
+			worker.process.kill();
+			refreshWorkerWidget();
+			return content(`Stopped ${worker.id}.`);
+		},
+	});
+}
