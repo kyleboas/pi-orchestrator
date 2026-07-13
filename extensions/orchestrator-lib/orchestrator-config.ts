@@ -1,0 +1,101 @@
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import type { PiThinkingLevel, WorkerProfile } from "./orchestrator-core.ts";
+
+export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
+export type OrchestratorConfig = {
+	coordinator: CoordinatorConfig;
+	commands: { pi: string; claude: string };
+	workers: Record<string, WorkerProfile>;
+	warning?: string;
+};
+
+type Json = Record<string, unknown>;
+const NAME = /^[A-Za-z][A-Za-z0-9 -]{0,48}$/;
+const THINKING = new Set<PiThinkingLevel>(["low", "medium", "high"]);
+
+export const DEFAULT_WORKERS: Record<string, WorkerProfile> = {
+	"Pi-High": { backend: "pi-rpc", thinking: "high" },
+	"Pi-Medium": { backend: "pi-rpc", thinking: "medium" },
+	"Pi-Low": { backend: "pi-rpc", thinking: "low" },
+	Opus: { backend: "claude-code", model: "opus" },
+	Sonnet: { backend: "claude-code", model: "sonnet" },
+	Haiku: { backend: "claude-code", model: "haiku" },
+};
+
+function nonempty(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+function object(value: unknown): value is Json {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function expandHome(path: string): string {
+	return path === "~" || path.startsWith("~/") ? resolve(homedir(), path.slice(2)) : path;
+}
+function command(value: unknown, fallback: string): string {
+	return nonempty(value) && !/[\r\n\0]/.test(value) ? value.trim() : fallback;
+}
+function piModel(value: unknown): value is string {
+	return nonempty(value) && /^[^/\s]+\/[^/\s]+$/.test(value.trim());
+}
+function profile(value: unknown): WorkerProfile | undefined {
+	if (!object(value)) return undefined;
+	if (value.backend === "pi-rpc") {
+		if (!THINKING.has(value.thinking as PiThinkingLevel) || (value.model !== undefined && !piModel(value.model))) return undefined;
+		return { backend: "pi-rpc", ...(value.model ? { model: value.model.trim() } : {}), thinking: value.thinking as PiThinkingLevel };
+	}
+	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim() };
+	return undefined;
+}
+function workers(value: unknown): Record<string, WorkerProfile> | undefined {
+	const entries: [string, unknown][] = Array.isArray(value)
+		? value.map((item): [string, unknown] | undefined => object(item) && nonempty(item.name) ? [item.name.trim(), item] : undefined).filter((item): item is [string, unknown] => !!item)
+		: object(value) ? Object.entries(value) : [];
+	if (!entries.length || (Array.isArray(value) && entries.length !== value.length)) return undefined;
+	const seen = new Set<string>();
+	const output: Record<string, WorkerProfile> = {};
+	for (const [name, raw] of entries) {
+		const key = name.toLowerCase();
+		const parsed = profile(raw);
+		if (!NAME.test(name) || seen.has(key) || !parsed) return undefined;
+		seen.add(key);
+		output[name] = parsed;
+	}
+	return output;
+}
+function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, ...(warning ? { warning } : {}) };
+}
+
+/** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
+export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): OrchestratorConfig {
+	const requested = nonempty(env.PI_ORCHESTRATOR_CONFIG) ? expandHome(env.PI_ORCHESTRATOR_CONFIG.trim()) : resolve(homedir(), ".config/pi-orchestrator/config.json");
+	const explicit = nonempty(env.PI_ORCHESTRATOR_CONFIG);
+	if (!existsSync(requested)) return defaults(env, explicit ? "Orchestrator configuration was unavailable; using defaults." : undefined);
+	try {
+		const raw: unknown = JSON.parse(readFileSync(requested, "utf8"));
+		if (!object(raw)) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
+		const configuredWorkers = workers(raw.workers);
+		if (!configuredWorkers) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
+		const coordinatorRaw = raw.coordinator === undefined ? {} : raw.coordinator;
+		if (!object(coordinatorRaw) || !THINKING.has((coordinatorRaw.thinking ?? "high") as PiThinkingLevel) ||
+			(coordinatorRaw.provider !== undefined && !nonempty(coordinatorRaw.provider)) ||
+			(coordinatorRaw.id !== undefined && !nonempty(coordinatorRaw.id))) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
+		const commandsRaw = raw.commands === undefined ? {} : raw.commands;
+		if (!object(commandsRaw)) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
+		return {
+			coordinator: {
+				...(nonempty(coordinatorRaw.provider) ? { provider: coordinatorRaw.provider.trim() } : {}),
+				...(nonempty(coordinatorRaw.id) ? { id: coordinatorRaw.id.trim() } : {}),
+				thinking: (coordinatorRaw.thinking ?? "high") as PiThinkingLevel,
+			},
+			commands: {
+				pi: command(env.PI_ORCHESTRATOR_PI_BIN, command(commandsRaw.pi, "pi")),
+				claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
+			}, workers: configuredWorkers,
+		};
+	} catch {
+		return defaults(env, "Orchestrator configuration was invalid; using defaults.");
+	}
+}

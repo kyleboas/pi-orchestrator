@@ -1,0 +1,25 @@
+{
+  "name": "@kyleboas/pi-orchestrator",
+  "version": "0.1.0",
+  "description": "Persistent worker orchestration extension for Pi",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "orchestrator", "coding-agent"],
+  "files": ["extensions", "README.md", "LICENSE", "examples"],
+  "pi": { "extensions": ["./extensions/orchestrator.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  },
+  "scripts": {
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx -e \"import('./extensions/orchestrator.ts')\""
+  },
+  "engines": { "node": ">=24" }
+}

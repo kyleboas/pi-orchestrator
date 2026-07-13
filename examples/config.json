@@ -1,0 +1,26 @@
+{
+  "coordinator": {
+    "provider": "example-provider",
+    "id": "coordinator-model-placeholder",
+    "thinking": "high"
+  },
+  "commands": {
+    "pi": "pi",
+    "claude": "claude-auto"
+  },
+  "workers": {
+    "Builder": {
+      "backend": "pi-rpc",
+      "model": "example-provider/implementation-model-placeholder",
+      "thinking": "high"
+    },
+    "Reviewer": {
+      "backend": "pi-rpc",
+      "thinking": "medium"
+    },
+    "Fable": {
+      "backend": "claude-code",
+      "model": "fable-custom-alias-placeholder"
+    }
+  }
+}
