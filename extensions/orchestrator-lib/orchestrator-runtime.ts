@@ -36,6 +36,8 @@ export type OrchestratorRuntime = {
 	onStateChange?: () => void;
 	headlessReap: boolean;
 	exitHookInstalled: boolean;
+	/** Worker session view is open: hold result reports so no coordinator turn starts and rewrites the screen. */
+	reportsHeld?: boolean;
 	generation?: symbol;
 	disposeUi?: () => void;
 };
@@ -122,6 +124,7 @@ export function notifyOrchestratorStateChange(runtime: OrchestratorRuntime): voi
  * targets intentionally leave the run pending for the next generation.
  */
 export function deliverWorkerReport(runtime: OrchestratorRuntime, worker: OrchestratorWorker, text: string): boolean {
+	if (runtime.reportsHeld) return false;
 	if (worker.state === "stopped" || worker.reportedRun === worker.run || worker.reportingRun === worker.run) return false;
 	const api = runtime.api;
 	if (!api) return false;

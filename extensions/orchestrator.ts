@@ -505,14 +505,29 @@ export default function orchestrator(pi: ExtensionAPI) {
 					.catch(() => {});
 			}
 			viewerOpen = true;
+			// Minimize writes under the overlay: pi's overlay lives in a
+			// line-indexed buffer, so any base-screen change rewrites the whole
+			// viewport. Hide the streaming loader and hold worker reports (which
+			// would start a coordinator turn) until the view closes.
+			runtime.reportsHeld = true;
+			ctx.ui.setWorkingVisible(false);
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
 						let scrollUp = 0;
 						let cachedKey = "";
 						let cachedBody: string[] = [];
-						// Live view: poll local state only; no I/O or model calls.
-						const tick = setInterval(() => tui.requestRender(), 500);
+						// Live view: poll local state only, and only redraw when the
+						// transcript actually changed; no I/O or model calls.
+						let lastSignature = "";
+						const tick = setInterval(() => {
+							const worker = runtime.workers.get(workerId);
+							const signature = worker ? `${worker.transcript?.length ?? 0}:${worker.state}` : "gone";
+							if (signature !== lastSignature) {
+								lastSignature = signature;
+								tui.requestRender();
+							}
+						}, 500);
 						// Native pi look: transcript entries render through pi's own
 						// message components (markdown, theme colors, word wrap).
 						const buildBody = (transcript: readonly { role: string; text: string }[], width: number): string[] => {
@@ -579,6 +594,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 				.catch(() => {})
 				.finally(() => {
 					viewerOpen = false;
+					runtime.reportsHeld = false;
+					ctx.ui.setWorkingVisible(true);
+					flushDeferredWorkerReports();
 					redraw();
 				});
 		};
@@ -617,6 +635,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 		const disposeUi = () => {
 			unsubscribeInput();
 			selectedWorkerId = undefined;
+			runtime.reportsHeld = false;
 			stopTimer();
 			removeFooter();
 			ctx.ui.setWidget(LEGACY_WORKER_WIDGET_ID, undefined);
