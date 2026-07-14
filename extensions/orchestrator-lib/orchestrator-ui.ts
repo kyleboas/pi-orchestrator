@@ -88,9 +88,7 @@ export type WorkerPanelOptions = {
 
 /** Workers shown by the panel, in stable row order, for selection to walk. */
 export function panelWorkers(workers: WorkerPanelItem[], includeSettled = false): WorkerPanelItem[] {
-	return workers.filter((worker) =>
-		worker.state === "starting" || worker.state === "working" || (includeSettled && worker.state !== "stopped"),
-	);
+	return workers.filter((worker) => includeSettled || worker.state === "starting" || worker.state === "working");
 }
 
 /**

@@ -50,6 +50,8 @@ test("renderWorkerSession shows title, transcript tail, and scrolls", () => {
 	const worker = { name: "Terra", id: "terra-1", state: "working" as const, task: "task", transcript };
 	const followed = renderWorkerSession(worker, 60, 12, 0, theme);
 	assert.match(followed.lines[0]!, /Terra · working · terra-1/);
+	assert.equal(followed.lines.length, 12);
+	for (const line of followed.lines) assert.equal(Array.from(line).length, 60);
 	assert.ok(followed.lines.some((line) => line.includes("line 29")));
 	assert.ok(followed.maxScrollUp > 0);
 	const scrolled = renderWorkerSession(worker, 60, 12, followed.maxScrollUp, theme);

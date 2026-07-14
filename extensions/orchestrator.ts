@@ -422,8 +422,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 		// rows, enter opens that worker's session view, esc/up-past-top returns.
 		let selectedWorkerId: string | undefined;
 		let viewerOpen = false;
-		const selectableWorkerIds = () =>
-			panelWorkers([...runtime.workers.values()], selectedWorkerId !== undefined).map((worker) => worker.id);
+		// Settled workers stay selectable so finished sessions can be reviewed
+		// even after the live footer rows have cleared.
+		const selectableWorkerIds = () => panelWorkers([...runtime.workers.values()], true).map((worker) => worker.id);
 		const stopTimer = () => {
 			if (timer !== undefined) clearInterval(timer);
 			timer = undefined;
@@ -483,7 +484,20 @@ export default function orchestrator(pi: ExtensionAPI) {
 			requestFooterRender();
 		};
 		const openWorkerSession = (workerId: string) => {
-			if (!runtime.workers.has(workerId)) return;
+			const opened = runtime.workers.get(workerId);
+			if (!opened) return;
+			// Workers launched by an older extension generation have no captured
+			// transcript; best-effort seed it with the worker's latest reply.
+			if (!opened.transcript?.length && opened.profile.backend === "pi-rpc" && canSteerWorker(opened, opened.process)) {
+				void requestWorkerRpc(opened, { type: "get_last_assistant_text" })
+					.then((response) => {
+						const text = response && typeof response === "object" && typeof (response as { text?: unknown }).text === "string"
+							? (response as { text: string }).text
+							: undefined;
+						if (text) appendTranscript(opened.transcript ??= [], "assistant", text);
+					})
+					.catch(() => {});
+			}
 			viewerOpen = true;
 			void ctx.ui
 				.custom<void>(
@@ -516,7 +530,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 							dispose: () => clearInterval(tick),
 						};
 					},
-					{ overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } },
+					{ overlay: true, overlayOptions: { width: "90%", anchor: "center" } },
 				)
 				.catch(() => {})
 				.finally(() => {
