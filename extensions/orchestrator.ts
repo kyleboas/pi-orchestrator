@@ -40,10 +40,27 @@ import {
 import { renderBaseFooter } from "./orchestrator-lib/orchestrator-footer.ts";
 import {
 	hasAnimatingWorker,
+	panelWorkers,
 	renderWorkerFooterRows,
 	renderWorkerPanel,
 	WORKER_WIDGET_TICK_MS,
+	type WorkerPanelOptions,
 } from "./orchestrator-lib/orchestrator-ui.ts";
+import {
+	appendTranscript,
+	transcriptFromClaudeEvent,
+	transcriptFromRpcEvent,
+} from "./orchestrator-lib/orchestrator-transcript.ts";
+import {
+	isDownKey,
+	isEnterKey,
+	isEscapeKey,
+	isPageDownKey,
+	isPageUpKey,
+	isUpKey,
+	moveSelection,
+	renderWorkerSession,
+} from "./orchestrator-lib/orchestrator-session-view.ts";
 
 const LEGACY_WORKER_WIDGET_ID = "orchestrator-workers";
 
@@ -62,8 +79,8 @@ Workers are persistent: use orchestrator_steer for corrections or follow-up inst
 If the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
 }
 
-function workerWidgetLines(now = Date.now(), width = 80): string[] | undefined {
-	return renderWorkerPanel([...getOrchestratorRuntime().workers.values()], now, width);
+function workerWidgetLines(now = Date.now(), width = 80, options: WorkerPanelOptions = {}): string[] | undefined {
+	return renderWorkerPanel([...getOrchestratorRuntime().workers.values()], now, width, options);
 }
 
 
@@ -239,6 +256,8 @@ function handleRpcLine(worker: Worker, line: string): void {
 		return;
 	}
 
+	for (const entry of transcriptFromRpcEvent(event)) appendTranscript(worker.transcript, entry.role, entry.text, entry.at);
+
 	if (event.type === "response" && typeof event.id === "string") {
 		const pending = worker.rpcPending.get(event.id);
 		if (pending) {
@@ -277,7 +296,10 @@ function handleClaudeLine(worker: Worker, line: string): void {
 		failWorker(worker, "Invalid Claude Code stream JSON.");
 		return;
 	}
-	for (const event of parsed.events) settleClaudeResult(worker, event);
+	for (const event of parsed.events) {
+		for (const entry of transcriptFromClaudeEvent(event)) appendTranscript(worker.transcript, entry.role, entry.text, entry.at);
+		settleClaudeResult(worker, event);
+	}
 }
 
 function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig): Worker {
@@ -304,6 +326,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		run: 1,
 		startedAt: new Date(),
 		buffer: "",
+		transcript: [],
 		rpcNextId: 0,
 		rpcPending: new Map(),
 	};
@@ -346,6 +369,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 ${task}
 
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Sol receives your final response directly and may send follow-up instructions while you work.`;
+	appendTranscript(worker.transcript, "user", task);
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
 	return worker;
 }
@@ -394,6 +418,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 		let timer: ReturnType<typeof setInterval> | undefined;
 		let footerInstalled = false;
 		let requestFooterRender = () => {};
+		// Footer keyboard selection: down from an empty editor enters the worker
+		// rows, enter opens that worker's session view, esc/up-past-top returns.
+		let selectedWorkerId: string | undefined;
+		let viewerOpen = false;
+		const selectableWorkerIds = () =>
+			panelWorkers([...runtime.workers.values()], selectedWorkerId !== undefined).map((worker) => worker.id);
 		const stopTimer = () => {
 			if (timer !== undefined) clearInterval(timer);
 			timer = undefined;
@@ -414,17 +444,25 @@ export default function orchestrator(pi: ExtensionAPI) {
 				requestFooterRender = () => tui.requestRender();
 				const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
 				return {
-					render: (width: number) => [
-						...renderBaseFooter(ctx as never, footerData as never, theme as never, pi.getThinkingLevel(), width),
-						...renderWorkerFooterRows(workerWidgetLines(Date.now(), width), theme),
-					],
+					render: (width: number) => {
+						const selecting = selectedWorkerId !== undefined;
+						const rows = renderWorkerFooterRows(
+							workerWidgetLines(Date.now(), width, { selectedId: selectedWorkerId, includeSettled: selecting }),
+							theme,
+						);
+						if (selecting && rows.length) rows.push(theme.fg("dim", "enter: view session · esc: back"));
+						return [
+							...renderBaseFooter(ctx as never, footerData as never, theme as never, pi.getThinkingLevel(), width),
+							...rows,
+						];
+					},
 					invalidate: () => tui.requestRender(),
 					dispose: unsubscribe,
 				};
 			});
 		};
 		const render = () => {
-			if (hasAnimatingWorker([...runtime.workers.values()])) installFooter();
+			if (hasAnimatingWorker([...runtime.workers.values()]) || selectedWorkerId !== undefined) installFooter();
 			else removeFooter();
 		};
 		const reconcileTimer = () => {
@@ -440,7 +478,86 @@ export default function orchestrator(pi: ExtensionAPI) {
 				}, WORKER_WIDGET_TICK_MS);
 			}
 		};
+		const redraw = () => {
+			render();
+			requestFooterRender();
+		};
+		const openWorkerSession = (workerId: string) => {
+			if (!runtime.workers.has(workerId)) return;
+			viewerOpen = true;
+			void ctx.ui
+				.custom<void>(
+					(tui, theme, _keybindings, done) => {
+						let scrollUp = 0;
+						// Live view: poll local state only; no I/O or model calls.
+						const tick = setInterval(() => tui.requestRender(), 500);
+						return {
+							render: (width: number) => {
+								const worker = runtime.workers.get(workerId);
+								if (!worker) return [theme.fg("dim", "Worker is gone.")];
+								const height = Math.max(12, (process.stdout.rows ?? 30) - 4);
+								const view = renderWorkerSession(worker, width, height, scrollUp, theme);
+								scrollUp = Math.min(scrollUp, view.maxScrollUp);
+								return view.lines;
+							},
+							handleInput: (data: string) => {
+								if (isUpKey(data)) scrollUp += 1;
+								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
+								else if (isPageUpKey(data)) scrollUp += 10;
+								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - 10);
+								else if (isEscapeKey(data) || data === "q") {
+									done(undefined);
+									return;
+								} else return;
+								tui.requestRender();
+							},
+							invalidate: () => {},
+							dispose: () => clearInterval(tick),
+						};
+					},
+					{ overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } },
+				)
+				.catch(() => {})
+				.finally(() => {
+					viewerOpen = false;
+					redraw();
+				});
+		};
+		const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
+			if (viewerOpen) return undefined;
+			if (selectedWorkerId === undefined) {
+				// Only an empty editor hands the down arrow over to the worker rows,
+				// so history navigation and multi-line editing keep their keys.
+				if (!isDownKey(data) || ctx.ui.getEditorText() !== "") return undefined;
+				const ids = selectableWorkerIds();
+				if (ids.length === 0) return undefined;
+				selectedWorkerId = moveSelection(ids, undefined, "down");
+				redraw();
+				return { consume: true };
+			}
+			if (isUpKey(data) || isDownKey(data)) {
+				selectedWorkerId = moveSelection(selectableWorkerIds(), selectedWorkerId, isUpKey(data) ? "up" : "down");
+				redraw();
+				return { consume: true };
+			}
+			if (isEnterKey(data)) {
+				openWorkerSession(selectedWorkerId);
+				redraw();
+				return { consume: true };
+			}
+			if (isEscapeKey(data)) {
+				selectedWorkerId = undefined;
+				redraw();
+				return { consume: true };
+			}
+			// Any other key returns focus to the editor and is handled normally.
+			selectedWorkerId = undefined;
+			redraw();
+			return undefined;
+		});
 		const disposeUi = () => {
+			unsubscribeInput();
+			selectedWorkerId = undefined;
 			stopTimer();
 			removeFooter();
 			ctx.ui.setWidget(LEGACY_WORKER_WIDGET_ID, undefined);
@@ -551,6 +668,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			beginWorkerRun(worker);
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
+			appendTranscript(worker.transcript, "user", params.instructions);
 			if (!sendWorkerInstruction(worker, params.instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
 				return content(`${worker.id} could not accept follow-up instructions.`);

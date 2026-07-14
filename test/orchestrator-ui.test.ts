@@ -13,6 +13,7 @@ const now = startedAt.getTime() + 2_000;
 
 function worker(overrides: Partial<WorkerPanelItem> = {}): WorkerPanelItem {
 	return {
+		id: "terra-1",
 		name: "Terra",
 		task: "Simple delegation test",
 		state: "working",

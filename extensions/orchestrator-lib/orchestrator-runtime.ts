@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { WorkerProfile } from "./orchestrator-core.ts";
+import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 import type { WorkerLifecycle } from "./worker-lifecycle.ts";
 
 /** Process-wide key: extension modules are replaced by /reload, globalThis is not. */
@@ -24,6 +25,7 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	claudeSessionId?: string;
 	tokens?: number;
 	buffer: string;
+	transcript: TranscriptEntry[];
 	rpcNextId: number;
 	rpcPending: Map<string, PendingRpc>;
 };

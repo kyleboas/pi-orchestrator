@@ -29,6 +29,7 @@ function worker(): OrchestratorWorker {
 		run: 1,
 		startedAt: new Date(),
 		buffer: "",
+		transcript: [],
 		rpcNextId: 0,
 		rpcPending: new Map(),
 	};
