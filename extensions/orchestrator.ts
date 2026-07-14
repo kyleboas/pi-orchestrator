@@ -509,7 +509,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 							render: (width: number) => {
 								const worker = runtime.workers.get(workerId);
 								if (!worker) return [theme.fg("dim", "Worker is gone.")];
-								const height = Math.max(12, (process.stdout.rows ?? 30) - 4);
+								const height = Math.max(12, process.stdout.rows ?? 30);
 								// Workers launched before this version predate the transcript field.
 								const view = renderWorkerSession({ ...worker, transcript: worker.transcript ?? [] }, width, height, scrollUp, theme);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
@@ -530,7 +530,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 							dispose: () => clearInterval(tick),
 						};
 					},
-					{ overlay: true, overlayOptions: { width: "90%", anchor: "center" } },
+					// Full-terminal takeover: extensions cannot swap pi's core chat
+					// view, so the session view covers it edge to edge instead.
+					{ overlay: true, overlayOptions: { width: "100%", anchor: "top-left", row: 0, col: 0 } },
 				)
 				.catch(() => {})
 				.finally(() => {

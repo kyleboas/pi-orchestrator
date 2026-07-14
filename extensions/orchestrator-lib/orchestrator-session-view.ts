@@ -93,10 +93,12 @@ function padTo(text: string, width: number): string {
 }
 
 /**
- * Render the worker session view as a solid bordered panel. Pi's overlay
- * compositor replaces exactly the cells a component emits, so every row must
- * be full-width and the panel must keep a fixed height — a content-sized,
- * borderless render bleeds into the chat text behind it.
+ * Render the worker session view as a full-screen takeover, like entering a
+ * subagent in Claude Code. Pi extensions cannot replace the core chat view,
+ * so this is a full-terminal overlay: every row must be padded to the full
+ * width and the view must fill the full height, because the compositor
+ * replaces exactly the cells a component emits — anything narrower or
+ * shorter lets the chat behind it bleed through.
  *
  * `scrollUp` counts wrapped lines up from the bottom (0 = follow live
  * output). Returns the lines plus the maximum meaningful scrollUp so callers
@@ -109,8 +111,8 @@ export function renderWorkerSession(
 	scrollUp: number,
 	theme: ViewerTheme,
 ): { lines: string[]; maxScrollUp: number } {
-	const panelWidth = Math.max(24, width);
-	const innerWidth = panelWidth - 4;
+	const fullWidth = Math.max(24, width);
+	const innerWidth = fullWidth - 2;
 	const body: { text: string; role: TranscriptEntry["role"] | "blank" }[] = [];
 	for (const entry of worker.transcript) {
 		const prefix = `${rolePrefix(entry.role)} `;
@@ -123,28 +125,24 @@ export function renderWorkerSession(
 	}
 	if (body.length === 0) body.push({ text: "No output yet.", role: "blank" });
 
-	const viewport = Math.max(3, height - 2);
+	const viewport = Math.max(3, height - 3);
 	const maxScrollUp = Math.max(0, body.length - viewport);
 	const clamped = Math.min(Math.max(0, scrollUp), maxScrollUp);
 	const end = body.length - clamped;
 	const visible = body.slice(Math.max(0, end - viewport), end);
 	while (visible.length < viewport) visible.push({ text: "", role: "blank" });
 
-	const title = ` ${worker.name} · ${worker.state} · ${worker.id} `;
-	const hints = ` ↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc: back `;
-	const rule = (label: string, edges: [string, string]) => {
-		const text = Array.from(label).slice(0, panelWidth - 2).join("");
-		const fill = "─".repeat(Math.max(0, panelWidth - 2 - Array.from(text).length));
-		return theme.fg("dim", edges[0]) + theme.fg("text", text) + theme.fg("dim", fill + edges[1]);
-	};
+	const title = `${worker.name} · ${worker.state} · ${worker.id}`;
+	const hints = `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to go back`;
+	const pad = (text: string) => padTo(` ${text}`, fullWidth);
 	const lines = [
-		rule(title, ["╭", "╮"]),
+		theme.fg("text", pad(title)),
+		theme.fg("dim", "─".repeat(fullWidth)),
 		...visible.map((row) => {
-			const content = padTo(row.text, innerWidth);
-			const painted = row.role === "assistant" ? theme.fg("text", content) : theme.fg("dim", content);
-			return theme.fg("dim", "│ ") + painted + theme.fg("dim", " │");
+			const content = pad(row.text);
+			return row.role === "assistant" ? theme.fg("text", content) : theme.fg("dim", content);
 		}),
-		rule(hints, ["╰", "╯"]),
+		theme.fg("dim", pad(hints)),
 	];
 	return { lines, maxScrollUp };
 }
