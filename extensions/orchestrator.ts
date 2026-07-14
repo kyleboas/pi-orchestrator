@@ -256,7 +256,7 @@ function handleRpcLine(worker: Worker, line: string): void {
 		return;
 	}
 
-	for (const entry of transcriptFromRpcEvent(event)) appendTranscript(worker.transcript, entry.role, entry.text, entry.at);
+	for (const entry of transcriptFromRpcEvent(event)) appendTranscript(worker.transcript ??= [], entry.role, entry.text, entry.at);
 
 	if (event.type === "response" && typeof event.id === "string") {
 		const pending = worker.rpcPending.get(event.id);
@@ -297,7 +297,7 @@ function handleClaudeLine(worker: Worker, line: string): void {
 		return;
 	}
 	for (const event of parsed.events) {
-		for (const entry of transcriptFromClaudeEvent(event)) appendTranscript(worker.transcript, entry.role, entry.text, entry.at);
+		for (const entry of transcriptFromClaudeEvent(event)) appendTranscript(worker.transcript ??= [], entry.role, entry.text, entry.at);
 		settleClaudeResult(worker, event);
 	}
 }
@@ -369,7 +369,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 ${task}
 
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Sol receives your final response directly and may send follow-up instructions while you work.`;
-	appendTranscript(worker.transcript, "user", task);
+	appendTranscript(worker.transcript ??= [], "user", task);
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
 	return worker;
 }
@@ -496,7 +496,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 								const worker = runtime.workers.get(workerId);
 								if (!worker) return [theme.fg("dim", "Worker is gone.")];
 								const height = Math.max(12, (process.stdout.rows ?? 30) - 4);
-								const view = renderWorkerSession(worker, width, height, scrollUp, theme);
+								// Workers launched before this version predate the transcript field.
+								const view = renderWorkerSession({ ...worker, transcript: worker.transcript ?? [] }, width, height, scrollUp, theme);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
 								return view.lines;
 							},
@@ -668,7 +669,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			beginWorkerRun(worker);
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
-			appendTranscript(worker.transcript, "user", params.instructions);
+			appendTranscript(worker.transcript ??= [], "user", params.instructions);
 			if (!sendWorkerInstruction(worker, params.instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
 				return content(`${worker.id} could not accept follow-up instructions.`);
