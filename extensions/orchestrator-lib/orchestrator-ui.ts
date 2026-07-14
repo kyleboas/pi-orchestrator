@@ -1,6 +1,7 @@
 export type WorkerPanelState = "starting" | "working" | "idle" | "failed" | "stopped";
 
 export type WorkerPanelItem = {
+	id: string;
 	name: string;
 	task: string;
 	state: WorkerPanelState;
@@ -78,6 +79,20 @@ function statusFor(worker: WorkerPanelItem, now: number): string {
 	return duration;
 }
 
+export type WorkerPanelOptions = {
+	/** Worker id highlighted by footer keyboard selection. */
+	selectedId?: string;
+	/** Include settled workers so finished sessions stay enterable while selecting. */
+	includeSettled?: boolean;
+};
+
+/** Workers shown by the panel, in stable row order, for selection to walk. */
+export function panelWorkers(workers: WorkerPanelItem[], includeSettled = false): WorkerPanelItem[] {
+	return workers.filter((worker) =>
+		worker.state === "starting" || worker.state === "working" || (includeSettled && worker.state !== "stopped"),
+	);
+}
+
 /**
  * Claude-style one-line subagent rows:
  *   ○ Terra  Inspect the repository                         2s · ↑ 21.7k tokens
@@ -89,12 +104,14 @@ export function renderWorkerPanel(
 	workers: WorkerPanelItem[],
 	now: number,
 	width = 80,
+	options: WorkerPanelOptions = {},
 ): string[] | undefined {
-	const visible = workers.filter((worker) => worker.state === "starting" || worker.state === "working");
+	const visible = panelWorkers(workers, options.includeSettled ?? false);
 	if (visible.length === 0) return undefined;
 
 	return visible.map((worker) => {
-		const glyph = glyphFor(worker.state);
+		const selected = options.selectedId !== undefined && worker.id === options.selectedId;
+		const glyph = selected ? "❯" : glyphFor(worker.state);
 		const prefix = `${glyph} ${worker.name}  `;
 		const status = statusFor(worker, now);
 		const minimumGap = 2;
