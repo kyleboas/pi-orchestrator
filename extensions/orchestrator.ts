@@ -1,7 +1,12 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	AssistantMessageComponent,
+	getMarkdownTheme,
+	UserMessageComponent,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import {
 	SolToolMode,
 	catalogText,
@@ -59,7 +64,8 @@ import {
 	isPageUpKey,
 	isUpKey,
 	moveSelection,
-	renderWorkerSession,
+	renderSessionScreen,
+	wrapPlainText,
 } from "./orchestrator-lib/orchestrator-session-view.ts";
 
 const LEGACY_WORKER_WIDGET_ID = "orchestrator-workers";
@@ -503,15 +509,51 @@ export default function orchestrator(pi: ExtensionAPI) {
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
 						let scrollUp = 0;
+						let cachedKey = "";
+						let cachedBody: string[] = [];
 						// Live view: poll local state only; no I/O or model calls.
 						const tick = setInterval(() => tui.requestRender(), 500);
+						// Native pi look: transcript entries render through pi's own
+						// message components (markdown, theme colors, word wrap).
+						const buildBody = (transcript: readonly { role: string; text: string }[], width: number): string[] => {
+							const key = `${transcript.length}:${width}`;
+							if (key === cachedKey) return cachedBody;
+							const markdownTheme = getMarkdownTheme();
+							const lines: string[] = [];
+							for (const entry of transcript) {
+								try {
+									if (entry.role === "user") {
+										lines.push(...new UserMessageComponent(entry.text, markdownTheme).render(width));
+									} else if (entry.role === "assistant") {
+										const message = { content: [{ type: "text", text: entry.text }] };
+										lines.push(...new AssistantMessageComponent(message as never, false, markdownTheme).render(width));
+									} else if (entry.role === "tool") {
+										const [first = "", ...rest] = entry.text.split(/\r?\n/);
+										lines.push(...wrapPlainText(first, width - 4).map((line, index) =>
+											theme.fg(index === 0 ? "toolTitle" : "toolOutput", index === 0 ? ` ⚒ ${line}` : `   ${line}`)));
+										for (const raw of rest) {
+											lines.push(...wrapPlainText(raw, width - 4).map((line) => theme.fg("toolOutput", `   ${line}`)));
+										}
+									} else {
+										lines.push(...wrapPlainText(entry.text, width - 2).map((line) => theme.fg("error", ` ${line}`)));
+									}
+								} catch {
+									lines.push(...wrapPlainText(entry.text, width - 2).map((line) => ` ${line}`));
+								}
+								lines.push("");
+							}
+							cachedKey = key;
+							cachedBody = lines;
+							return lines;
+						};
 						return {
 							render: (width: number) => {
 								const worker = runtime.workers.get(workerId);
 								if (!worker) return [theme.fg("dim", "Worker is gone.")];
 								const height = Math.max(12, process.stdout.rows ?? 30);
+								const title = `${worker.name} · ${worker.state} · ${worker.id}`;
 								// Workers launched before this version predate the transcript field.
-								const view = renderWorkerSession({ ...worker, transcript: worker.transcript ?? [] }, width, height, scrollUp, theme);
+								const view = renderSessionScreen(title, buildBody(worker.transcript ?? [], width), width, height, scrollUp, theme);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
 								return view.lines;
 							},

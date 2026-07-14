@@ -6,7 +6,8 @@ import {
 	isEscapeKey,
 	isUpKey,
 	moveSelection,
-	renderWorkerSession,
+	renderSessionScreen,
+	wrapPlainText,
 } from "../extensions/orchestrator-lib/orchestrator-session-view.ts";
 import {
 	appendTranscript,
@@ -42,27 +43,29 @@ test("moveSelection enters from the editor, walks rows, and exits past the top",
 	assert.equal(moveSelection(ids, "gone", "up"), "c");
 });
 
-test("renderWorkerSession shows title, transcript tail, and scrolls", () => {
-	const transcript: TranscriptEntry[] = [];
-	for (let index = 0; index < 30; index += 1) {
-		transcript.push({ at: 0, role: "assistant", text: `line ${index}` });
-	}
-	const worker = { name: "Terra", id: "terra-1", state: "working" as const, task: "task", transcript };
-	const followed = renderWorkerSession(worker, 60, 12, 0, theme);
+test("renderSessionScreen shows title, body tail, scrolls, and stays full-size", () => {
+	const body = Array.from({ length: 30 }, (_value, index) => `line ${index}`);
+	const followed = renderSessionScreen("Terra · working · terra-1", body, 60, 12, 0, theme);
 	assert.match(followed.lines[0]!, /Terra · working · terra-1/);
 	assert.equal(followed.lines.length, 12);
 	for (const line of followed.lines) assert.equal(Array.from(line).length, 60);
 	assert.ok(followed.lines.some((line) => line.includes("line 29")));
 	assert.ok(followed.maxScrollUp > 0);
-	const scrolled = renderWorkerSession(worker, 60, 12, followed.maxScrollUp, theme);
+	const scrolled = renderSessionScreen("Terra · working · terra-1", body, 60, 12, followed.maxScrollUp, theme);
 	assert.ok(scrolled.lines.some((line) => line.includes("line 0")));
 	assert.ok(!scrolled.lines.some((line) => line.includes("line 29")));
 });
 
-test("renderWorkerSession handles an empty transcript", () => {
-	const worker = { name: "Terra", id: "terra-1", state: "starting" as const, task: "task", transcript: [] };
-	const view = renderWorkerSession(worker, 60, 12, 0, theme);
+test("renderSessionScreen handles an empty body", () => {
+	const view = renderSessionScreen("Terra · starting · terra-1", [], 60, 12, 0, theme);
 	assert.ok(view.lines.some((line) => line.includes("No output yet.")));
+});
+
+test("wrapPlainText wraps at word boundaries and splits overlong words", () => {
+	assert.deepEqual(wrapPlainText("the quick brown fox jumps", 10), ["the quick", "brown fox", "jumps"]);
+	assert.deepEqual(wrapPlainText("short", 10), ["short"]);
+	assert.deepEqual(wrapPlainText("abcdefghijkl", 5), ["abcde", "fghij", "kl"]);
+	assert.deepEqual(wrapPlainText("", 10), [""]);
 });
 
 test("appendTranscript ignores blanks and stays bounded", () => {

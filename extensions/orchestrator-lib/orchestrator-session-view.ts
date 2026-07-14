@@ -53,43 +53,42 @@ export function moveSelection(
 	return index === 0 ? undefined : workerIds[index - 1];
 }
 
-function wrapLine(line: string, width: number): string[] {
-	if (width <= 0) return [line];
-	const chars = Array.from(line);
-	if (chars.length <= width) return [line];
-	const lines: string[] = [];
-	for (let start = 0; start < chars.length; start += width) lines.push(chars.slice(start, start + width).join(""));
-	return lines;
+const ANSI_PATTERN = /\u001b\[[0-?]*[ -\/]*[@-~]/g;
+
+function visibleLength(text: string): number {
+	return Array.from(text.replace(ANSI_PATTERN, "")).length;
 }
 
-function rolePrefix(role: TranscriptEntry["role"]): string {
-	switch (role) {
-		case "user":
-			return "❯";
-		case "assistant":
-			return "●";
-		case "tool":
-			return "⚒";
-		case "system":
-			return "!";
+/** Word-aware wrap for plain (non-ANSI) text. */
+export function wrapPlainText(line: string, width: number): string[] {
+	if (width <= 0 || Array.from(line).length <= width) return [line];
+	const lines: string[] = [];
+	let current = "";
+	for (const word of line.split(" ")) {
+		const candidate = current ? `${current} ${word}` : word;
+		if (Array.from(candidate).length <= width) {
+			current = candidate;
+			continue;
+		}
+		if (current) lines.push(current);
+		current = word;
+		while (Array.from(current).length > width) {
+			const chars = Array.from(current);
+			lines.push(chars.slice(0, width).join(""));
+			current = chars.slice(width).join("");
+		}
 	}
+	if (current) lines.push(current);
+	return lines.length ? lines : [""];
 }
 
 export type ViewerTheme = {
 	fg(color: string, text: string): string;
 };
 
-export type ViewerWorkerView = {
-	name: string;
-	id: string;
-	state: WorkerPanelState;
-	task: string;
-	transcript: readonly TranscriptEntry[];
-};
-
-function padTo(text: string, width: number): string {
-	const length = Array.from(text).length;
-	return length >= width ? Array.from(text).slice(0, width).join("") : text + " ".repeat(width - length);
+function padVisible(text: string, width: number): string {
+	const pad = width - visibleLength(text);
+	return pad > 0 ? text + " ".repeat(pad) : text;
 }
 
 /**
@@ -100,49 +99,36 @@ function padTo(text: string, width: number): string {
  * replaces exactly the cells a component emits — anything narrower or
  * shorter lets the chat behind it bleed through.
  *
- * `scrollUp` counts wrapped lines up from the bottom (0 = follow live
- * output). Returns the lines plus the maximum meaningful scrollUp so callers
- * can clamp.
+ * `bodyLines` are prerendered (already themed/wrapped) transcript lines, so
+ * callers can build them with pi's own message components for a native look.
+ * `scrollUp` counts lines up from the bottom (0 = follow live output).
+ * Returns the lines plus the maximum meaningful scrollUp so callers can
+ * clamp.
  */
-export function renderWorkerSession(
-	worker: ViewerWorkerView,
+export function renderSessionScreen(
+	title: string,
+	bodyLines: readonly string[],
 	width: number,
 	height: number,
 	scrollUp: number,
 	theme: ViewerTheme,
 ): { lines: string[]; maxScrollUp: number } {
 	const fullWidth = Math.max(24, width);
-	const innerWidth = fullWidth - 2;
-	const body: { text: string; role: TranscriptEntry["role"] | "blank" }[] = [];
-	for (const entry of worker.transcript) {
-		const prefix = `${rolePrefix(entry.role)} `;
-		entry.text.split(/\r?\n/).forEach((line, index) => {
-			for (const wrapped of wrapLine(index === 0 ? prefix + line : `  ${line}`, innerWidth)) {
-				body.push({ text: wrapped, role: entry.role });
-			}
-		});
-		body.push({ text: "", role: "blank" });
-	}
-	if (body.length === 0) body.push({ text: "No output yet.", role: "blank" });
+	const body = bodyLines.length ? bodyLines : ["No output yet."];
 
 	const viewport = Math.max(3, height - 3);
 	const maxScrollUp = Math.max(0, body.length - viewport);
 	const clamped = Math.min(Math.max(0, scrollUp), maxScrollUp);
 	const end = body.length - clamped;
-	const visible = body.slice(Math.max(0, end - viewport), end);
-	while (visible.length < viewport) visible.push({ text: "", role: "blank" });
+	const visible = body.slice(Math.max(0, end - viewport), end).map((line) => padVisible(line, fullWidth));
+	while (visible.length < viewport) visible.push(" ".repeat(fullWidth));
 
-	const title = `${worker.name} · ${worker.state} · ${worker.id}`;
 	const hints = `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to go back`;
-	const pad = (text: string) => padTo(` ${text}`, fullWidth);
 	const lines = [
-		theme.fg("text", pad(title)),
+		theme.fg("text", padVisible(` ${title}`, fullWidth)),
 		theme.fg("dim", "─".repeat(fullWidth)),
-		...visible.map((row) => {
-			const content = pad(row.text);
-			return row.role === "assistant" ? theme.fg("text", content) : theme.fg("dim", content);
-		}),
-		theme.fg("dim", pad(hints)),
+		...visible,
+		theme.fg("dim", padVisible(` ${hints}`, fullWidth)),
 	];
 	return { lines, maxScrollUp };
 }
