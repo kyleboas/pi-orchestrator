@@ -88,6 +88,8 @@ Before delegating, use your read-only tools to inspect the relevant files, locat
 
 Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Do not use /end or request an end-of-task summary.
 
+Workers run concurrently. When a task splits into independent workstreams (different files or subsystems with no ordering dependency), delegate each to a different worker in the same turn so they run in parallel; give each a disjoint set of files to change so they never edit the same file. Keep it to two or three concurrent workers, and never parallelize work where one piece depends on another's output — sequence those through steering instead.
+
 If the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
 }
 
@@ -768,7 +770,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator.`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Independent workstreams may be delegated to different workers in one turn; they run in parallel.`,
+		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
 			task: Type.String({ description: "Implementation brief built from YOUR OWN investigation: state the root cause or design you already determined, the exact files and changes to make, edge cases, and the validation to run. Never ask the worker to 'diagnose', 'investigate', or 'find' something you already read — hand it your conclusions and acceptance criteria." }),
