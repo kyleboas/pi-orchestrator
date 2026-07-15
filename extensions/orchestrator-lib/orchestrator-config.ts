@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import type { ClaudeAccountsConfig } from "./orchestrator-accounts.ts";
+import { defaultClaudeAccountStatePath } from "./orchestrator-accounts.ts";
 import type { PiThinkingLevel, WorkerProfile } from "./orchestrator-core.ts";
 
 export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
@@ -8,6 +10,8 @@ export type OrchestratorConfig = {
 	coordinator: CoordinatorConfig;
 	commands: { pi: string; claude: string };
 	workers: Record<string, WorkerProfile>;
+	/** When set, Claude workers rotate across these accounts and fail over on usage limits. */
+	claudeAccounts?: ClaudeAccountsConfig;
 	warning?: string;
 };
 
@@ -71,6 +75,19 @@ function workers(value: unknown): Record<string, WorkerProfile> | undefined {
 	}
 	return output;
 }
+function claudeAccounts(value: unknown): ClaudeAccountsConfig | undefined {
+	if (!object(value) || !object(value.accounts)) return undefined;
+	const accounts: Record<string, string> = {};
+	for (const [name, dir] of Object.entries(value.accounts)) {
+		if (!NAME.test(name) || !nonempty(dir)) return undefined;
+		accounts[name] = expandHome(dir.trim());
+	}
+	if (!Object.keys(accounts).length) return undefined;
+	return {
+		accounts,
+		statePath: nonempty(value.state) ? expandHome(value.state.trim()) : defaultClaudeAccountStatePath(),
+	};
+}
 function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
 	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, ...(warning ? { warning } : {}) };
 }
@@ -103,6 +120,7 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 				pi: command(env.PI_ORCHESTRATOR_PI_BIN, command(commandsRaw.pi, "pi")),
 				claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
 			}, workers: configuredWorkers,
+			...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 		};
 	} catch {
 		return defaults(env, "Orchestrator configuration was invalid; using defaults.");

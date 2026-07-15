@@ -26,6 +26,13 @@ import {
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
 import {
+	earliestAccountReset,
+	isUsageLimitText,
+	markClaudeAccountLimited,
+	parseUsageLimitReset,
+	pickClaudeAccount,
+} from "./orchestrator-lib/orchestrator-accounts.ts";
+import {
 	beginWorkerRun,
 	beginWorkerSettlement,
 	canSteerWorker,
@@ -204,6 +211,7 @@ function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
 			if (error) failWorker(worker, "Claude Code worker stdin failed.");
 		});
 		queueClaudeTurn(worker);
+		worker.lastInstruction = instructions;
 		return true;
 	} catch {
 		return false;
@@ -285,12 +293,20 @@ async function settleWorker(worker: Worker): Promise<void> {
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
-function settleClaudeResult(worker: Worker, event: Record<string, unknown>): void {
+function settleClaudeResult(worker: Worker, event: Record<string, unknown>, config?: OrchestratorConfig): void {
 	const settlement = claudeResultSettlement(event);
 	if (!settlement) return;
 	worker.claudeSessionId = settlement.sessionId ?? worker.claudeSessionId;
 	const tokens = claudeUsageTokenTotal(settlement.usage);
 	if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
+	// A usage-limit result is an account problem, not a task outcome: fail
+	// over to the next available account instead of settling or failing.
+	if (settlement.isError && isUsageLimitText(settlement.result) && config?.claudeAccounts) {
+		if (failoverClaudeWorker(worker, config, settlement.result ?? "")) return;
+		const reset = earliestAccountReset(config.claudeAccounts);
+		failWorker(worker, `Usage limit reached and every Claude account is in cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`);
+		return;
+	}
 	// A result for an earlier turn (one that was already streaming when a
 	// steer queued another) must not settle the steered run: the worker is
 	// still working on the follow-up instructions.
@@ -360,7 +376,7 @@ function handleRpcLine(worker: Worker, line: string): void {
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
-function handleClaudeLine(worker: Worker, line: string): void {
+function handleClaudeLine(worker: Worker, line: string, config?: OrchestratorConfig): void {
 	const parsed = parseClaudeStreamLine(line);
 	if (!parsed.ok) {
 		failWorker(worker, "Invalid Claude Code stream JSON.");
@@ -368,23 +384,112 @@ function handleClaudeLine(worker: Worker, line: string): void {
 	}
 	for (const event of parsed.events) {
 		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry);
-		settleClaudeResult(worker, event);
+		settleClaudeResult(worker, event, config);
 	}
+}
+
+function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig, accountDir?: string, resumeSessionId?: string) {
+	// An inherited CLAUDE_CONFIG_DIR (e.g. pi launched from a shell that set
+	// one) must not pin every worker to a single account: account choice
+	// belongs to the orchestrator's rotation, or to the launcher's own.
+	const env: NodeJS.ProcessEnv = { ...process.env, PI_ORCHESTRATOR_WORKER: "1" };
+	delete env.CLAUDE_CONFIG_DIR;
+	if (accountDir) env.CLAUDE_CONFIG_DIR = accountDir;
+	return spawn(config.commands.claude, [...claudeCodeArgs(model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])], {
+		cwd,
+		env,
+		stdio: ["pipe", "pipe", "pipe"] as const,
+	});
+}
+
+/** Attach stream handlers to a (possibly replacement) child; stale children's late events are ignored. */
+function wireWorkerChild(worker: Worker, child: Worker["process"], config: OrchestratorConfig): void {
+	child.stdout.on("data", (chunk: Buffer) => {
+		if (worker.process !== child) return;
+		worker.buffer += chunk.toString("utf8");
+		let newline: number;
+		while ((newline = worker.buffer.indexOf("\n")) >= 0) {
+			const line = worker.buffer.slice(0, newline).trim();
+			worker.buffer = worker.buffer.slice(newline + 1);
+			if (line) {
+				if (worker.profile.backend === "pi-rpc") handleRpcLine(worker, line);
+				else handleClaudeLine(worker, line, config);
+			}
+		}
+	});
+	child.stderr.on("data", (chunk: Buffer) => {
+		// Do not retain stderr: it can include local auth/config details. Exit and
+		// stdin paths below report a safe, actionable status instead.
+		if (worker.process === child && chunk.length && worker.state !== "stopped") worker.lastError ??= `${worker.profile.backend === "claude-code" ? "Claude Code" : "Pi RPC"} worker reported stderr.`;
+	});
+	child.on("error", () => {
+		if (worker.process !== child) return;
+		rejectPendingRpc(worker, new Error("Worker process failed to start."));
+		failWorker(worker, "Worker process failed to start.");
+	});
+	child.on("exit", (code, signal) => {
+		if (worker.process !== child) return;
+		rejectPendingRpc(worker, new Error("Worker process exited."));
+		if (worker.state !== "stopped" && worker.state !== "idle") {
+			failWorker(worker, code === 0
+				? "Worker process exited before returning a result."
+				: `Worker exited with code ${code ?? "null"} (${signal ?? "no signal"}).`);
+		}
+		notifyOrchestratorStateChange(getOrchestratorRuntime());
+	});
+}
+
+/**
+ * A Claude worker hit its account's usage limit: put that account in cooldown
+ * (claude-select/claude-auto honor the same state file) and restart the
+ * worker on the next available account, resuming the same Claude session and
+ * resending the interrupted instruction. Returns false when no account is
+ * available, in which case the caller fails the worker.
+ */
+function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitText: string): boolean {
+	const accounts = config.claudeAccounts;
+	if (!accounts || worker.profile.backend !== "claude-code") return false;
+	if (worker.claudeAccount) {
+		markClaudeAccountLimited(accounts, worker.claudeAccount, parseUsageLimitReset(limitText));
+	}
+	const pick = pickClaudeAccount(accounts);
+	if (!pick) return false;
+	try {
+		worker.process.kill();
+	} catch {
+		// The limited process may already be gone.
+	}
+	const child = spawnClaudeChild(worker.profile.model, worker.cwd, config, pick.configDir, worker.claudeSessionId);
+	worker.process = child;
+	worker.buffer = "";
+	worker.pendingTurns = 0;
+	worker.claudeAccount = pick.name;
+	worker.state = "working";
+	wireWorkerChild(worker, child, config);
+	recordWorkerActivity(worker, {
+		at: Date.now(),
+		role: "system",
+		text: `Usage limit reached; switched to account ${pick.name} and resumed.`,
+	});
+	const instruction = worker.lastInstruction ?? worker.task;
+	if (!sendWorkerInstruction(worker, instruction, true)) {
+		failWorker(worker, "Worker stdin was unavailable after an account failover.");
+		return true; // Handled: the worker is already failed, no double-report.
+	}
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
+	return true;
 }
 
 function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
+	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const child = profile.backend === "pi-rpc"
 		? spawn(config.commands.pi, piRpcWorkerArgs(profile), {
 			cwd,
 			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
 			stdio: ["pipe", "pipe", "pipe"],
 		})
-		: spawn(config.commands.claude, claudeCodeArgs(profile.model), {
-			cwd,
-			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
-			stdio: ["pipe", "pipe", "pipe"],
-		});
+		: spawnClaudeChild(profile.model, cwd, config, account?.configDir);
 	const worker: Worker = {
 		id,
 		name,
@@ -399,40 +504,17 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		transcript: [],
 		rpcNextId: 0,
 		rpcPending: new Map(),
+		...(account ? { claudeAccount: account.name } : {}),
 	};
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
-
-	child.stdout.on("data", (chunk: Buffer) => {
-		worker.buffer += chunk.toString("utf8");
-		let newline: number;
-		while ((newline = worker.buffer.indexOf("\n")) >= 0) {
-			const line = worker.buffer.slice(0, newline).trim();
-			worker.buffer = worker.buffer.slice(newline + 1);
-			if (line) {
-				if (worker.profile.backend === "pi-rpc") handleRpcLine(worker, line);
-				else handleClaudeLine(worker, line);
-			}
-		}
-	});
-	child.stderr.on("data", (chunk: Buffer) => {
-		// Do not retain stderr: it can include local auth/config details. Exit and
-		// stdin paths below report a safe, actionable status instead.
-		if (chunk.length && worker.state !== "stopped") worker.lastError ??= `${worker.profile.backend === "claude-code" ? "Claude Code" : "Pi RPC"} worker reported stderr.`;
-	});
-	child.on("error", () => {
-		rejectPendingRpc(worker, new Error("Worker process failed to start."));
-		failWorker(worker, "Worker process failed to start.");
-	});
-	child.on("exit", (code, signal) => {
-		rejectPendingRpc(worker, new Error("Worker process exited."));
-		if (worker.state !== "stopped" && worker.state !== "idle") {
-			failWorker(worker, code === 0
-				? "Worker process exited before returning a result."
-				: `Worker exited with code ${code ?? "null"} (${signal ?? "no signal"}).`);
-		}
-		notifyOrchestratorStateChange(getOrchestratorRuntime());
-	});
+	wireWorkerChild(worker, child, config);
+	if (profile.backend === "claude-code" && config.claudeAccounts && !account) {
+		const reset = earliestAccountReset(config.claudeAccounts);
+		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`);
+		child.kill();
+		return worker;
+	}
 
 	const prompt = `You are ${name}, an implementation worker. Work directly in ${cwd}.
 
@@ -752,11 +834,19 @@ export default function orchestrator(pi: ExtensionAPI) {
 		releaseOrchestratorSession(runtime, generation);
 	});
 
-	pi.on("input", async (event) => {
+	pi.on("input", async (event, ctx) => {
 		// Worker-result follow-ups are extension messages, not a user asking Sol
 		// to take over. Only an explicit user/RPC request can enable this escape
 		// hatch, and agent_settled restores orchestration afterward.
 		if (event.source === "extension") return { action: "continue" };
+		// agent_settled never fires for a takeover turn the user aborted (esc),
+		// which used to leave takeover stuck on. A fresh user prompt while the
+		// agent is idle means that task is over: restore orchestration first,
+		// then let this prompt request a new takeover if it explicitly asks.
+		if (solToolMode.takeoverActive && ctx.isIdle()) {
+			const restoredTools = solToolMode.settle();
+			if (restoredTools) pi.setActiveTools(restoredTools);
+		}
 		const takeoverTools = solToolMode.beginTakeover(
 			event.text,
 			pi.getActiveTools(),
@@ -783,7 +873,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("orchestrator", {
-		description: `Activate orchestration mode (${catalogNames} are persistent workers)`,
+		description: `Activate orchestration mode (${catalogNames} are persistent workers); also exits a stuck takeover`,
 		handler: async (_args, ctx) => {
 			await activate(ctx);
 			ctx.ui.notify(`Orchestration mode is active. Delegate to ${catalogNames}.`, "info");

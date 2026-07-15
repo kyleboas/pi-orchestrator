@@ -25,6 +25,10 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	lastResult?: string;
 	lastError?: string;
 	claudeSessionId?: string;
+	/** Account name (claude-select state key) this Claude worker is running on. */
+	claudeAccount?: string;
+	/** Latest instruction sent; resent after a usage-limit account failover. */
+	lastInstruction?: string;
 	tokens?: number;
 	buffer: string;
 	transcript: TranscriptEntry[];

@@ -79,6 +79,23 @@ PI_ORCHESTRATOR_PI_BIN=pi PI_ORCHESTRATOR_CLAUDE_BIN=claude-auto pi
 
 Like Claude Code's subagent navigation: with the editor empty, press **down** to move focus into the worker rows in the footer, **up/down** to change the highlighted worker, and **enter** to open that worker's live session view — the task, assistant replies, and tool calls captured from its stream. **Up/down** scrolls the view (page up/down for pages; scrolled views stop following live output until scrolled back to the bottom), and **esc** (or `q`) returns to the row list; **esc** again, or moving up past the first row, returns focus to the editor. Only live workers are listed; settled ones leave the rows immediately (they remain steerable in memory for an hour after their result is delivered). Any other key cancels selection and types into the editor as normal. Transcripts are kept in memory only, bounded to the last 400 entries per worker.
 
+## Claude account failover
+
+With a `claudeAccounts` config section, the orchestrator rotates Claude workers across accounts (claude-select/claude-auto-compatible state file) and handles usage limits automatically: the limited account is put in cooldown (reset time parsed from the limit message when present, 90 minutes otherwise), the worker restarts on the next available account resuming the same Claude session, and the interrupted instruction is resent. When every account is cooling down, the delegation fails with the earliest reset time so the coordinator can route to a Pi worker instead.
+
+```json
+{
+  "claudeAccounts": {
+    "state": "~/.claude-account-state.json",
+    "accounts": { "claude1": "~/.claude-account1", "claude2": "~/.claude-account2" }
+  }
+}
+```
+
+The orchestrator picks the account itself (setting `CLAUDE_CONFIG_DIR`), so pair it with a launcher that respects a preset `CLAUDE_CONFIG_DIR`. An inherited `CLAUDE_CONFIG_DIR` from the surrounding shell is always stripped from worker environments so it cannot pin every worker to one account.
+
+A takeover interrupted with esc no longer sticks: the next user prompt while the agent is idle restores orchestration, and `/orchestrator` force-exits it.
+
 ## Maintenance
 
 ```sh
