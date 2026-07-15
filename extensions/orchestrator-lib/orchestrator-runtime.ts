@@ -38,6 +38,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	runTokensBase?: number;
 	/** Run whose outcome was already written to the stats ledger. */
 	statsRecordedRun?: number;
+	/** Last passive progress digest delivered to the coordinator. */
+	lastCheckinAt?: Date;
 	rpcNextId: number;
 	rpcPending: Map<string, PendingRpc>;
 };
@@ -52,6 +54,8 @@ export type OrchestratorRuntime = {
 	reportsHeld?: boolean;
 	generation?: symbol;
 	disposeUi?: () => void;
+	/** One passive check-in ticker across reload generations. */
+	checkInTimer?: ReturnType<typeof setInterval>;
 };
 
 function createRuntime(): OrchestratorRuntime {
@@ -82,9 +86,16 @@ function disposeCurrentUi(runtime: OrchestratorRuntime): void {
 	runtime.disposeUi = undefined;
 }
 
+/** The timer belongs to the current extension generation, not a session callback closure. */
+export function disposeOrchestratorCheckInTimer(runtime: OrchestratorRuntime): void {
+	if (runtime.checkInTimer !== undefined) clearInterval(runtime.checkInTimer);
+	runtime.checkInTimer = undefined;
+}
+
 /** A newly loaded extension takes delivery ownership and retires the old UI safely. */
 export function bindOrchestratorApi(runtime: OrchestratorRuntime, api: ExtensionAPI): symbol {
 	disposeCurrentUi(runtime);
+	disposeOrchestratorCheckInTimer(runtime);
 	const generation = Symbol("orchestrator-extension-generation");
 	runtime.generation = generation;
 	runtime.api = api;
@@ -116,6 +127,7 @@ export function bindOrchestratorSession(
 export function releaseOrchestratorSession(runtime: OrchestratorRuntime, generation: symbol): boolean {
 	if (runtime.generation !== generation) return false;
 	disposeCurrentUi(runtime);
+	disposeOrchestratorCheckInTimer(runtime);
 	runtime.api = undefined;
 	runtime.onStateChange = undefined;
 	runtime.headlessReap = false;
