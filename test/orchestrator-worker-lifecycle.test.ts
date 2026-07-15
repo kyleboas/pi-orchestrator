@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	beginWorkerRun,
+	completeClaudeTurn,
+	queueClaudeTurn,
 	beginWorkerSettlement,
 	canSteerWorker,
 	claimWorkerReport,
@@ -62,4 +64,17 @@ test("a live follow-up starts a new generation and cannot reuse the prior report
 	beginWorkerRun(lifecycle);
 	assert.equal(lifecycle.run, 2);
 	assert.equal(claimWorkerReport(lifecycle), true);
+});
+
+test("only the last outstanding Claude turn settles a steered worker", () => {
+	const worker = { state: "working" as const, run: 1 };
+	queueClaudeTurn(worker);
+	queueClaudeTurn(worker); // steer while the first turn is still streaming
+	assert.equal(completeClaudeTurn(worker), false); // first turn's result must not settle
+	assert.equal(completeClaudeTurn(worker), true); // steered turn's result settles
+});
+
+test("workers from before the counter existed settle on their first result", () => {
+	const worker = { state: "working" as const, run: 1 };
+	assert.equal(completeClaudeTurn(worker), true);
 });

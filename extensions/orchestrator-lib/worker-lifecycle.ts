@@ -9,7 +9,25 @@ export type WorkerLifecycle = {
 	reportingRun?: number;
 	/** When the worker last left the live states; freezes the row timer and ages it out of selection. */
 	settledAt?: Date;
+	/** Claude Code emits one result event per user turn; only the last outstanding turn settles the worker. */
+	pendingTurns?: number;
 };
+
+/** Record that one more user turn was written to a Claude Code worker. */
+export function queueClaudeTurn(worker: WorkerLifecycle): void {
+	worker.pendingTurns = (worker.pendingTurns ?? 0) + 1;
+}
+
+/**
+ * Record one Claude Code result event. Returns true when it belongs to the
+ * last outstanding turn and may settle the worker; earlier results (a turn
+ * that was already streaming when a steer queued another) must not settle
+ * the steered run.
+ */
+export function completeClaudeTurn(worker: WorkerLifecycle): boolean {
+	worker.pendingTurns = Math.max(0, (worker.pendingTurns ?? 1) - 1);
+	return worker.pendingTurns === 0;
+}
 
 export type WorkerProcessState = {
 	exitCode: number | null;

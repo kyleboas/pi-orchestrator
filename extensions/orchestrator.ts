@@ -28,7 +28,9 @@ import {
 	beginWorkerRun,
 	beginWorkerSettlement,
 	canSteerWorker,
+	completeClaudeTurn,
 	finishWorkerSettlement,
+	queueClaudeTurn,
 	selectFinalWorkerText,
 	stopWorker,
 } from "./orchestrator-lib/worker-lifecycle.ts";
@@ -162,6 +164,7 @@ function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
 		worker.process.stdin.write(`${JSON.stringify(claudeUserEvent(instructions))}\n`, (error) => {
 			if (error) failWorker(worker, "Claude Code worker stdin failed.");
 		});
+		queueClaudeTurn(worker);
 		return true;
 	} catch {
 		return false;
@@ -243,11 +246,18 @@ async function settleWorker(worker: Worker): Promise<void> {
 function settleClaudeResult(worker: Worker, event: Record<string, unknown>): void {
 	const settlement = claudeResultSettlement(event);
 	if (!settlement) return;
-	const run = beginWorkerSettlement(worker);
-	if (run === undefined) return;
 	worker.claudeSessionId = settlement.sessionId ?? worker.claudeSessionId;
 	const tokens = claudeUsageTokenTotal(settlement.usage);
 	if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
+	// A result for an earlier turn (one that was already streaming when a
+	// steer queued another) must not settle the steered run: the worker is
+	// still working on the follow-up instructions.
+	if (!completeClaudeTurn(worker)) {
+		notifyOrchestratorStateChange(getOrchestratorRuntime());
+		return;
+	}
+	const run = beginWorkerSettlement(worker);
+	if (run === undefined) return;
 	if (settlement.isError || !settlement.result) {
 		worker.settlingRun = undefined;
 		worker.state = "failed";
