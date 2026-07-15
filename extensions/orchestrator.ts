@@ -431,9 +431,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 		// rows, enter opens that worker's session view, esc/up-past-top returns.
 		let selectedWorkerId: string | undefined;
 		let viewerOpen = false;
-		// Settled workers stay selectable so finished sessions can be reviewed
-		// even after the live footer rows have cleared; expired ones (report
-		// delivered, review window passed) are dropped for good.
+		// Only live workers are shown and selectable; settled ones leave the
+		// list immediately but stay in memory (still steerable) until their
+		// report is delivered and the retention window passes.
 		const pruneExpiredWorkers = () => {
 			for (const worker of [...runtime.workers.values()]) {
 				if (worker.id !== selectedWorkerId && !viewerOpen && isExpiredWorker(worker)) runtime.workers.delete(worker.id);
@@ -441,7 +441,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 		};
 		const selectableWorkerIds = () => {
 			pruneExpiredWorkers();
-			return panelWorkers([...runtime.workers.values()], true).map((worker) => worker.id);
+			return panelWorkers([...runtime.workers.values()]).map((worker) => worker.id);
 		};
 		const stopTimer = () => {
 			if (timer !== undefined) clearInterval(timer);
@@ -466,7 +466,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 					render: (width: number) => {
 						const selecting = selectedWorkerId !== undefined;
 						const rows = renderWorkerFooterRows(
-							workerWidgetLines(Date.now(), width, { selectedId: selectedWorkerId, includeSettled: selecting }),
+							workerWidgetLines(Date.now(), width, { selectedId: selectedWorkerId }),
 							theme,
 						);
 						if (selecting && rows.length) rows.push(theme.fg("dim", "enter: view session · esc: back"));
@@ -481,6 +481,11 @@ export default function orchestrator(pi: ExtensionAPI) {
 			});
 		};
 		const render = () => {
+			// A selected worker that settles leaves the list; drop the selection
+			// with it (but not while its session view is open).
+			if (selectedWorkerId !== undefined && !viewerOpen && !selectableWorkerIds().includes(selectedWorkerId)) {
+				selectedWorkerId = undefined;
+			}
 			if (hasAnimatingWorker([...runtime.workers.values()]) || selectedWorkerId !== undefined) installFooter();
 			else removeFooter();
 		};
