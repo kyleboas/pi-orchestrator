@@ -598,7 +598,11 @@ export default function orchestrator(pi: ExtensionAPI) {
 									} else if (entry.role === "tool" && entry.tool?.name) {
 										lines.push(...renderToolEntry(entry, width));
 									} else if (entry.role === "tool") {
-										lines.push(...wrapPlainText(entry.text, width - 4).map((line) => theme.fg("toolOutput", `   ${line}`)));
+										// Legacy flattened entries (pre-structured transcripts):
+										// one truncated summary line, never a wall of wrapped text.
+										const summary = entry.text.split(/\r?\n/, 1)[0] ?? "";
+										const chars = Array.from(` ⚒ ${summary}`);
+										lines.push(theme.fg("toolTitle", chars.length > width ? `${chars.slice(0, Math.max(1, width - 1)).join("")}…` : chars.join("")));
 									} else {
 										lines.push(...wrapPlainText(entry.text, width - 2).map((line) => theme.fg("error", ` ${line}`)));
 									}
