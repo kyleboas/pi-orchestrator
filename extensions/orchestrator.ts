@@ -90,6 +90,8 @@ Workers are persistent: use orchestrator_steer for corrections or follow-up inst
 
 Workers run concurrently. When a task splits into independent workstreams (different files or subsystems with no ordering dependency), delegate each to a different worker in the same turn so they run in parallel; give each a disjoint set of files to change so they never edit the same file. Keep it to two or three concurrent workers, and never parallelize work where one piece depends on another's output — sequence those through steering instead.
 
+Write progress updates and reviews as plain sentences that lead with the content itself. Never open with a label prefix such as "Checkpoint:", "Update:", "Status:", or similar.
+
 If the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
 }
 
@@ -398,7 +400,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 
 ${task}
 
-Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Sol receives your final response directly and may send follow-up instructions while you work.`;
+Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Write it as plain sentences leading with the content — never open with a label prefix such as "Checkpoint:" or "Status:". Sol receives your final response directly and may send follow-up instructions while you work.`;
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
 	return worker;
