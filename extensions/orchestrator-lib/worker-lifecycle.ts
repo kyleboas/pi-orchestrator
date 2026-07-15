@@ -7,6 +7,8 @@ export type WorkerLifecycle = {
 	reportedRun?: number;
 	/** A synchronous report send is in progress; failed sends clear this for retry. */
 	reportingRun?: number;
+	/** When the worker last left the live states; freezes the row timer and ages it out of selection. */
+	settledAt?: Date;
 };
 
 export type WorkerProcessState = {
@@ -25,6 +27,7 @@ export function beginWorkerRun(worker: WorkerLifecycle): void {
 	worker.run += 1;
 	worker.settlingRun = undefined;
 	worker.reportingRun = undefined;
+	worker.settledAt = undefined;
 	worker.state = "working";
 }
 
@@ -44,6 +47,7 @@ export function finishWorkerSettlement(worker: WorkerLifecycle, run: number): bo
 	if (worker.settlingRun !== run || worker.run !== run || isTerminal(worker.state)) return false;
 	worker.settlingRun = undefined;
 	worker.state = "idle";
+	worker.settledAt ??= new Date();
 	return true;
 }
 
@@ -59,6 +63,7 @@ export function stopWorker(worker: WorkerLifecycle): void {
 	worker.state = "stopped";
 	worker.settlingRun = undefined;
 	worker.reportingRun = undefined;
+	worker.settledAt ??= new Date();
 }
 
 /** A stale idle state is not enough: the child process itself must still be live. */

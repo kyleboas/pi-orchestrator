@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
 	hasAnimatingWorker,
+	isExpiredWorker,
+	panelWorkers,
 	renderWorkerFooterRows,
 	renderWorkerPanel,
 	WORKER_WIDGET_TICK_MS,
@@ -72,4 +74,40 @@ test("only active workers animate and the cadence stays low overhead", () => {
 	assert.equal(hasAnimatingWorker([worker({ state: "working" })]), true);
 	assert.equal(hasAnimatingWorker([worker({ state: "idle" })]), false);
 	assert.equal(hasAnimatingWorker([worker({ state: "failed" })]), false);
+});
+
+test("settled workers freeze their duration instead of ticking forever", () => {
+	const settledAt = new Date(startedAt.getTime() + 30_000);
+	const [line] = renderWorkerPanel(
+		[worker({ state: "idle", settledAt })],
+		startedAt.getTime() + 600_000,
+		80,
+		{ includeSettled: true },
+	)!;
+	assert.match(line, /30s$/);
+});
+
+test("selection lists only recent settled workers, capped and TTL-bound", () => {
+	const now = startedAt.getTime() + 1_000;
+	const fresh = (id: string, offsetMs: number) =>
+		worker({ id, state: "idle" as const, settledAt: new Date(now - offsetMs) });
+	const stale = fresh("stale", 61 * 60 * 1_000);
+	const recents = Array.from({ length: 7 }, (_v, i) => fresh(`recent-${i}`, i * 1_000));
+	const live = worker({ id: "live", state: "working" as const });
+	const shown = panelWorkers([stale, ...recents, live], true, now).map((w) => w.id);
+	assert.ok(!shown.includes("stale"));
+	assert.ok(shown.includes("live"));
+	assert.equal(shown.filter((id) => id.startsWith("recent-")).length, 5);
+	assert.deepEqual(panelWorkers([stale, ...recents, live], false, now).map((w) => w.id), ["live"]);
+});
+
+test("workers expire only after report delivery and the review window", () => {
+	const now = startedAt.getTime();
+	const old = new Date(now - 2 * 60 * 60 * 1_000);
+	const base = { ...worker({ state: "idle" as const, settledAt: old }), run: 1 };
+	assert.equal(isExpiredWorker({ ...base, reportedRun: 1 }, now), true);
+	assert.equal(isExpiredWorker({ ...base, reportedRun: undefined }, now), false);
+	assert.equal(isExpiredWorker({ ...base, state: "stopped" }, now), true);
+	assert.equal(isExpiredWorker({ ...base, state: "working", reportedRun: 1 }, now), false);
+	assert.equal(isExpiredWorker({ ...base, settledAt: new Date(now - 1_000), reportedRun: 1 }, now), false);
 });

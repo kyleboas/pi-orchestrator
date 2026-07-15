@@ -45,6 +45,7 @@ import {
 import { renderBaseFooter } from "./orchestrator-lib/orchestrator-footer.ts";
 import {
 	hasAnimatingWorker,
+	isExpiredWorker,
 	panelWorkers,
 	renderWorkerFooterRows,
 	renderWorkerPanel,
@@ -132,6 +133,7 @@ function getUsageTokens(message: unknown): number | undefined {
 function failWorker(worker: Worker, message: string): void {
 	if (worker.state === "stopped" || worker.state === "failed") return;
 	worker.state = "failed";
+	worker.settledAt ??= new Date();
 	worker.lastError = message;
 	reportWorkerResult(worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -244,6 +246,7 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>): voi
 	if (settlement.isError || !settlement.result) {
 		worker.settlingRun = undefined;
 		worker.state = "failed";
+		worker.settledAt ??= new Date();
 		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
 		reportWorkerResult(worker);
 	} else {
@@ -429,8 +432,17 @@ export default function orchestrator(pi: ExtensionAPI) {
 		let selectedWorkerId: string | undefined;
 		let viewerOpen = false;
 		// Settled workers stay selectable so finished sessions can be reviewed
-		// even after the live footer rows have cleared.
-		const selectableWorkerIds = () => panelWorkers([...runtime.workers.values()], true).map((worker) => worker.id);
+		// even after the live footer rows have cleared; expired ones (report
+		// delivered, review window passed) are dropped for good.
+		const pruneExpiredWorkers = () => {
+			for (const worker of [...runtime.workers.values()]) {
+				if (worker.id !== selectedWorkerId && !viewerOpen && isExpiredWorker(worker)) runtime.workers.delete(worker.id);
+			}
+		};
+		const selectableWorkerIds = () => {
+			pruneExpiredWorkers();
+			return panelWorkers([...runtime.workers.values()], true).map((worker) => worker.id);
+		};
 		const stopTimer = () => {
 			if (timer !== undefined) clearInterval(timer);
 			timer = undefined;

@@ -6,11 +6,18 @@ export type WorkerPanelItem = {
 	task: string;
 	state: WorkerPanelState;
 	startedAt: Date;
+	settledAt?: Date;
 	tokens?: number;
 };
 
 /** Low-frequency local redraw: enough for elapsed time without wasting VPS CPU. */
 export const WORKER_WIDGET_TICK_MS = 2_000;
+
+/** Settled workers stay reviewable this long before leaving the selection list. */
+export const SETTLED_WORKER_TTL_MS = 60 * 60 * 1_000;
+
+/** At most this many settled workers stay selectable, newest first. */
+export const SETTLED_WORKER_LIMIT = 5;
 
 export function hasAnimatingWorker(workers: Iterable<WorkerPanelItem>): boolean {
 	for (const worker of workers) {
@@ -19,8 +26,10 @@ export function hasAnimatingWorker(workers: Iterable<WorkerPanelItem>): boolean 
 	return false;
 }
 
-function elapsed(startedAt: Date, now: number): string {
-	const seconds = Math.max(0, Math.floor((now - startedAt.getTime()) / 1_000));
+function elapsed(worker: WorkerPanelItem, now: number): string {
+	// A settled worker's duration is frozen at settlement; only live rows tick.
+	const end = worker.settledAt?.getTime() ?? now;
+	const seconds = Math.max(0, Math.floor((end - worker.startedAt.getTime()) / 1_000));
 	if (seconds < 60) return `${seconds}s`;
 	const minutes = Math.floor(seconds / 60);
 	const remainder = seconds % 60;
@@ -70,7 +79,7 @@ function glyphFor(state: WorkerPanelState): string {
 }
 
 function statusFor(worker: WorkerPanelItem, now: number): string {
-	const duration = elapsed(worker.startedAt, now);
+	const duration = elapsed(worker, now);
 	if (worker.state === "failed") return `${duration} · failed`;
 	if (worker.state === "stopped") return `${duration} · stopped`;
 	if (worker.tokens !== undefined && worker.tokens > 0) {
@@ -86,9 +95,32 @@ export type WorkerPanelOptions = {
 	includeSettled?: boolean;
 };
 
-/** Workers shown by the panel, in stable row order, for selection to walk. */
-export function panelWorkers(workers: WorkerPanelItem[], includeSettled = false): WorkerPanelItem[] {
-	return workers.filter((worker) => includeSettled || worker.state === "starting" || worker.state === "working");
+/**
+ * Workers shown by the panel, in stable row order, for selection to walk.
+ * Settled workers stay reviewable only while recent (newest few, within the
+ * TTL) so old delegations do not pile up in the list forever.
+ */
+export function panelWorkers(workers: WorkerPanelItem[], includeSettled = false, now = Date.now()): WorkerPanelItem[] {
+	const live = workers.filter((worker) => worker.state === "starting" || worker.state === "working");
+	if (!includeSettled) return live;
+	const settled = workers
+		.filter((worker) => worker.state !== "starting" && worker.state !== "working")
+		.filter((worker) => now - (worker.settledAt?.getTime() ?? worker.startedAt.getTime()) <= SETTLED_WORKER_TTL_MS)
+		.sort((a, b) => (b.settledAt?.getTime() ?? 0) - (a.settledAt?.getTime() ?? 0))
+		.slice(0, SETTLED_WORKER_LIMIT);
+	// Preserve original row order so selection walking stays stable.
+	const keep = new Set([...live, ...settled].map((worker) => worker.id));
+	return workers.filter((worker) => keep.has(worker.id));
+}
+
+/** True once a settled worker's report is delivered and its review window passed. */
+export function isExpiredWorker(
+	worker: WorkerPanelItem & { run: number; reportedRun?: number },
+	now = Date.now(),
+): boolean {
+	if (worker.state === "starting" || worker.state === "working") return false;
+	if (worker.state !== "stopped" && worker.reportedRun !== worker.run) return false;
+	return now - (worker.settledAt?.getTime() ?? worker.startedAt.getTime()) > SETTLED_WORKER_TTL_MS;
 }
 
 /**
@@ -104,7 +136,7 @@ export function renderWorkerPanel(
 	width = 80,
 	options: WorkerPanelOptions = {},
 ): string[] | undefined {
-	const visible = panelWorkers(workers, options.includeSettled ?? false);
+	const visible = panelWorkers(workers, options.includeSettled ?? false, now);
 	if (visible.length === 0) return undefined;
 
 	return visible.map((worker) => {
