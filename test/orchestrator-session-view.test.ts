@@ -11,6 +11,7 @@ import {
 } from "../extensions/orchestrator-lib/orchestrator-session-view.ts";
 import {
 	appendTranscript,
+	mergeTranscriptEntry,
 	TRANSCRIPT_MAX_ENTRIES,
 	transcriptFromClaudeEvent,
 	transcriptFromRpcEvent,
@@ -121,4 +122,31 @@ test("claude stream events yield assistant text, tool use, and tool results", ()
 	const errorResult = transcriptFromClaudeEvent({ type: "result", result: "boom", is_error: true });
 	assert.deepEqual(errorResult.map((entry) => [entry.role, entry.text]), [["system", "boom"]]);
 	assert.equal(transcriptFromClaudeEvent({ type: "result", result: "fine", is_error: false }).length, 0);
+});
+
+test("tool results attach to their pending call instead of appending a row", () => {
+	const transcript: TranscriptEntry[] = [];
+	const [call] = transcriptFromClaudeEvent({
+		type: "assistant",
+		message: { role: "assistant", content: [{ type: "tool_use", id: "tc1", name: "bash", input: { command: "ls" } }] },
+	});
+	mergeTranscriptEntry(transcript, call!);
+	const [result] = transcriptFromClaudeEvent({
+		type: "user",
+		message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tc1", content: [{ type: "text", text: "a.txt" }] }] },
+	});
+	mergeTranscriptEntry(transcript, result!);
+	assert.equal(transcript.length, 1);
+	assert.equal(transcript[0]!.tool!.name, "bash");
+	assert.deepEqual(transcript[0]!.tool!.result, { content: [{ type: "text", text: "a.txt" }], isError: false });
+});
+
+test("pi rpc toolResult messages extract as attachable results", () => {
+	const [entry] = transcriptFromRpcEvent({
+		type: "message_end",
+		message: { role: "toolResult", toolCallId: "tc9", content: [{ type: "text", text: "done" }], isError: false },
+	});
+	assert.equal(entry!.tool!.callId, "tc9");
+	assert.equal(entry!.tool!.name, "");
+	assert.equal(entry!.tool!.result!.isError, false);
 });

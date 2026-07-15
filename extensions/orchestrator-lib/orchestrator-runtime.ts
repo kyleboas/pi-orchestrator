@@ -28,6 +28,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	tokens?: number;
 	buffer: string;
 	transcript: TranscriptEntry[];
+	/** Bumped on every transcript mutation (appends and result attachments) for cheap change detection. */
+	transcriptRevision?: number;
 	rpcNextId: number;
 	rpcPending: Map<string, PendingRpc>;
 };

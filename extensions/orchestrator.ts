@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import {
 	AssistantMessageComponent,
 	getMarkdownTheme,
+	ToolExecutionComponent,
 	UserMessageComponent,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
@@ -56,8 +57,10 @@ import {
 } from "./orchestrator-lib/orchestrator-ui.ts";
 import {
 	appendTranscript,
+	mergeTranscriptEntry,
 	transcriptFromClaudeEvent,
 	transcriptFromRpcEvent,
+	type TranscriptEntry,
 } from "./orchestrator-lib/orchestrator-transcript.ts";
 import {
 	isDownKey,
@@ -132,9 +135,10 @@ function getUsageTokens(message: unknown): number | undefined {
 	return typeof totalTokens === "number" && Number.isFinite(totalTokens) ? totalTokens : undefined;
 }
 
-function recordWorkerActivity(worker: Worker, role: "user" | "assistant" | "tool" | "system", text: string, at = Date.now()): void {
-	appendTranscript(worker.transcript ??= [], role, text, at);
-	worker.lastActivityAt = new Date(at);
+function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
+	mergeTranscriptEntry(worker.transcript ??= [], entry);
+	worker.transcriptRevision = (worker.transcriptRevision ?? 0) + 1;
+	worker.lastActivityAt = new Date(entry.at);
 }
 
 function failWorker(worker: Worker, message: string): void {
@@ -280,7 +284,7 @@ function handleRpcLine(worker: Worker, line: string): void {
 		return;
 	}
 
-	for (const entry of transcriptFromRpcEvent(event)) recordWorkerActivity(worker, entry.role, entry.text, entry.at);
+	for (const entry of transcriptFromRpcEvent(event)) recordWorkerActivity(worker, entry);
 
 	if (event.type === "response" && typeof event.id === "string") {
 		const pending = worker.rpcPending.get(event.id);
@@ -321,7 +325,7 @@ function handleClaudeLine(worker: Worker, line: string): void {
 		return;
 	}
 	for (const event of parsed.events) {
-		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry.role, entry.text, entry.at);
+		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry);
 		settleClaudeResult(worker, event);
 	}
 }
@@ -393,7 +397,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 ${task}
 
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Sol receives your final response directly and may send follow-up instructions while you work.`;
-	recordWorkerActivity(worker, "user", task);
+	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
 	return worker;
 }
@@ -552,7 +556,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 						let lastSignature = "";
 						const tick = setInterval(() => {
 							const worker = runtime.workers.get(workerId);
-							const signature = worker ? `${worker.transcript?.length ?? 0}:${worker.state}` : "gone";
+							const signature = worker ? `${worker.transcriptRevision ?? worker.transcript?.length ?? 0}:${worker.state}` : "gone";
 							if (signature !== lastSignature) {
 								lastSignature = signature;
 								tui.requestRender();
@@ -560,8 +564,27 @@ export default function orchestrator(pi: ExtensionAPI) {
 						}, 500);
 						// Native pi look: transcript entries render through pi's own
 						// message components (markdown, theme colors, word wrap).
-						const buildBody = (transcript: readonly { role: string; text: string }[], width: number): string[] => {
-							const key = `${transcript.length}:${width}`;
+						const renderToolEntry = (entry: TranscriptEntry, width: number): string[] => {
+							// Pi's own tool row: built-in tools (bash, read, edit, …) get
+							// their exact native rendering, unknown tools the generic shell.
+							const call = entry.tool!;
+							const component = new ToolExecutionComponent(
+								call.name,
+								call.callId ?? "transcript",
+								call.args ?? {},
+								{ showImages: false },
+								undefined,
+								tui,
+								runtime.workers.get(workerId)?.cwd ?? process.cwd(),
+							);
+							component.markExecutionStarted();
+							component.setArgsComplete();
+							if (call.result) component.updateResult(call.result, false);
+							return component.render(width);
+						};
+						const buildBody = (worker: Worker, width: number): string[] => {
+							const transcript = worker.transcript ?? [];
+							const key = `${worker.transcriptRevision ?? transcript.length}:${width}`;
 							if (key === cachedKey) return cachedBody;
 							const markdownTheme = getMarkdownTheme();
 							const lines: string[] = [];
@@ -572,13 +595,10 @@ export default function orchestrator(pi: ExtensionAPI) {
 									} else if (entry.role === "assistant") {
 										const message = { content: [{ type: "text", text: entry.text }] };
 										lines.push(...new AssistantMessageComponent(message as never, false, markdownTheme).render(width));
+									} else if (entry.role === "tool" && entry.tool?.name) {
+										lines.push(...renderToolEntry(entry, width));
 									} else if (entry.role === "tool") {
-										const [first = "", ...rest] = entry.text.split(/\r?\n/);
-										lines.push(...wrapPlainText(first, width - 4).map((line, index) =>
-											theme.fg(index === 0 ? "toolTitle" : "toolOutput", index === 0 ? ` ⚒ ${line}` : `   ${line}`)));
-										for (const raw of rest) {
-											lines.push(...wrapPlainText(raw, width - 4).map((line) => theme.fg("toolOutput", `   ${line}`)));
-										}
+										lines.push(...wrapPlainText(entry.text, width - 4).map((line) => theme.fg("toolOutput", `   ${line}`)));
 									} else {
 										lines.push(...wrapPlainText(entry.text, width - 2).map((line) => theme.fg("error", ` ${line}`)));
 									}
@@ -598,7 +618,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 								const height = Math.max(12, process.stdout.rows ?? 30);
 								const title = `${worker.name} · ${worker.state} · ${worker.id}`;
 								// Workers launched before this version predate the transcript field.
-								const view = renderSessionScreen(title, buildBody(worker.transcript ?? [], width), width, height, scrollUp, theme);
+								const view = renderSessionScreen(title, buildBody(worker, width), width, height, scrollUp, theme);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
 								return view.lines;
 							},
@@ -776,7 +796,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			beginWorkerRun(worker);
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
-			recordWorkerActivity(worker, "user", params.instructions);
+			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: params.instructions });
 			if (!sendWorkerInstruction(worker, params.instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
 				return content(`${worker.id} could not accept follow-up instructions.`);
