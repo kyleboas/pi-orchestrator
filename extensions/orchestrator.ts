@@ -469,12 +469,10 @@ export default function orchestrator(pi: ExtensionAPI) {
 				const unsubscribe = footerData.onBranchChange(() => tui.requestRender());
 				return {
 					render: (width: number) => {
-						const selecting = selectedWorkerId !== undefined;
 						const rows = renderWorkerFooterRows(
 							workerWidgetLines(Date.now(), width, { selectedId: selectedWorkerId }),
 							theme,
 						);
-						if (selecting && rows.length) rows.push(theme.fg("dim", "enter: view session · esc: back"));
 						return [
 							...renderBaseFooter(ctx as never, footerData as never, theme as never, pi.getThinkingLevel(), width),
 							...rows,
