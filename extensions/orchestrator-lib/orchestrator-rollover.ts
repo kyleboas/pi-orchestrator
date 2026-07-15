@@ -4,11 +4,14 @@ export type ContextUse = { percent: number | null } | undefined;
 
 /** Only settle-boundary, sufficiently large contexts may pay for a compaction. */
 export function isOutcomeRolloverEligible(
+	boundary: "agent_end" | "agent_settled",
 	workers: Iterable<RolloverWorkerState>,
 	state: RolloverState,
 	usage: ContextUse,
 	thresholdPercent: number,
 ): boolean {
+	// agent_end can still auto-retry, compact/retry, or deliver queued follow-ups.
+	if (boundary !== "agent_settled") return false;
 	if (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || !usage || usage.percent === null || usage.percent < thresholdPercent) return false;
 	if (!state.outcomePending || state.rolloverInFlight !== undefined || state.rolloverCompletedVersion === state.outcomeVersion) return false;
 	for (const worker of workers) if (worker.state === "starting" || worker.state === "working" || worker.state === "settling") return false;

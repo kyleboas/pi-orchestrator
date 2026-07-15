@@ -9,10 +9,13 @@ function worker(overrides: Record<string, unknown> = {}) { return { name: "Luna"
 test("initial base assessment is due at 15 minutes and healthy checks back off to 30", () => {
 	const base = 15 * MIN; const at = startedAt.getTime();
 	assert.equal(isCheckInDue(worker(), base, at + 14 * MIN), false); assert.equal(isCheckInDue(worker(), base, at + 15 * MIN), true);
-	const healthy = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 1 });
+	const healthy = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 1, transcript: [{ at: at + 30 * MIN, role: "assistant", text: "Continuing implementation." }] });
 	assert.equal(checkInCadenceMs({ healthStreak: 1 }, base), 30 * MIN); assert.equal(isCheckInDue(healthy, base, at + 44 * MIN), false); assert.equal(isCheckInDue(healthy, base, at + 45 * MIN), true);
 	const reset = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 0 });
 	assert.equal(isCheckInDue(reset, base, at + 30 * MIN), true); assert.equal(isCheckInDue(worker(), 0, at + 30 * MIN), false);
+	const silentAfterHealthy = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 1, transcript: [{ at: at + 15 * MIN, role: "assistant", text: "Still working." }] });
+	assert.equal(isCheckInDue(silentAfterHealthy, base, at + 29 * MIN), false);
+	assert.equal(isCheckInDue(silentAfterHealthy, base, at + 30 * MIN), true, "silence returns to the 15-minute base cadence rather than waiting 30 minutes");
 });
 
 test("assessment deterministically identifies stalls, blocking language, and repeated activity", () => {
@@ -23,6 +26,8 @@ test("assessment deterministically identifies stalls, blocking language, and rep
 	const repeated = assessWorkerCheckIn(worker({ transcript: [1, 2, 3].map((n) => ({ at: at + n * MIN, role: "tool" as const, text: "bash: npm test" })) }), base, at + base);
 	assert.match(repeated.signals.join(" "), /repeated recent tool activity 3 times/);
 	assert.equal(assessWorkerCheckIn(worker({ transcript: [{ at: at + 14 * MIN, role: "assistant", text: "Implementing the test now." }] }), base, at + base).status, "healthy");
+	assert.equal(assessWorkerCheckIn(worker({ transcript: [{ at: at + 14 * MIN, role: "assistant", text: "Validation passed: 0 failures and no errors." }] }), base, at + base).status, "healthy");
+	assert.equal(assessWorkerCheckIn(worker({ transcript: [{ at: at + 14 * MIN, role: "assistant", text: "No failed checks; validation is healthy." }] }), base, at + base).status, "healthy");
 });
 
 test("check-in delivery integration uses triggerTurn:false for healthy work and wakes only suspicious work without touching worker", () => {

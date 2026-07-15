@@ -30,11 +30,18 @@ export function checkInCadenceMs(worker: Pick<CheckInWorkerView, "healthStreak">
 	return baseIntervalMs * (worker.healthStreak && worker.healthStreak > 0 ? 2 : 1);
 }
 
-/** The first assessment is based on launch, then strictly on the prior assessment's cadence. */
+/**
+ * The first assessment is based on launch. A healthy check extends routine
+ * polling to 2x, but silence since that check is still reassessed at base.
+ */
 export function isCheckInDue(worker: CheckInWorkerView, baseIntervalMs: number, now = Date.now()): boolean {
 	if (!Number.isFinite(baseIntervalMs) || baseIntervalMs <= 0 || worker.state !== "working") return false;
-	const anchor = worker.lastCheckinAt?.getTime() ?? worker.startedAt.getTime();
-	return now - anchor >= checkInCadenceMs(worker, baseIntervalMs);
+	const checkAnchor = worker.lastCheckinAt?.getTime() ?? worker.startedAt.getTime();
+	const adaptiveDueAt = checkAnchor + checkInCadenceMs(worker, baseIntervalMs);
+	if (!worker.lastCheckinAt || !worker.healthStreak) return now >= adaptiveDueAt;
+	const lastActivityAfterCheck = workerActivity(worker).filter((entry) => entry.at >= checkAnchor).at(-1)?.at;
+	const silenceDueAt = (lastActivityAfterCheck ?? checkAnchor) + baseIntervalMs;
+	return now >= Math.min(adaptiveDueAt, silenceDueAt);
 }
 
 function clip(text: string, max: number): string {
@@ -50,6 +57,7 @@ function workerActivity(worker: CheckInWorkerView): TranscriptEntry[] {
 }
 
 const BLOCKED_LANGUAGE = /\b(blocked|blocker|cannot proceed|can't proceed|unable to|permission denied|access denied|not authorized|conflict|merge conflict|rate[ -]?limit|too many requests|\b429\b|error|failed|failure|exception)\b/i;
+const NEGATED_HEALTHY_LANGUAGE = /\b(?:no|zero|0|without)\s+(?:known\s+)?(?:errors?|failures?|failed|blockers?)\b|\b(?:did not|didn't|not)\s+fail\b|\bnot blocked\b/i;
 
 /**
  * Pure, transcript-only assessment. It deliberately performs no RPC/status
@@ -67,7 +75,7 @@ export function assessWorkerCheckIn(worker: CheckInWorkerView, baseIntervalMs: n
 	}
 	const since = Math.max(worker.lastCheckinAt?.getTime() ?? 0, now - baseIntervalMs);
 	const recent = activity.filter((entry) => entry.at >= since);
-	const blocked = recent.find((entry) => BLOCKED_LANGUAGE.test(entry.text));
+	const blocked = recent.find((entry) => BLOCKED_LANGUAGE.test(entry.text) && !NEGATED_HEALTHY_LANGUAGE.test(entry.text));
 	if (blocked) signals.push(`${blocked.role} reported possible blockage: “${clip(blocked.text, 120)}”`);
 	const normalized = new Map<string, number>();
 	for (const entry of recent) {

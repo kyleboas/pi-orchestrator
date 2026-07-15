@@ -70,7 +70,7 @@ import {
 	type TranscriptEntry,
 } from "./orchestrator-lib/orchestrator-transcript.ts";
 import { assessWorkerCheckIn, buildCheckInDigest, deliverCheckIn, isCheckInDue, shouldWakeForCheckIn } from "./orchestrator-lib/orchestrator-checkin.ts";
-import { piMessageUsage } from "./orchestrator-lib/orchestrator-usage.ts";
+import { accumulateReportedUsage, piMessageUsage, shouldAccumulatePiUsage } from "./orchestrator-lib/orchestrator-usage.ts";
 import {
 	OUTCOME_ROLLOVER_INSTRUCTIONS,
 	beginOutcomeRollover,
@@ -319,8 +319,12 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 	if (!settlement) return;
 	worker.claudeSessionId = settlement.sessionId ?? worker.claudeSessionId;
 	const tokens = claudeUsageTokenTotal(settlement.usage);
-	if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
-	if (settlement.estimatedCostUsd !== undefined) worker.costUsd = Math.max(worker.costUsd ?? 0, settlement.estimatedCostUsd);
+	const cumulativeUsage = accumulateReportedUsage(
+		{ ...(worker.tokens === undefined ? {} : { tokens: worker.tokens }), ...(worker.costUsd === undefined ? {} : { costUsd: worker.costUsd }) },
+		{ ...(tokens === undefined ? {} : { tokens }), ...(settlement.estimatedCostUsd === undefined ? {} : { costUsd: settlement.estimatedCostUsd }) },
+	);
+	worker.tokens = cumulativeUsage.tokens;
+	worker.costUsd = cumulativeUsage.costUsd;
 	// A usage-limit result is an account problem, not a task outcome: fail
 	// over to the next available account instead of settling or failing.
 	if (settlement.isError && isUsageLimitText(settlement.result) && config?.claudeAccounts) {
@@ -384,9 +388,14 @@ function handleRpcLine(worker: Worker, line: string): void {
 		case "turn_end": {
 			const text = getText(event.message);
 			if (text) worker.lastResult = text;
-			const usage = piMessageUsage(event.message);
-			if (usage.tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, usage.tokens);
-			if (usage.costUsd !== undefined) worker.costUsd = Math.max(worker.costUsd ?? 0, usage.costUsd);
+			if (shouldAccumulatePiUsage(event.type)) {
+				const cumulativeUsage = accumulateReportedUsage(
+					{ ...(worker.tokens === undefined ? {} : { tokens: worker.tokens }), ...(worker.costUsd === undefined ? {} : { costUsd: worker.costUsd }) },
+					piMessageUsage(event.message),
+				);
+				worker.tokens = cumulativeUsage.tokens;
+				worker.costUsd = cumulativeUsage.costUsd;
+			}
 			break;
 		}
 		case "agent_settled":
@@ -920,27 +929,25 @@ export default function orchestrator(pi: ExtensionAPI) {
 			: coordinatorInstructions(catalog, statsSummary(loadStats(), workerNames(catalog)))}`,
 	}));
 
-	pi.on("agent_end", async (_event, ctx) => {
-		// Compaction is deliberately considered only at an agent boundary, never
-		// while a worker or coordinator turn is active. A failed attempt remains
-		// pending and is retried at a later eligible boundary.
-		if (runtime.generation !== generation || !isOutcomeRolloverEligible(runtime.workers.values(), runtime, ctx.getContextUsage(), config.rolloverContextPercent)) return;
-		const version = beginOutcomeRollover(runtime);
-		if (version === undefined) return;
-		try {
-			ctx.compact({
-				customInstructions: OUTCOME_ROLLOVER_INSTRUCTIONS,
-				onComplete: () => completeOutcomeRollover(runtime, version),
-				onError: () => failOutcomeRollover(runtime, version),
-			});
-		} catch {
-			failOutcomeRollover(runtime, version);
-		}
-	});
-
-	pi.on("agent_settled", async () => {
+	pi.on("agent_settled", async (_event, ctx) => {
 		const restrictedTools = solToolMode.settle();
 		if (restrictedTools) pi.setActiveTools(restrictedTools);
+		// agent_settled is Pi's safe boundary: unlike agent_end, no automatic
+		// retry, compaction retry, or queued follow-up remains active.
+		if (runtime.generation === generation && isOutcomeRolloverEligible("agent_settled", runtime.workers.values(), runtime, ctx.getContextUsage(), config.rolloverContextPercent)) {
+			const version = beginOutcomeRollover(runtime);
+			if (version !== undefined) {
+				try {
+					ctx.compact({
+						customInstructions: OUTCOME_ROLLOVER_INSTRUCTIONS,
+						onComplete: () => completeOutcomeRollover(runtime, version),
+						onError: () => failOutcomeRollover(runtime, version),
+					});
+				} catch {
+					failOutcomeRollover(runtime, version);
+				}
+			}
+		}
 		// Do not let a stale generation reap workers after a reload. Deferred
 		// reports stay live until a current API target accepts them.
 		if (runtime.generation !== generation || !runtime.headlessReap) return;
