@@ -28,7 +28,7 @@ export function hasAnimatingWorker(workers: Iterable<WorkerPanelItem>): boolean 
 }
 
 function elapsed(worker: WorkerPanelItem, now: number): string {
-	// Time since the worker's last message, not total runtime; frozen once settled.
+	// Time since the worker was last steered, not total runtime; frozen once settled.
 	const start = worker.lastActivityAt?.getTime() ?? worker.startedAt.getTime();
 	const end = worker.settledAt?.getTime() ?? now;
 	const seconds = Math.max(0, Math.floor((end - start) / 1_000));

@@ -142,7 +142,9 @@ function getUsageTokens(message: unknown): number | undefined {
 function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 	mergeTranscriptEntry(worker.transcript ??= [], entry);
 	worker.transcriptRevision = (worker.transcriptRevision ?? 0) + 1;
-	worker.lastActivityAt = new Date(entry.at);
+	// The row timer shows time since the worker was last instructed (delegate
+	// or steer), so only user entries reset it — worker output does not.
+	if (entry.role === "user") worker.lastActivityAt = new Date(entry.at);
 }
 
 function failWorker(worker: Worker, message: string): void {

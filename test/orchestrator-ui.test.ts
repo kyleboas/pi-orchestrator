@@ -112,7 +112,7 @@ test("workers expire only after report delivery and the review window", () => {
 	assert.equal(isExpiredWorker({ ...base, settledAt: new Date(now - 1_000), reportedRun: 1 }, now), false);
 });
 
-test("row timer counts from the last message, not worker start", () => {
+test("row timer counts from the last instruction, not worker start", () => {
 	const lastActivityAt = new Date(startedAt.getTime() + 55_000);
 	const [line] = renderWorkerPanel([worker({ lastActivityAt })], lastActivityAt.getTime() + 7_000, 80)!;
 	assert.match(line, /7s$/);

@@ -20,7 +20,7 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	cwd: string;
 	process: ChildProcessWithoutNullStreams;
 	startedAt: Date;
-	/** Last transcript activity; the footer row timer counts from here. */
+	/** Last delegate/steer instruction; the footer row timer counts from here. */
 	lastActivityAt?: Date;
 	lastResult?: string;
 	lastError?: string;
