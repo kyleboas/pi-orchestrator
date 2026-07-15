@@ -130,6 +130,11 @@ function getUsageTokens(message: unknown): number | undefined {
 	return typeof totalTokens === "number" && Number.isFinite(totalTokens) ? totalTokens : undefined;
 }
 
+function recordWorkerActivity(worker: Worker, role: "user" | "assistant" | "tool" | "system", text: string, at = Date.now()): void {
+	appendTranscript(worker.transcript ??= [], role, text, at);
+	worker.lastActivityAt = new Date(at);
+}
+
 function failWorker(worker: Worker, message: string): void {
 	if (worker.state === "stopped" || worker.state === "failed") return;
 	worker.state = "failed";
@@ -265,7 +270,7 @@ function handleRpcLine(worker: Worker, line: string): void {
 		return;
 	}
 
-	for (const entry of transcriptFromRpcEvent(event)) appendTranscript(worker.transcript ??= [], entry.role, entry.text, entry.at);
+	for (const entry of transcriptFromRpcEvent(event)) recordWorkerActivity(worker, entry.role, entry.text, entry.at);
 
 	if (event.type === "response" && typeof event.id === "string") {
 		const pending = worker.rpcPending.get(event.id);
@@ -306,7 +311,7 @@ function handleClaudeLine(worker: Worker, line: string): void {
 		return;
 	}
 	for (const event of parsed.events) {
-		for (const entry of transcriptFromClaudeEvent(event)) appendTranscript(worker.transcript ??= [], entry.role, entry.text, entry.at);
+		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry.role, entry.text, entry.at);
 		settleClaudeResult(worker, event);
 	}
 }
@@ -378,7 +383,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 ${task}
 
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Sol receives your final response directly and may send follow-up instructions while you work.`;
-	appendTranscript(worker.transcript ??= [], "user", task);
+	recordWorkerActivity(worker, "user", task);
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
 	return worker;
 }
@@ -763,7 +768,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			beginWorkerRun(worker);
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
-			appendTranscript(worker.transcript ??= [], "user", params.instructions);
+			recordWorkerActivity(worker, "user", params.instructions);
 			if (!sendWorkerInstruction(worker, params.instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
 				return content(`${worker.id} could not accept follow-up instructions.`);

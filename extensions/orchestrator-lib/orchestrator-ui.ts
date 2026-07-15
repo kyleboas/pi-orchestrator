@@ -6,6 +6,7 @@ export type WorkerPanelItem = {
 	task: string;
 	state: WorkerPanelState;
 	startedAt: Date;
+	lastActivityAt?: Date;
 	settledAt?: Date;
 	tokens?: number;
 };
@@ -27,9 +28,10 @@ export function hasAnimatingWorker(workers: Iterable<WorkerPanelItem>): boolean 
 }
 
 function elapsed(worker: WorkerPanelItem, now: number): string {
-	// A settled worker's duration is frozen at settlement; only live rows tick.
+	// Time since the worker's last message, not total runtime; frozen once settled.
+	const start = worker.lastActivityAt?.getTime() ?? worker.startedAt.getTime();
 	const end = worker.settledAt?.getTime() ?? now;
-	const seconds = Math.max(0, Math.floor((end - worker.startedAt.getTime()) / 1_000));
+	const seconds = Math.max(0, Math.floor((end - start) / 1_000));
 	if (seconds < 60) return `${seconds}s`;
 	const minutes = Math.floor(seconds / 60);
 	const remainder = seconds % 60;
