@@ -27,11 +27,11 @@ Every worker is an individual, explicit model profile. Pi workers **never inheri
 - `Haiku`: Claude Code, `haiku`
 - `Fable`: Claude Code, `fable`
 
-Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. The coordinator is instructed to default to the cheapest plausible tier and escalate only when difficulty demands it.
+Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with Luna unless its already-inspected scope demonstrably requires Sol or Terra; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task.
 
 ## Outcome ledger
 
-Every settled run appends to `~/.config/pi-orchestrator/stats.json`: per worker name, task count, failures, steers, total duration, and tokens. A per-worker summary (averages) is injected into the coordinator's system prompt each turn so tier choice is informed by the actual track record — failure-prone cheap tiers get escalated, reliable ones keep the work. The ledger is advisory: corrupt or missing files load as empty and IO errors never disturb orchestration. Delete the file to reset the record.
+Every settled run updates `~/.config/pi-orchestrator/stats.json`: aggregate per-worker task count, failures, steers, duration, tokens, and reported cost, plus a bounded latest-200 `recentRuns` ledger with worker, backend/model, truncated task, timestamp, outcome, duration, tokens, and cost when the provider supplied one. A per-worker summary (including average reported cost when available) is injected into the coordinator's system prompt so routing can optimize reliability and dollars as well as tokens. Pi cost is provider-reported only. Claude Code's `total_cost_usd` is stored as an estimated/notional API-equivalent value, not actual Claude subscription billing. The ledger is advisory, backward-compatible with the earlier aggregate-only shape, and corrupt or missing files load as empty; IO errors never disturb orchestration. Delete the file to reset it.
 
 For example: “ask Opus to implement the migration and run its tests.” While a worker is live: “steer Opus: also cover rollback behavior.”
 
@@ -41,7 +41,9 @@ The Terra, Sol, and Fable aliases are opinionated defaults from this package's a
 
 Configuration is read once when the extension initializes. It uses `PI_ORCHESTRATOR_CONFIG` when set; otherwise it reads `~/.config/pi-orchestrator/config.json` if present; otherwise defaults apply. `~` is expanded in the config-path environment variable. Invalid, empty, duplicate, or incomplete worker catalogs safely use the full explicit default catalog without exposing configuration contents.
 
-`checkInMinutes` is an optional nonnegative finite number and defaults to `15`; set it to `0` to disable check-ins. A check-in is a passive coordinator follow-up assembled only from the worker's already-captured task, transcript, and lifecycle state. It never sends a message to, steers, or interrupts the worker. Its compact digest contains the task, a few recent tool/worker signals, and the latest worker words; the coordinator should acknowledge briefly when the worker is on track and steer only for actual drift, never request metrics, status, or an ETA.
+`checkInMinutes` is an optional nonnegative finite number and defaults to `15`; set it to `0` to disable check-ins. The first passive assessment is after this base interval. Healthy/on-track workers then back off to 30 minutes (at most 2x the configured base); suspicious, stalled, or newly steered workers reset to the base interval. Assessments use only already-captured task, transcript, and lifecycle state and never send a message to, steer, or interrupt the worker. Healthy checks are hidden custom next-turn context (`triggerTurn:false`), so they do not wake the coordinator or require an acknowledgement. Only concrete suspicious signals — inactivity, blocked/error/permission/conflict/rate-limit language, or obvious repeated activity — send a coordinator follow-up, and it should steer only for actual drift.
+
+`rolloverContextPercent` is an optional finite percentage from `0` through `100`, defaulting to the conservative `38`. Set it to `0` to disable outcome-boundary rollover. After a worker result is delivered, if no worker is starting, working, or settling and context use is at least this threshold, the extension requests one Pi compaction at the next `agent_end` boundary. Its handoff preserves the user goal, decisions, authoritative paths, changed files, validation, commits/PRs, and blockers while dropping routine tool/status chatter. It never compacts active work or small contexts, does not repeat the same outcome, and safely retries after a failed compaction.
 
 `workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string.
 
@@ -54,6 +56,7 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
   },
   "commands": { "pi": "pi", "claude": "claude-auto" },
   "checkInMinutes": 15,
+  "rolloverContextPercent": 38,
   "workers": {
     "Builder": {
       "backend": "pi-rpc",

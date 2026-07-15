@@ -30,16 +30,23 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	/** Latest instruction sent; resent after a usage-limit account failover. */
 	lastInstruction?: string;
 	tokens?: number;
+	/** Cumulative provider-reported run/session total when available. */
+	costUsd?: number;
 	buffer: string;
 	transcript: TranscriptEntry[];
 	/** Bumped on every transcript mutation (appends and result attachments) for cheap change detection. */
 	transcriptRevision?: number;
-	/** Token total when the current run's instructions were sent; per-run cost = tokens - base. */
+	/** Token/cost totals when the current run's instructions were sent; per-run values are deltas. */
 	runTokensBase?: number;
+	runCostBase?: number;
 	/** Run whose outcome was already written to the stats ledger. */
 	statsRecordedRun?: number;
 	/** Last passive progress digest delivered to the coordinator. */
 	lastCheckinAt?: Date;
+	lastCheckinRevision?: number;
+	lastAlertAt?: Date;
+	lastAlertRevision?: number;
+	healthStreak?: number;
 	rpcNextId: number;
 	rpcPending: Map<string, PendingRpc>;
 };
@@ -56,6 +63,11 @@ export type OrchestratorRuntime = {
 	disposeUi?: () => void;
 	/** One passive check-in ticker across reload generations. */
 	checkInTimer?: ReturnType<typeof setInterval>;
+	/** Outcome delivery makes one idle-boundary context rollover eligible. */
+	outcomeVersion: number;
+	outcomePending: boolean;
+	rolloverInFlight?: number;
+	rolloverCompletedVersion?: number;
 };
 
 function createRuntime(): OrchestratorRuntime {
@@ -63,6 +75,8 @@ function createRuntime(): OrchestratorRuntime {
 		workers: new Map(),
 		headlessReap: false,
 		exitHookInstalled: false,
+		outcomeVersion: 0,
+		outcomePending: false,
 	};
 }
 
@@ -156,6 +170,8 @@ export function deliverWorkerReport(runtime: OrchestratorRuntime, worker: Orches
 	try {
 		api.sendUserMessage(text, { deliverAs: "followUp" });
 		worker.reportedRun = worker.run;
+		runtime.outcomeVersion = (runtime.outcomeVersion ?? 0) + 1;
+		runtime.outcomePending = true;
 		return true;
 	} catch {
 		return false;

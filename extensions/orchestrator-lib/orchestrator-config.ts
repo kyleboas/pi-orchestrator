@@ -13,8 +13,10 @@ export type OrchestratorConfig = {
 	workers: Record<string, WorkerProfile>;
 	/** When set, Claude workers rotate across these accounts and fail over on usage limits. */
 	claudeAccounts?: ClaudeAccountsConfig;
-	/** Minutes between passive worker progress digests to the coordinator; 0 disables. */
+	/** Initial/base passive assessment interval in minutes; 0 disables. Healthy workers back off to 2x. */
 	checkInMinutes: number;
+	/** Context-use percentage for outcome-boundary rollover; 0 disables. */
+	rolloverContextPercent: number;
 	warning?: string;
 };
 
@@ -95,8 +97,13 @@ function checkInMinutes(value: unknown): number {
 	if (value === undefined) return DEFAULT_CHECKIN_MINUTES;
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : DEFAULT_CHECKIN_MINUTES;
 }
+export const DEFAULT_ROLLOVER_CONTEXT_PERCENT = 38;
+function rolloverContextPercent(value: unknown): number {
+	if (value === undefined) return DEFAULT_ROLLOVER_CONTEXT_PERCENT;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : DEFAULT_ROLLOVER_CONTEXT_PERCENT;
+}
 function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
-	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, ...(warning ? { warning } : {}) };
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, ...(warning ? { warning } : {}) };
 }
 
 /** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
@@ -128,6 +135,7 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 				claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
 			}, workers: configuredWorkers,
 			checkInMinutes: checkInMinutes(raw.checkInMinutes),
+			rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
 			...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 		};
 	} catch {

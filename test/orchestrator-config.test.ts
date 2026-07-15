@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_WORKERS, loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
+import { DEFAULT_ROLLOVER_CONTEXT_PERCENT, DEFAULT_WORKERS, loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
 import { catalogText, piRpcWorkerArgs, workerDescription, workerNames } from "../extensions/orchestrator-lib/orchestrator-core.ts";
 import { claudeCodeArgs } from "../extensions/orchestrator-lib/orchestrator-claude.ts";
@@ -33,14 +33,19 @@ test("default catalog uses eight explicit individual worker profiles", () => {
 	assert.deepEqual(piRpcWorkerArgs(terra), ["--mode", "rpc", "--no-session", "--no-extensions", "--tools", "read,bash,edit,write", "--model", "openai-codex/gpt-5.6-terra", "--thinking", "high"]);
 	assert.equal(config.commands.pi, "pi"); assert.equal(config.commands.claude, "claude");
 	assert.equal(config.checkInMinutes, DEFAULT_CHECKIN_MINUTES);
+	assert.equal(config.rolloverContextPercent, DEFAULT_ROLLOVER_CONTEXT_PERCENT);
 });
 
-test("checkInMinutes accepts nonnegative finite numbers, defaults to 15, and zero disables", () => {
+test("checkInMinutes and rollover threshold accept bounded configuration with zero disable", () => {
 	for (const [value, expected] of [[0, 0], [1, 1], [0.25, 0.25], [Number.MAX_VALUE, Number.MAX_VALUE], [-1, DEFAULT_CHECKIN_MINUTES], ["15", DEFAULT_CHECKIN_MINUTES], [null, DEFAULT_CHECKIN_MINUTES]] as const) {
 		const file = configFile({ checkInMinutes: value });
 		try {
 			assert.equal(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file }).checkInMinutes, expected);
 		} finally { remove(file); }
+	}
+	for (const [value, expected] of [[0, 0], [38, 38], [100, 100], [-1, DEFAULT_ROLLOVER_CONTEXT_PERCENT], [101, DEFAULT_ROLLOVER_CONTEXT_PERCENT], ["38", DEFAULT_ROLLOVER_CONTEXT_PERCENT]] as const) {
+		const file = configFile({ rolloverContextPercent: value });
+		try { assert.equal(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file }).rolloverContextPercent, expected); } finally { remove(file); }
 	}
 });
 
@@ -70,6 +75,8 @@ test("configured map generates dynamic names, explicit Pi metadata, commands, an
 		assert.match(schema.anyOf[0]!.description, /example\/worker/);
 		assert.match(schema.anyOf[1]!.description, /fable-placeholder/);
 		assert.match(coordinatorInstructions(config.workers), /ask Fable/);
+		assert.match(coordinatorInstructions(config.workers), /unqualified new task, start with Luna/);
+		assert.match(coordinatorInstructions(config.workers), /Each distinct new task gets a new delegate/);
 		assert.equal(config.commands.pi, "pi-env"); assert.equal(config.commands.claude, "claude-auto");
 		const fable = config.workers.Fable!;
 		assert.equal(fable.backend, "claude-code");

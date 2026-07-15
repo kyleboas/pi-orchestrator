@@ -69,7 +69,15 @@ import {
 	transcriptFromRpcEvent,
 	type TranscriptEntry,
 } from "./orchestrator-lib/orchestrator-transcript.ts";
-import { buildCheckInDigest, isCheckInDue } from "./orchestrator-lib/orchestrator-checkin.ts";
+import { assessWorkerCheckIn, buildCheckInDigest, deliverCheckIn, isCheckInDue, shouldWakeForCheckIn } from "./orchestrator-lib/orchestrator-checkin.ts";
+import { accumulateReportedUsage, piMessageUsage, shouldAccumulatePiUsage } from "./orchestrator-lib/orchestrator-usage.ts";
+import {
+	OUTCOME_ROLLOVER_INSTRUCTIONS,
+	beginOutcomeRollover,
+	completeOutcomeRollover,
+	failOutcomeRollover,
+	isOutcomeRolloverEligible,
+} from "./orchestrator-lib/orchestrator-rollover.ts";
 import {
 	loadStats,
 	recordWorkerOutcome,
@@ -101,15 +109,17 @@ export function coordinatorInstructions(catalog: WorkerCatalog, statsText?: stri
 		: "";
 	return `You are the orchestration lead. You investigate, think, and plan yourself, then hand implementation to workers; you never mutate anything.
 
-Before delegating, use your read-only tools to inspect the relevant files, locate the root cause, and decide the approach. Then delegate with orchestrator_delegate, choosing one of: ${names}. Give a precise implementation brief: files to change, the change and why, edge cases, and validation. Workers implement your plan — do not send them off to investigate what you could determine yourself. Configured names are intentional: natural requests such as ${workerNames(catalog).map((name) => `“ask ${name}”`).join(", ")} select that worker.
+Before delegating, use your read-only tools to inspect the relevant files, locate the root cause, and decide the approach. Then delegate with orchestrator_delegate, choosing one of: ${names}. Give a precise implementation brief: files to change, the change and why, edge cases, and validation. Workers implement your plan — do not send them off to investigate what you could determine yourself. Configured names are intentional: natural requests such as ${workerNames(catalog).map((name) => `“ask ${name}”`).join(", ")} select that worker and always win.
+
+For every unqualified new task, start with Luna unless the scope you already inspected demonstrably requires Sol or Terra. Escalate only when substantial complexity is known up front or Luna's cheaper attempt cannot complete the task. Each distinct new task gets a new delegate; orchestrator_steer is only for continuation or correction of the same task, never as a substitute for a new delegation.
 
 Worker tiers, cheapest first, with what each is for:
 ${workerNames(catalog).map((name) => `- ${workerDescription(name, catalog[name]!)}`).join("\n")}
-Default to the cheapest tier that can plausibly do the job well; escalate only when the task's difficulty demands it.${stats}
+Default to Luna for unqualified new work, then use the cheapest tier that the inspected scope demonstrably requires; escalate only when the task's difficulty is known or a cheaper attempt has not completed it.${stats}
 
 Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Do not use /end or request an end-of-task summary.
 
-Never steer a worker just to ask how it is doing: status-report steers interrupt the work and waste its context. Passive progress digests for long-running workers arrive automatically; when one arrives and the worker is on track, acknowledge in one short sentence and let it keep working. Steer only to correct actual drift.
+Never steer a worker just to ask how it is doing: status-report steers interrupt the work and waste its context. Healthy passive checks are silently retained for your next real turn and need no acknowledgement. Only suspicious passive checks wake you; review their concrete signals and steer only to correct actual drift.
 
 Workers run concurrently, and parallel delegation is your default: before delegating, always decompose the task into independent workstreams (different files or subsystems with no ordering dependency). Two or more independent workstreams MUST each go to a different worker in the same assistant turn — emit the orchestrator_delegate calls together; never delegate one piece, wait for its result, then delegate the next when they were independent all along. Give each worker a disjoint set of files to change so they never edit the same file. Keep it to two or three concurrent workers, and sequence genuinely dependent work through steering instead. This applies regardless of how earlier tasks in this session were delegated.
 
@@ -154,13 +164,6 @@ function getText(message: unknown): string | undefined {
 	return text || undefined;
 }
 
-function getUsageTokens(message: unknown): number | undefined {
-	if (!message || typeof message !== "object") return undefined;
-	const usage = (message as { usage?: unknown }).usage;
-	if (!usage || typeof usage !== "object") return undefined;
-	const totalTokens = (usage as { totalTokens?: unknown }).totalTokens;
-	return typeof totalTokens === "number" && Number.isFinite(totalTokens) ? totalTokens : undefined;
-}
 
 function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 	mergeTranscriptEntry(worker.transcript ??= [], entry);
@@ -169,7 +172,10 @@ function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 	// or steer), so only user entries reset it — worker output does not.
 	if (entry.role === "user") {
 		worker.lastActivityAt = new Date(entry.at);
+		worker.lastCheckinAt = new Date(entry.at);
+		worker.healthStreak = 0;
 		worker.runTokensBase = worker.tokens ?? 0;
+		worker.runCostBase = worker.costUsd ?? 0;
 	}
 }
 
@@ -182,6 +188,11 @@ function recordRunOutcome(worker: Worker, failed: boolean): void {
 		failed,
 		durationMs: Math.max(0, (worker.settledAt?.getTime() ?? Date.now()) - start),
 		tokens: Math.max(0, (worker.tokens ?? 0) - (worker.runTokensBase ?? 0)),
+		...(worker.costUsd === undefined ? {} : { costUsd: Math.max(0, worker.costUsd - (worker.runCostBase ?? 0)) }),
+		costKind: worker.profile.backend === "claude-code" ? "estimated" : "reported",
+		backend: worker.profile.backend,
+		model: worker.profile.model,
+		task: worker.task,
 	});
 }
 
@@ -308,7 +319,12 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 	if (!settlement) return;
 	worker.claudeSessionId = settlement.sessionId ?? worker.claudeSessionId;
 	const tokens = claudeUsageTokenTotal(settlement.usage);
-	if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
+	const cumulativeUsage = accumulateReportedUsage(
+		{ ...(worker.tokens === undefined ? {} : { tokens: worker.tokens }), ...(worker.costUsd === undefined ? {} : { costUsd: worker.costUsd }) },
+		{ ...(tokens === undefined ? {} : { tokens }), ...(settlement.estimatedCostUsd === undefined ? {} : { costUsd: settlement.estimatedCostUsd }) },
+	);
+	worker.tokens = cumulativeUsage.tokens;
+	worker.costUsd = cumulativeUsage.costUsd;
 	// A usage-limit result is an account problem, not a task outcome: fail
 	// over to the next available account instead of settling or failing.
 	if (settlement.isError && isUsageLimitText(settlement.result) && config?.claudeAccounts) {
@@ -372,8 +388,14 @@ function handleRpcLine(worker: Worker, line: string): void {
 		case "turn_end": {
 			const text = getText(event.message);
 			if (text) worker.lastResult = text;
-			const tokens = getUsageTokens(event.message);
-			if (tokens !== undefined) worker.tokens = Math.max(worker.tokens ?? 0, tokens);
+			if (shouldAccumulatePiUsage(event.type)) {
+				const cumulativeUsage = accumulateReportedUsage(
+					{ ...(worker.tokens === undefined ? {} : { tokens: worker.tokens }), ...(worker.costUsd === undefined ? {} : { costUsd: worker.costUsd }) },
+					piMessageUsage(event.message),
+				);
+				worker.tokens = cumulativeUsage.tokens;
+				worker.costUsd = cumulativeUsage.costUsd;
+			}
 			break;
 		}
 		case "agent_settled":
@@ -550,32 +572,38 @@ export default function orchestrator(pi: ExtensionAPI) {
 	ensureOrchestratorExitHook(runtime);
 	flushDeferredWorkerReports();
 
-	// Passive worker check-ins: every interval, hand the coordinator a compact
-	// digest of a long-running worker's captured transcript. The worker itself
-	// is never interrupted or asked to report.
+	// Passive worker assessments inspect only captured state/transcript. Healthy
+	// checks are a hidden next-turn custom message; suspicious checks alone wake
+	// the coordinator. Neither path writes to the worker process.
 	const checkInIntervalMs = config.checkInMinutes * 60_000;
-	const checkInTimer = checkInIntervalMs > 0
-		? setInterval(() => {
+	const startCheckInTimer = () => {
+		if (checkInIntervalMs <= 0 || runtime.checkInTimer !== undefined || runtime.generation !== generation) return;
+		const checkInTimer = setInterval(() => {
 			if (runtime.generation !== generation || runtime.reportsHeld || !runtime.api) return;
 			for (const worker of runtime.workers.values()) {
 				if (!isCheckInDue(worker, checkInIntervalMs)) continue;
 				const checkedAt = Date.now();
-				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt);
+				const assessment = assessWorkerCheckIn(worker, checkInIntervalMs, checkedAt);
+				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment);
 				try {
-					runtime.api.sendUserMessage(digest, { deliverAs: "followUp" });
-					// Mark only a delivered digest. A failed send remains due for the
-					// next tick, and building before marking preserves its transcript window.
+					const wake = shouldWakeForCheckIn(worker, assessment);
+					if (assessment.status === "healthy") deliverCheckIn(runtime.api, digest, assessment);
+					else if (wake) {
+						deliverCheckIn(runtime.api, digest, assessment);
+						worker.lastAlertAt = new Date(checkedAt);
+						worker.lastAlertRevision = worker.transcriptRevision;
+					}
 					worker.lastCheckinAt = new Date(checkedAt);
+					worker.lastCheckinRevision = worker.transcriptRevision;
+					worker.healthStreak = assessment.status === "healthy" ? (worker.healthStreak ?? 0) + 1 : 0;
 				} catch {
 					// A torn-down session must not break the timer; the next tick retries.
 				}
 			}
-		}, 60_000)
-		: undefined;
-	if (checkInTimer) {
+		}, 60_000);
 		runtime.checkInTimer = checkInTimer;
 		checkInTimer.unref?.();
-	}
+	};
 
 	let refreshWorkerWidget = () => {};
 	let stopWorkerWidgetTimer = () => {};
@@ -592,6 +620,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		startCheckInTimer();
 		stopWorkerWidgetTimer();
 		refreshWorkerWidget = () => {};
 		await activate(ctx);
@@ -900,9 +929,25 @@ export default function orchestrator(pi: ExtensionAPI) {
 			: coordinatorInstructions(catalog, statsSummary(loadStats(), workerNames(catalog)))}`,
 	}));
 
-	pi.on("agent_settled", async () => {
+	pi.on("agent_settled", async (_event, ctx) => {
 		const restrictedTools = solToolMode.settle();
 		if (restrictedTools) pi.setActiveTools(restrictedTools);
+		// agent_settled is Pi's safe boundary: unlike agent_end, no automatic
+		// retry, compaction retry, or queued follow-up remains active.
+		if (runtime.generation === generation && isOutcomeRolloverEligible("agent_settled", runtime.workers.values(), runtime, ctx.getContextUsage(), config.rolloverContextPercent)) {
+			const version = beginOutcomeRollover(runtime);
+			if (version !== undefined) {
+				try {
+					ctx.compact({
+						customInstructions: OUTCOME_ROLLOVER_INSTRUCTIONS,
+						onComplete: () => completeOutcomeRollover(runtime, version),
+						onError: () => failOutcomeRollover(runtime, version),
+					});
+				} catch {
+					failOutcomeRollover(runtime, version);
+				}
+			}
+		}
 		// Do not let a stale generation reap workers after a reload. Deferred
 		// reports stay live until a current API target accepts them.
 		if (runtime.generation !== generation || !runtime.headlessReap) return;
