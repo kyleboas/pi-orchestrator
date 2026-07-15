@@ -41,6 +41,8 @@ The Terra, Sol, and Fable aliases are opinionated defaults from this package's a
 
 Configuration is read once when the extension initializes. It uses `PI_ORCHESTRATOR_CONFIG` when set; otherwise it reads `~/.config/pi-orchestrator/config.json` if present; otherwise defaults apply. `~` is expanded in the config-path environment variable. Invalid, empty, duplicate, or incomplete worker catalogs safely use the full explicit default catalog without exposing configuration contents.
 
+`checkInMinutes` is an optional nonnegative finite number and defaults to `15`; set it to `0` to disable check-ins. A check-in is a passive coordinator follow-up assembled only from the worker's already-captured task, transcript, and lifecycle state. It never sends a message to, steers, or interrupts the worker. Its compact digest contains the task, a few recent tool/worker signals, and the latest worker words; the coordinator should acknowledge briefly when the worker is on track and steer only for actual drift, never request metrics, status, or an ETA.
+
 `workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string.
 
 ```json
@@ -51,6 +53,7 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
     "thinking": "high"
   },
   "commands": { "pi": "pi", "claude": "claude-auto" },
+  "checkInMinutes": 15,
   "workers": {
     "Builder": {
       "backend": "pi-rpc",

@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { ClaudeAccountsConfig } from "./orchestrator-accounts.ts";
 import { defaultClaudeAccountStatePath } from "./orchestrator-accounts.ts";
+import { DEFAULT_CHECKIN_MINUTES } from "./orchestrator-checkin.ts";
 import type { PiThinkingLevel, WorkerProfile } from "./orchestrator-core.ts";
 
 export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
@@ -12,6 +13,8 @@ export type OrchestratorConfig = {
 	workers: Record<string, WorkerProfile>;
 	/** When set, Claude workers rotate across these accounts and fail over on usage limits. */
 	claudeAccounts?: ClaudeAccountsConfig;
+	/** Minutes between passive worker progress digests to the coordinator; 0 disables. */
+	checkInMinutes: number;
 	warning?: string;
 };
 
@@ -88,8 +91,12 @@ function claudeAccounts(value: unknown): ClaudeAccountsConfig | undefined {
 		statePath: nonempty(value.state) ? expandHome(value.state.trim()) : defaultClaudeAccountStatePath(),
 	};
 }
+function checkInMinutes(value: unknown): number {
+	if (value === undefined) return DEFAULT_CHECKIN_MINUTES;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : DEFAULT_CHECKIN_MINUTES;
+}
 function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
-	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, ...(warning ? { warning } : {}) };
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, ...(warning ? { warning } : {}) };
 }
 
 /** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
@@ -120,6 +127,7 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 				pi: command(env.PI_ORCHESTRATOR_PI_BIN, command(commandsRaw.pi, "pi")),
 				claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
 			}, workers: configuredWorkers,
+			checkInMinutes: checkInMinutes(raw.checkInMinutes),
 			...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 		};
 	} catch {

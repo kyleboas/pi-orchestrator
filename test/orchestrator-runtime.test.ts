@@ -6,6 +6,7 @@ import {
 	bindOrchestratorSession,
 	createOrchestratorRuntimeForTesting,
 	deliverWorkerReport,
+	disposeOrchestratorCheckInTimer,
 	ensureOrchestratorExitHook,
 	getOrchestratorRuntime,
 	notifyOrchestratorStateChange,
@@ -41,6 +42,7 @@ test("reload generations share workers while API/notifier ownership moves safely
 	runtime.api = undefined;
 	runtime.onStateChange = undefined;
 	runtime.disposeUi = undefined;
+	disposeOrchestratorCheckInTimer(runtime);
 	runtime.generation = undefined;
 	runtime.headlessReap = false;
 
@@ -76,6 +78,23 @@ test("reload generations share workers while API/notifier ownership moves safely
 	assert.deepEqual(delivered, ["second:result"]);
 	assert.equal(releaseOrchestratorSession(runtime, secondGeneration), true);
 	assert.equal(secondDisposed, 1);
+});
+
+test("check-in timers are retired on reload and current-session shutdown", async () => {
+	const runtime = createOrchestratorRuntimeForTesting();
+	let staleTicks = 0;
+	runtime.checkInTimer = setInterval(() => { staleTicks++; }, 1);
+	const generation = bindOrchestratorApi(runtime, api(() => {}));
+	assert.equal(runtime.checkInTimer, undefined, "a replacement generation clears the old ticker");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(staleTicks, 0);
+
+	let currentTicks = 0;
+	runtime.checkInTimer = setInterval(() => { currentTicks++; }, 1);
+	assert.equal(releaseOrchestratorSession(runtime, generation), true);
+	assert.equal(runtime.checkInTimer, undefined, "current-session shutdown clears its ticker");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(currentTicks, 0);
 });
 
 test("undeliverable reports are deferred and delivered exactly once after rebinding", () => {

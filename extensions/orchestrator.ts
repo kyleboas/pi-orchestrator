@@ -69,6 +69,7 @@ import {
 	transcriptFromRpcEvent,
 	type TranscriptEntry,
 } from "./orchestrator-lib/orchestrator-transcript.ts";
+import { buildCheckInDigest, isCheckInDue } from "./orchestrator-lib/orchestrator-checkin.ts";
 import {
 	loadStats,
 	recordWorkerOutcome,
@@ -107,6 +108,8 @@ ${workerNames(catalog).map((name) => `- ${workerDescription(name, catalog[name]!
 Default to the cheapest tier that can plausibly do the job well; escalate only when the task's difficulty demands it.${stats}
 
 Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Do not use /end or request an end-of-task summary.
+
+Never steer a worker just to ask how it is doing: status-report steers interrupt the work and waste its context. Passive progress digests for long-running workers arrive automatically; when one arrives and the worker is on track, acknowledge in one short sentence and let it keep working. Steer only to correct actual drift.
 
 Workers run concurrently, and parallel delegation is your default: before delegating, always decompose the task into independent workstreams (different files or subsystems with no ordering dependency). Two or more independent workstreams MUST each go to a different worker in the same assistant turn — emit the orchestrator_delegate calls together; never delegate one piece, wait for its result, then delegate the next when they were independent all along. Give each worker a disjoint set of files to change so they never edit the same file. Keep it to two or three concurrent workers, and sequence genuinely dependent work through steering instead. This applies regardless of how earlier tasks in this session were delegated.
 
@@ -212,6 +215,13 @@ function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
 		});
 		queueClaudeTurn(worker);
 		worker.lastInstruction = instructions;
+		// Unlike Pi RPC's agent_start event, Claude's stream-json protocol has
+		// no separate run-start event. Its accepted initial instruction means it
+		// is now working (and eligible for a passive check-in).
+		if (worker.state === "starting") {
+			worker.state = "working";
+			notifyOrchestratorStateChange(getOrchestratorRuntime());
+		}
 		return true;
 	} catch {
 		return false;
@@ -539,6 +549,33 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const generation = bindOrchestratorApi(runtime, pi);
 	ensureOrchestratorExitHook(runtime);
 	flushDeferredWorkerReports();
+
+	// Passive worker check-ins: every interval, hand the coordinator a compact
+	// digest of a long-running worker's captured transcript. The worker itself
+	// is never interrupted or asked to report.
+	const checkInIntervalMs = config.checkInMinutes * 60_000;
+	const checkInTimer = checkInIntervalMs > 0
+		? setInterval(() => {
+			if (runtime.generation !== generation || runtime.reportsHeld || !runtime.api) return;
+			for (const worker of runtime.workers.values()) {
+				if (!isCheckInDue(worker, checkInIntervalMs)) continue;
+				const checkedAt = Date.now();
+				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt);
+				try {
+					runtime.api.sendUserMessage(digest, { deliverAs: "followUp" });
+					// Mark only a delivered digest. A failed send remains due for the
+					// next tick, and building before marking preserves its transcript window.
+					worker.lastCheckinAt = new Date(checkedAt);
+				} catch {
+					// A torn-down session must not break the timer; the next tick retries.
+				}
+			}
+		}, 60_000)
+		: undefined;
+	if (checkInTimer) {
+		runtime.checkInTimer = checkInTimer;
+		checkInTimer.unref?.();
+	}
 
 	let refreshWorkerWidget = () => {};
 	let stopWorkerWidgetTimer = () => {};
