@@ -150,3 +150,20 @@ test("pi rpc toolResult messages extract as attachable results", () => {
 	assert.equal(entry!.tool!.name, "");
 	assert.equal(entry!.tool!.result!.isError, false);
 });
+
+test("assistant thinking blocks are captured and flagged", () => {
+	const entries = transcriptFromRpcEvent({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "Plan the edit first." },
+				{ type: "text", text: "Editing now." },
+			],
+		},
+	});
+	assert.deepEqual(entries.map((entry) => [entry.role, entry.text, entry.thinking ?? false]), [
+		["assistant", "Plan the edit first.", true],
+		["assistant", "Editing now.", false],
+	]);
+});

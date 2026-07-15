@@ -17,6 +17,8 @@ export type TranscriptEntry = {
 	role: TranscriptRole;
 	/** Plain-text fallback when a native component cannot render the entry. */
 	text: string;
+	/** Assistant reasoning block, rendered in pi's thinking style. */
+	thinking?: boolean;
 	tool?: TranscriptToolCall;
 };
 
@@ -107,6 +109,9 @@ export function transcriptFromMessage(message: unknown): TranscriptEntry[] {
 		if (type === "text") {
 			const text = textOf(part);
 			if (text?.trim()) entries.push({ at: Date.now(), role: role === "assistant" ? "assistant" : "user", text: text.trim() });
+		} else if (type === "thinking" && role === "assistant") {
+			const text = typeof part.thinking === "string" ? part.thinking : textOf(part);
+			if (text?.trim()) entries.push({ at: Date.now(), role: "assistant", text: text.trim(), thinking: true });
 		} else if (type === "toolCall" || type === "tool_use") {
 			const args = part.arguments ?? part.input;
 			entries.push({

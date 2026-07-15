@@ -599,7 +599,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 									if (entry.role === "user") {
 										lines.push(...new UserMessageComponent(entry.text, markdownTheme).render(width));
 									} else if (entry.role === "assistant") {
-										const message = { content: [{ type: "text", text: entry.text }] };
+										const part = entry.thinking ? { type: "thinking", thinking: entry.text } : { type: "text", text: entry.text };
+										const message = { content: [part] };
 										lines.push(...new AssistantMessageComponent(message as never, false, markdownTheme).render(width));
 									} else if (entry.role === "tool" && entry.tool?.name) {
 										lines.push(...renderToolEntry(entry, width));
