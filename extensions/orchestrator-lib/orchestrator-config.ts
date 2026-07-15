@@ -16,9 +16,10 @@ const NAME = /^[A-Za-z][A-Za-z0-9 -]{0,48}$/;
 const THINKING = new Set<PiThinkingLevel>(["low", "medium", "high"]);
 
 export const DEFAULT_WORKERS: Record<string, WorkerProfile> = {
-	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high" },
-	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
-	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low" },
+	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
+	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation when Luna would be out of its depth." },
+	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
+	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier; reserve for genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
 	Opus: { backend: "claude-code", model: "opus" },
 	Sonnet: { backend: "claude-code", model: "sonnet" },
 	Haiku: { backend: "claude-code", model: "haiku" },
@@ -40,13 +41,18 @@ function command(value: unknown, fallback: string): string {
 function piModel(value: unknown): value is string {
 	return nonempty(value) && /^[^/\s]+\/[^/\s]+$/.test(value.trim());
 }
+function description(value: unknown): { description?: string } {
+	if (!nonempty(value)) return {};
+	const cleaned = value.replace(/\s+/g, " ").trim().slice(0, 300);
+	return cleaned ? { description: cleaned } : {};
+}
 function profile(value: unknown): WorkerProfile | undefined {
 	if (!object(value)) return undefined;
 	if (value.backend === "pi-rpc") {
 		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model)) return undefined;
-		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel };
+		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description) };
 	}
-	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim() };
+	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim(), ...description(value.description) };
 	return undefined;
 }
 function workers(value: unknown): Record<string, WorkerProfile> | undefined {
@@ -77,7 +83,9 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 	try {
 		const raw: unknown = JSON.parse(readFileSync(requested, "utf8"));
 		if (!object(raw)) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
-		const configuredWorkers = workers(raw.workers);
+		// A config without a workers key keeps its coordinator/commands and the
+		// default catalog; only a present-but-invalid catalog rejects the file.
+		const configuredWorkers = raw.workers === undefined ? { ...DEFAULT_WORKERS } : workers(raw.workers);
 		if (!configuredWorkers) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
 		const coordinatorRaw = raw.coordinator === undefined ? {} : raw.coordinator;
 		if (!object(coordinatorRaw) || !THINKING.has((coordinatorRaw.thinking ?? "high") as PiThinkingLevel) ||

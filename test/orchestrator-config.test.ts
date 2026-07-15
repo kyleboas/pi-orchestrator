@@ -12,18 +12,19 @@ function configFile(value: unknown): string { const dir = mkdtempSync(join(tmpdi
 function remove(file: string) { rmSync(join(file, ".."), { recursive: true, force: true }); }
 
 const EXPECTED_DEFAULT_WORKERS = {
-	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high" },
-	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
-	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low" },
+	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
+	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation when Luna would be out of its depth." },
+	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
+	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier; reserve for genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
 	Opus: { backend: "claude-code", model: "opus" },
 	Sonnet: { backend: "claude-code", model: "sonnet" },
 	Haiku: { backend: "claude-code", model: "haiku" },
 	Fable: { backend: "claude-code", model: "fable" },
 } as const;
 
-test("default catalog uses seven explicit individual worker profiles", () => {
+test("default catalog uses eight explicit individual worker profiles", () => {
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "absent-config") });
-	assert.deepEqual(workerNames(config.workers), ["Terra", "Sol-Medium", "Sol-Low", "Opus", "Sonnet", "Haiku", "Fable"]);
+	assert.deepEqual(workerNames(config.workers), ["Luna", "Sol-Low", "Sol-Medium", "Terra", "Opus", "Sonnet", "Haiku", "Fable"]);
 	assert.deepEqual(config.workers, EXPECTED_DEFAULT_WORKERS);
 	assert.deepEqual(DEFAULT_WORKERS, EXPECTED_DEFAULT_WORKERS);
 	const terra = config.workers.Terra!;
@@ -83,4 +84,19 @@ test("configured list is accepted and malformed, missing-model, empty, or duplic
 test("environment command overrides are portable even when config is unavailable", () => {
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "missing"), PI_ORCHESTRATOR_PI_BIN: "my-pi", PI_ORCHESTRATOR_CLAUDE_BIN: "claude-auto" });
 	assert.deepEqual(config.commands, { pi: "my-pi", claude: "claude-auto" });
+});
+
+test("a config without workers keeps its coordinator and commands with the default catalog", () => {
+	const file = configFile({ coordinator: { provider: "p", id: "m", thinking: "high" }, commands: { claude: "claude-auto" } });
+	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
+	assert.equal(config.warning, undefined);
+	assert.equal(config.coordinator.id, "m");
+	assert.equal(config.commands.claude, "claude-auto");
+	assert.deepEqual(config.workers, EXPECTED_DEFAULT_WORKERS);
+});
+
+test("worker descriptions are accepted, sanitized, and surfaced", () => {
+	const file = configFile({ workers: { Builder: { backend: "pi-rpc", model: "p/m", thinking: "low", description: "Line one\nline two\t end  " } } });
+	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
+	assert.equal(config.workers.Builder!.description, "Line one line two end");
 });

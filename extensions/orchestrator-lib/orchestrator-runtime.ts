@@ -30,6 +30,10 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	transcript: TranscriptEntry[];
 	/** Bumped on every transcript mutation (appends and result attachments) for cheap change detection. */
 	transcriptRevision?: number;
+	/** Token total when the current run's instructions were sent; per-run cost = tokens - base. */
+	runTokensBase?: number;
+	/** Run whose outcome was already written to the stats ledger. */
+	statsRecordedRun?: number;
 	rpcNextId: number;
 	rpcPending: Map<string, PendingRpc>;
 };

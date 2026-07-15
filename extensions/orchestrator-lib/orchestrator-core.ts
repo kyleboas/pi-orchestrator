@@ -1,14 +1,19 @@
 export const ORCHESTRATOR_TOOL_NAMES = ["orchestrator_delegate", "orchestrator_steer", "orchestrator_workers", "orchestrator_stop", "orchestrator_takeover"] as const;
 export const RPC_WORKER_TOOL_NAMES = ["read", "bash", "edit", "write"] as const;
 export type PiThinkingLevel = "low" | "medium" | "high";
-export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel };
-export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string };
+export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel; description?: string };
+export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string; description?: string };
 export type WorkerProfile = PiRpcWorkerProfile | ClaudeCodeWorkerProfile;
 export type WorkerCatalog = Record<string, WorkerProfile>;
 
 export function isPiRpcWorkerProfile(profile: WorkerProfile): profile is PiRpcWorkerProfile { return profile.backend === "pi-rpc"; }
 export function workerNames(catalog: WorkerCatalog): string[] { return Object.keys(catalog); }
-export function workerDescription(name: string, profile: WorkerProfile): string { return profile.backend === "pi-rpc" ? `${name}: Pi RPC implementation worker (${profile.model}, ${profile.thinking} thinking).` : `${name}: persistent Claude Code implementation worker (${profile.model}).`; }
+export function workerDescription(name: string, profile: WorkerProfile): string {
+	const base = profile.backend === "pi-rpc"
+		? `${name}: Pi RPC implementation worker (${profile.model}, ${profile.thinking} thinking).`
+		: `${name}: persistent Claude Code implementation worker (${profile.model}).`;
+	return profile.description ? `${base} ${profile.description}` : base;
+}
 export function catalogText(catalog: WorkerCatalog): string { const names = workerNames(catalog); return names.length < 2 ? names[0] ?? "workers" : `${names.slice(0, -1).join(", ")}, or ${names.at(-1)}`; }
 export function workerRpcArgs(model: string, thinking: PiThinkingLevel): string[] {
 	return ["--mode", "rpc", "--no-session", "--no-extensions", "--tools", RPC_WORKER_TOOL_NAMES.join(","), "--model", model, "--thinking", thinking];

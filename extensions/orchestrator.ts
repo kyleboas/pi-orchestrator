@@ -63,6 +63,12 @@ import {
 	type TranscriptEntry,
 } from "./orchestrator-lib/orchestrator-transcript.ts";
 import {
+	loadStats,
+	recordWorkerOutcome,
+	recordWorkerSteer,
+	statsSummary,
+} from "./orchestrator-lib/orchestrator-stats.ts";
+import {
 	isDownKey,
 	isEnterKey,
 	isEscapeKey,
@@ -80,11 +86,18 @@ export function createWorkerSchema(catalog: WorkerCatalog) {
 	return Type.Union(workerNames(catalog).map((name) => Type.Literal(name, { description: workerDescription(name, catalog[name]!) })));
 }
 
-export function coordinatorInstructions(catalog: WorkerCatalog): string {
+export function coordinatorInstructions(catalog: WorkerCatalog, statsText?: string): string {
 	const names = catalogText(catalog);
+	const stats = statsText
+		? `\n\nPast worker outcomes (all sessions, averages per task):\n${statsText}\nWeigh this record alongside the worker descriptions: prefer the cheapest tier whose track record fits the task, and escalate a tier when a cheaper one has been failing or needing repeated steers on similar work.\n`
+		: "";
 	return `You are the orchestration lead. You investigate, think, and plan yourself, then hand implementation to workers; you never mutate anything.
 
 Before delegating, use your read-only tools to inspect the relevant files, locate the root cause, and decide the approach. Then delegate with orchestrator_delegate, choosing one of: ${names}. Give a precise implementation brief: files to change, the change and why, edge cases, and validation. Workers implement your plan — do not send them off to investigate what you could determine yourself. Configured names are intentional: natural requests such as ${workerNames(catalog).map((name) => `“ask ${name}”`).join(", ")} select that worker.
+
+Worker tiers, cheapest first, with what each is for:
+${workerNames(catalog).map((name) => `- ${workerDescription(name, catalog[name]!)}`).join("\n")}
+Default to the cheapest tier that can plausibly do the job well; escalate only when the task's difficulty demands it.${stats}
 
 Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Do not use /end or request an end-of-task summary.
 
@@ -144,7 +157,22 @@ function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 	worker.transcriptRevision = (worker.transcriptRevision ?? 0) + 1;
 	// The row timer shows time since the worker was last instructed (delegate
 	// or steer), so only user entries reset it — worker output does not.
-	if (entry.role === "user") worker.lastActivityAt = new Date(entry.at);
+	if (entry.role === "user") {
+		worker.lastActivityAt = new Date(entry.at);
+		worker.runTokensBase = worker.tokens ?? 0;
+	}
+}
+
+/** Write one ledger outcome per run, at whichever terminal transition fires first. */
+function recordRunOutcome(worker: Worker, failed: boolean): void {
+	if (worker.statsRecordedRun === worker.run) return;
+	worker.statsRecordedRun = worker.run;
+	const start = worker.lastActivityAt?.getTime() ?? worker.startedAt.getTime();
+	recordWorkerOutcome(worker.name, {
+		failed,
+		durationMs: Math.max(0, (worker.settledAt?.getTime() ?? Date.now()) - start),
+		tokens: Math.max(0, (worker.tokens ?? 0) - (worker.runTokensBase ?? 0)),
+	});
 }
 
 function failWorker(worker: Worker, message: string): void {
@@ -152,6 +180,7 @@ function failWorker(worker: Worker, message: string): void {
 	worker.state = "failed";
 	worker.settledAt ??= new Date();
 	worker.lastError = message;
+	recordRunOutcome(worker, true);
 	reportWorkerResult(worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
@@ -249,7 +278,10 @@ async function settleWorker(worker: Worker): Promise<void> {
 		: undefined;
 	const text = selectFinalWorkerText(worker.lastResult, latest);
 	if (text) worker.lastResult = text;
-	if (finishWorkerSettlement(worker, run)) reportWorkerResult(worker);
+	if (finishWorkerSettlement(worker, run)) {
+		recordRunOutcome(worker, false);
+		reportWorkerResult(worker);
+	}
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
@@ -273,10 +305,14 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>): voi
 		worker.state = "failed";
 		worker.settledAt ??= new Date();
 		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
+		recordRunOutcome(worker, true);
 		reportWorkerResult(worker);
 	} else {
 		worker.lastResult = settlement.result;
-		if (finishWorkerSettlement(worker, run)) reportWorkerResult(worker);
+		if (finishWorkerSettlement(worker, run)) {
+			recordRunOutcome(worker, false);
+			reportWorkerResult(worker);
+		}
 	}
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
@@ -734,7 +770,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event) => ({
 		systemPrompt: `${event.systemPrompt}\n\n${solToolMode.takeoverActive
 			? TAKEOVER_SYSTEM_INSTRUCTIONS(takeoverReason)
-			: coordinatorInstructions(catalog)}`,
+			: coordinatorInstructions(catalog, statsSummary(loadStats(), workerNames(catalog)))}`,
 	}));
 
 	pi.on("agent_settled", async () => {
@@ -813,6 +849,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
 				return content(`${worker.id} could not accept follow-up instructions.`);
 			}
+			recordWorkerSteer(worker.name);
 			refreshWorkerWidget();
 			return content(`Sent follow-up instructions to ${worker.id}.`);
 		},

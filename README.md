@@ -18,13 +18,20 @@ Pi workers require `pi` on `PATH`. Claude workers are optional and require Claud
 
 Every worker is an individual, explicit model profile. Pi workers **never inherit the coordinator model**: each Pi RPC launch always uses the `model` and `thinking` in that worker's profile. The default catalog is:
 
-- `Terra`: Pi RPC, `openai-codex/gpt-5.6-terra`, high thinking
-- `Sol-Medium`: Pi RPC, `openai-codex/gpt-5.6-sol`, medium thinking
+- `Luna`: Pi RPC, `openai-codex/gpt-5.6-luna`, low thinking — the cheap default for routine bounded work
 - `Sol-Low`: Pi RPC, `openai-codex/gpt-5.6-sol`, low thinking
+- `Sol-Medium`: Pi RPC, `openai-codex/gpt-5.6-sol`, medium thinking
+- `Terra`: Pi RPC, `openai-codex/gpt-5.6-terra`, high thinking — reserved for genuinely hard work
 - `Opus`: Claude Code, `opus`
 - `Sonnet`: Claude Code, `sonnet`
 - `Haiku`: Claude Code, `haiku`
 - `Fable`: Claude Code, `fable`
+
+Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. The coordinator is instructed to default to the cheapest plausible tier and escalate only when difficulty demands it.
+
+## Outcome ledger
+
+Every settled run appends to `~/.config/pi-orchestrator/stats.json`: per worker name, task count, failures, steers, total duration, and tokens. A per-worker summary (averages) is injected into the coordinator's system prompt each turn so tier choice is informed by the actual track record — failure-prone cheap tiers get escalated, reliable ones keep the work. The ledger is advisory: corrupt or missing files load as empty and IO errors never disturb orchestration. Delete the file to reset the record.
 
 For example: “ask Opus to implement the migration and run its tests.” While a worker is live: “steer Opus: also cover rollback behavior.”
 
@@ -60,7 +67,7 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
 }
 ```
 
-`coordinator` is optional. It defaults to high thinking and changes the coordinator model only when **both** `provider` and `id` are supplied. Coordinator `{provider, id, thinking}` settings affect only the coordinator; they never select or alter a worker model. See [`examples/config.json`](examples/config.json) for the same portable shape and placeholder IDs.
+A config without a `workers` key keeps its `coordinator`/`commands` and uses the default catalog. `coordinator` is optional. It defaults to high thinking and changes the coordinator model only when **both** `provider` and `id` are supplied. Coordinator `{provider, id, thinking}` settings affect only the coordinator; they never select or alter a worker model. See [`examples/config.json`](examples/config.json) for the same portable shape and placeholder IDs.
 
 Executable overrides are command names or executable paths, never shell snippets. Config `commands.pi` and `commands.claude` set them; environment variables take precedence:
 
