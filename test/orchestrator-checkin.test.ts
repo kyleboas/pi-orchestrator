@@ -1,58 +1,46 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildCheckInDigest, isCheckInDue } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
+import { assessWorkerCheckIn, buildCheckInDigest, checkInCadenceMs, deliverCheckIn, isCheckInDue, shouldWakeForCheckIn } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
 import type { TranscriptEntry } from "../extensions/orchestrator-lib/orchestrator-transcript.ts";
 
-const startedAt = new Date("2026-07-15T12:00:00.000Z");
-const MIN = 60_000;
+const startedAt = new Date("2026-07-15T12:00:00.000Z"); const MIN = 60_000;
+function worker(overrides: Record<string, unknown> = {}) { return { name: "Luna", id: "luna-1", state: "working", task: "Implement the migration and run its tests.", startedAt, transcript: [] as TranscriptEntry[], ...overrides }; }
 
-function worker(overrides: Record<string, unknown> = {}) {
-	return {
-		name: "Opus",
-		id: "opus-1",
-		state: "working",
-		task: "Implement the migration and run its tests.",
-		startedAt,
-		transcript: [] as TranscriptEntry[],
-		...overrides,
-	};
-}
-
-test("check-ins come due only after a quiet full interval of continuous work", () => {
-	const interval = 15 * MIN;
-	const base = startedAt.getTime();
-	assert.equal(isCheckInDue(worker(), interval, base + 14 * MIN), false);
-	assert.equal(isCheckInDue(worker(), interval, base + 15 * MIN), true);
-	assert.equal(isCheckInDue(worker({ state: "idle" }), interval, base + 20 * MIN), false);
-	assert.equal(isCheckInDue(worker(), 0, base + 20 * MIN), false);
-	const steered = worker({ lastActivityAt: new Date(base + 10 * MIN) });
-	assert.equal(isCheckInDue(steered, interval, base + 20 * MIN), false);
-	assert.equal(isCheckInDue(steered, interval, base + 25 * MIN), true);
-	const checked = worker({ lastCheckinAt: new Date(base + 16 * MIN) });
-	assert.equal(isCheckInDue(checked, interval, base + 20 * MIN), false);
-	assert.equal(isCheckInDue(checked, interval, base + 31 * MIN), true);
+test("initial base assessment is due at 15 minutes and healthy checks back off to 30", () => {
+	const base = 15 * MIN; const at = startedAt.getTime();
+	assert.equal(isCheckInDue(worker(), base, at + 14 * MIN), false); assert.equal(isCheckInDue(worker(), base, at + 15 * MIN), true);
+	const healthy = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 1 });
+	assert.equal(checkInCadenceMs({ healthStreak: 1 }, base), 30 * MIN); assert.equal(isCheckInDue(healthy, base, at + 44 * MIN), false); assert.equal(isCheckInDue(healthy, base, at + 45 * MIN), true);
+	const reset = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 0 });
+	assert.equal(isCheckInDue(reset, base, at + 30 * MIN), true); assert.equal(isCheckInDue(worker(), 0, at + 30 * MIN), false);
 });
 
-test("digest is compact: task, recent tools, latest words, no demands on the worker", () => {
-	const base = startedAt.getTime();
-	const transcript: TranscriptEntry[] = [
-		{ at: base + 1 * MIN, role: "assistant", text: "Starting with the schema." },
-		{ at: base + 5 * MIN, role: "tool", text: "bash: npm test" },
-		{ at: base + 9 * MIN, role: "tool", text: "edit: src/migrate.ts" },
-		{ at: base + 12 * MIN, role: "assistant", text: "Migration written; fixing the failing regression test now." },
-	];
-	const digest = buildCheckInDigest(worker({ transcript }), 15 * MIN, base + 15 * MIN);
-	assert.match(digest, /Opus progress check — opus-1, working 15m/);
-	assert.match(digest, /edit: src\/migrate\.ts/);
-	assert.match(digest, /fixing the failing regression test/);
-	assert.match(digest, /worker was not interrupted/);
-	assert.match(digest, /Do not ask it for status reports, metrics, or ETAs\./);
-	assert.ok(digest.length < 1_200);
+test("assessment deterministically identifies stalls, blocking language, and repeated activity", () => {
+	const at = startedAt.getTime(); const base = 15 * MIN;
+	assert.deepEqual(assessWorkerCheckIn(worker(), base, at + base).signals, ["no assistant or tool activity for 15m"]);
+	const blocked = assessWorkerCheckIn(worker({ transcript: [{ at: at + 14 * MIN, role: "assistant", text: "Blocked: permission denied by the repository." }] }), base, at + base);
+	assert.equal(blocked.status, "suspicious"); assert.match(blocked.signals.join(" "), /possible blockage/);
+	const repeated = assessWorkerCheckIn(worker({ transcript: [1, 2, 3].map((n) => ({ at: at + n * MIN, role: "tool" as const, text: "bash: npm test" })) }), base, at + base);
+	assert.match(repeated.signals.join(" "), /repeated recent tool activity 3 times/);
+	assert.equal(assessWorkerCheckIn(worker({ transcript: [{ at: at + 14 * MIN, role: "assistant", text: "Implementing the test now." }] }), base, at + base).status, "healthy");
 });
 
-test("digest notes silence when nothing new was captured", () => {
-	const base = startedAt.getTime();
-	const transcript: TranscriptEntry[] = [{ at: base, role: "assistant", text: "On it." }];
-	const digest = buildCheckInDigest(worker({ transcript, lastCheckinAt: new Date(base + 16 * MIN) }), 15 * MIN, base + 31 * MIN);
-	assert.match(digest, /No new activity captured/);
+test("check-in delivery integration uses triggerTurn:false for healthy work and wakes only suspicious work without touching worker", () => {
+	const calls: Array<{ kind: string; options: unknown }> = []; const original = worker();
+	const api = { sendMessage: (_message: unknown, options: unknown) => calls.push({ kind: "custom", options }), sendUserMessage: (_text: string, options: unknown) => calls.push({ kind: "user", options }) };
+	const healthy = { status: "healthy" as const, signals: [] };
+	assert.equal(deliverCheckIn(api, "healthy", healthy), "silent");
+	assert.deepEqual(calls, [{ kind: "custom", options: { triggerTurn: false, deliverAs: "nextTurn" } }]);
+	assert.equal(deliverCheckIn(api, "stalled", { status: "suspicious", signals: ["no activity"] }), "wake");
+	assert.deepEqual(calls[1], { kind: "user", options: { deliverAs: "followUp" } });
+	assert.equal(shouldWakeForCheckIn({ lastAlertAt: new Date(), lastAlertRevision: 2, transcriptRevision: 2 }, { status: "suspicious", signals: ["same stall"] }), false, "unchanged alerts are not duplicated");
+	assert.equal(shouldWakeForCheckIn({ lastAlertAt: new Date(), lastAlertRevision: 2, transcriptRevision: 3 }, { status: "suspicious", signals: ["new output"] }), true);
+	assert.deepEqual(original.transcript, [], "delivery does not interrupt or mutate the worker");
+});
+
+test("digest is compact and gives concrete suspicious steering guidance", () => {
+	const at = startedAt.getTime(); const transcript: TranscriptEntry[] = [{ at: at + 14 * MIN, role: "assistant", text: "Blocked: rate limit reached." }];
+	const assessment = assessWorkerCheckIn(worker({ transcript }), 15 * MIN, at + 15 * MIN);
+	const digest = buildCheckInDigest(worker({ transcript }), 15 * MIN, at + 15 * MIN, assessment);
+	assert.match(digest, /Luna passive progress check/); assert.match(digest, /rate limit/i); assert.match(digest, /steer only if correction is needed/); assert.ok(digest.length < 1_200);
 });

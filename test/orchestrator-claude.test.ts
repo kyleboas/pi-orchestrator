@@ -80,6 +80,11 @@ test("final Claude result captures final text, error status, session ID, and saf
 	assert.equal(claudeUsageTokenTotal(settlement!.usage), 100);
 });
 
+test("Claude result retains total_cost_usd as an API-equivalent estimate", () => {
+	assert.equal(claudeResultSettlement({ type: "result", result: "done", is_error: false, total_cost_usd: 0.123 })!.estimatedCostUsd, 0.123);
+	assert.equal(claudeResultSettlement({ type: "result", result: "done", total_cost_usd: "unknown" })!.estimatedCostUsd, undefined);
+});
+
 test("Claude error results and empty result events remain terminal settlements", () => {
 	assert.deepEqual(claudeResultSettlement({ type: "result", result: "request failed", is_error: true }), {
 		result: "request failed",

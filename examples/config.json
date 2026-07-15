@@ -8,6 +8,8 @@
     "pi": "pi",
     "claude": "claude-auto"
   },
+  "checkInMinutes": 15,
+  "rolloverContextPercent": 38,
   "workers": {
     "Builder": {
       "backend": "pi-rpc",
