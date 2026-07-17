@@ -16,7 +16,9 @@ import {
 	piWorkerSandboxPlan,
 	resolveWorkerCommand,
 	resolveWorkerLaunch,
+	resolveWorkerWorkspace,
 	workerHomeDirPath,
+	type WorkspaceFs,
 	type CommandFs,
 	type SandboxConfig,
 	type WorkerLaunchRequest,
@@ -65,6 +67,7 @@ function request(overrides: Partial<WorkerLaunchRequest> = {}): WorkerLaunchRequ
 
 test("parseSandboxConfig accepts valid blocks and applies defaults", () => {
 	assert.deepEqual(parseSandboxConfig({}), sandbox());
+	assert.deepEqual(parseSandboxConfig({ workspaceRoots: ["~/code", "/srv/repos"] })!.workspaceRoots, [join(homedir(), "code"), "/srv/repos"]);
 	assert.deepEqual(
 		parseSandboxConfig({ mode: "required", network: "none", env: "allowlist", envAllow: ["ANTHROPIC_BASE_URL"], readOnlyPaths: ["~/runtime"], command: "bwrap" }),
 		sandbox({ mode: "required", network: "none", env: "allowlist", envAllow: ["ANTHROPIC_BASE_URL"], readOnlyPaths: [join(homedir(), "runtime")] }),
@@ -91,6 +94,9 @@ test("parseSandboxConfig rejects every malformed field without echoing values", 
 		{ readOnlyPaths: ["relative/path"] },
 		{ readOnlyPaths: ["/ok\npath"] },
 		{ readOnlyPaths: "~/x" },
+		{ workspaceRoots: "~/code" },
+		{ workspaceRoots: ["relative/code"] },
+		{ workspaceRoots: [""] },
 		{ command: "" },
 		{ command: "bwrap\n--evil" },
 	]) {
@@ -462,6 +468,80 @@ test("cleanup containment is path-component-safe, not a bare prefix match", () =
 	const ok = mkdtempSync(join(tmpdir(), "pi-orchestrator-home-"));
 	cleanupWorkerHomeDir(ok);
 	assert.throws(() => statSync(ok));
+});
+
+const workspaceFsHome = "/home/user";
+/** Directories that "exist" for workspace tests; symlink /home/user/code/link escapes the root. */
+const workspaceFs: WorkspaceFs = {
+	realpathSync: (path) => {
+		if (path === "/home/user/code/link") return "/home/user/other";
+		if (path === "/home/user/code/repo/file.txt" || path.endsWith("/missing")) return path;
+		return path;
+	},
+	statSync: (path) => ({ isDirectory: () => path !== "/home/user/code/repo/file.txt" && !path.endsWith("/missing-throw") }),
+};
+function workspace(config: SandboxConfig, requested: string | undefined, session: string) {
+	return resolveWorkerWorkspace(config, requested, session, workspaceFs, workspaceFsHome);
+}
+
+test("workspace resolution: off mode preserves legacy session cwd untouched", () => {
+	assert.deepEqual(workspace(sandbox(), undefined, "/home/user"), { ok: true, cwd: "/home/user" });
+	// An explicit cwd in off mode is canonicalized but not policed.
+	assert.deepEqual(workspace(sandbox(), "/home/user/code/repo", "/home/user"), { ok: true, cwd: "/home/user/code/repo" });
+});
+
+test("workspace resolution fails closed on the host home and its ancestors", () => {
+	const config = sandbox({ mode: "required", workspaceRoots: ["/home/user/code"] });
+	for (const cwd of ["/home/user", "/home", "/"]) {
+		const result = resolveWorkerWorkspace(config, cwd, "/x", workspaceFs, workspaceFsHome);
+		assert.ok(!result.ok && /host home/.test(result.error), cwd);
+	}
+	// The coordinator's own home session cwd (cwd omitted) is rejected with an
+	// actionable message, never mounted.
+	const session = workspace(config, undefined, "/home/user");
+	assert.ok(!session.ok && /host home/.test(session.error));
+});
+
+test("workspace resolution requires containment in a configured root", () => {
+	const config = sandbox({ mode: "required", workspaceRoots: ["/home/user/code"] });
+	assert.deepEqual(workspace(config, "/home/user/code", "/x"), { ok: true, cwd: "/home/user/code" });
+	assert.deepEqual(workspace(config, "/home/user/code/repo", "/x"), { ok: true, cwd: "/home/user/code/repo" });
+	// Session cwd already inside a root passes without an explicit cwd.
+	assert.deepEqual(workspace(config, undefined, "/home/user/code/repo"), { ok: true, cwd: "/home/user/code/repo" });
+	// Prefix sibling of a root must not match.
+	const sibling = workspace(config, "/home/user/code-evil", "/x");
+	assert.ok(!sibling.ok && /outside every configured/.test(sibling.error));
+	const outside = workspace(config, "/srv/elsewhere", "/x");
+	assert.ok(!outside.ok);
+	// Symlink escape: canonical target leaves the root.
+	const escape = workspace(config, "/home/user/code/link", "/x");
+	assert.ok(!escape.ok && /outside every configured/.test(escape.error));
+	// Non-directory and preferred mode behave identically to required.
+	const file = workspace(config, "/home/user/code/repo/file.txt", "/x");
+	assert.ok(!file.ok && /not a directory/.test(file.error));
+	const preferred = workspace(sandbox({ mode: "preferred", workspaceRoots: ["/home/user/code"] }), "/home/user", "/x");
+	assert.ok(!preferred.ok);
+	// No roots configured: sandboxed delegation is impossible, with guidance.
+	const noRoots = workspace(sandbox({ mode: "required" }), "/home/user/code/repo", "/x");
+	assert.ok(!noRoots.ok && /workspaceRoots are configured/.test(noRoots.error));
+	const relative = workspace(config, "code/repo", "/x");
+	assert.ok(!relative.ok && /absolute/.test(relative.error));
+});
+
+test("launch overlap guard hard-rejects home and worker-home cwds in both sandbox modes", () => {
+	const probe = () => ({ ok: true, unshareNet: true }) as const;
+	for (const mode of ["required", "preferred"] as const) {
+		const config = sandbox({ mode });
+		// fakeEnv.HOME is /home/user: cwd equal to or containing the host home,
+		// or overlapping the worker home, must reject — never spawn or fall back.
+		for (const cwd of ["/home/user", "/home", request().homeDir, "/home/user/.cache", join(request().homeDir, "sub")]) {
+			const result = resolveWorkerLaunch(config, request({ cwd }), fakeEnv, probe, fakeFs);
+			assert.ok(!result.ok, `${mode} must reject cwd ${cwd}`);
+		}
+		// A normal repo cwd still launches sandboxed.
+		const fine = resolveWorkerLaunch(config, request({ cwd: "/home/user/code/repo" }), fakeEnv, probe, fakeFs);
+		assert.ok(fine.ok && fine.sandboxed);
+	}
 });
 
 test("worker home paths are stable, sanitized, and scoped to the orchestrator cache", () => {
