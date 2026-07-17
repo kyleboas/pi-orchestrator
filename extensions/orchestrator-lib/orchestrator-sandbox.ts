@@ -272,8 +272,11 @@ export const PI_WORKER_CONFIG_FILES: readonly string[] = ["auth.json", "models.j
  * home receives only the allowlisted auth/model files, and PI_CODING_AGENT_DIR
  * points at it, so host sessions, chat, logs, secret-store, prompts, and other
  * private state under ~/.pi are never mounted. The gateway token, when Pi's
- * provider config references it, is mounted as that single file — never the
- * surrounding ~/.config/agent directory.
+ * provider config references it, is mounted as that single file at
+ * ~/.config/agent/gateway.token RELATIVE TO THE SANDBOX HOME: consumers
+ * resolve that path against $HOME, which is the isolated worker home inside
+ * the sandbox, so a host-absolute destination would be invisible to them.
+ * The surrounding host ~/.config/agent directory is never mounted.
  */
 export function piWorkerSandboxPlan(homeDir: string, home: string = homedir()): {
 	sandboxEnvOverrides: Record<string, string>;
@@ -281,12 +284,14 @@ export function piWorkerSandboxPlan(homeDir: string, home: string = homedir()): 
 } {
 	const sourceDir = join(home, ".pi", "agent");
 	const isolatedDir = join(homeDir, "pi-agent");
-	const gatewayToken = join(home, ".config", "agent", "gateway.token");
 	return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
 		fileMountsReadOnlyTry: [
 			...PI_WORKER_CONFIG_FILES.map((name) => ({ source: join(sourceDir, name), dest: join(isolatedDir, name) })),
-			{ source: gatewayToken, dest: gatewayToken },
+			{
+				source: join(home, ".config", "agent", "gateway.token"),
+				dest: join(homeDir, ".config", "agent", "gateway.token"),
+			},
 		],
 	};
 }

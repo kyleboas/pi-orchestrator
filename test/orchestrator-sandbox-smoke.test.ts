@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
 	DEFAULT_SANDBOX_CONFIG,
+	piWorkerSandboxPlan,
 	probeBwrap,
 	resetSandboxProbeCacheForTesting,
 	resolveWorkerLaunch,
@@ -57,6 +58,53 @@ test("real bwrap probe and sandboxed launch", { skip: !enabled }, () => {
 		rmSync(cwd, { recursive: true, force: true });
 		rmSync(home, { recursive: true, force: true });
 		rmSync(sourceDir, { recursive: true, force: true });
+	}
+	resetSandboxProbeCacheForTesting();
+});
+
+test("real bwrap: gateway token resolves at $HOME/.config/agent/gateway.token, not a host-home path", { skip: !enabled }, () => {
+	resetSandboxProbeCacheForTesting();
+	assert.ok(probeBwrap("bwrap").ok, "bwrap must be functional for this smoke test");
+
+	const cwd = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-cwd-"));
+	const home = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-home-"));
+	// A fake host home carrying a fake token: the real token is never read.
+	const fakeHostHome = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-host-"));
+	const fakeTokenSource = join(fakeHostHome, ".config", "agent", "gateway.token");
+	mkdirSync(dirname(fakeTokenSource), { recursive: true });
+	writeFileSync(fakeTokenSource, "fake-smoke-token\n");
+	try {
+		const plan = piWorkerSandboxPlan(home, fakeHostHome);
+		const sandboxToken = join(home, ".config", "agent", "gateway.token");
+		const launch = resolveWorkerLaunch(
+			{ ...DEFAULT_SANDBOX_CONFIG, mode: "required", env: "allowlist" },
+			{
+				command: "sh",
+				// The platform contract path: consumers resolve ~/.config/agent/gateway.token against $HOME.
+				args: ["-c", [
+					`cat "$HOME/.config/agent/gateway.token"`,
+					`if echo x > "$HOME/.config/agent/gateway.token" 2>/dev/null; then echo writable; else echo read-only; fi`,
+					`test ! -e '${fakeTokenSource}' && echo no-host-style-dest`,
+				].join("; ")],
+				cwd,
+				envOverrides: {},
+				homeDir: home,
+				...plan,
+			},
+		);
+		assert.ok(launch.ok && launch.sandboxed);
+		assert.equal(launch.spec.env.HOME, home);
+		const run = spawnSync(launch.spec.command, launch.spec.args, { env: launch.spec.env, encoding: "utf8", timeout: 30_000 });
+		assert.equal(run.status, 0, run.stderr);
+		const lines = run.stdout.trim().split("\n");
+		assert.equal(lines[0], "fake-smoke-token", "token is readable at the $HOME-relative contract path");
+		assert.equal(lines[1], "read-only", "token mount must reject writes");
+		assert.equal(lines[2], "no-host-style-dest", "no host-home-style token destination is exposed");
+		assert.equal(readFileSync(fakeTokenSource, "utf8"), "fake-smoke-token\n", "fake source remains unchanged");
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+		rmSync(home, { recursive: true, force: true });
+		rmSync(fakeHostHome, { recursive: true, force: true });
 	}
 	resetSandboxProbeCacheForTesting();
 });
