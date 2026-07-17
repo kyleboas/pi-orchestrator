@@ -258,7 +258,7 @@ test("eligible Pi and Claude broker mounts retain provider auth while excluding 
 	assert.ok(piArgs.includes("/host/pi/auth.json"), "Pi provider auth mount is retained");
 	assert.ok(claudeArgs.includes("/host/claude-account"), "Claude provider account mount is retained");
 	assert.ok(piArgs.includes("/run/pio-pr") && claudeArgs.includes("/run/pio-pr"));
-	const vectors = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GITHUB_CONFIG_DIR", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"];
+	const vectors = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GITHUB_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GITHUB_CONFIG_DIR", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
 	const safe = brokerSafeWorkerEnv(Object.fromEntries([...vectors.map((key) => [key, "host-vector"]), ["ANTHROPIC_API_KEY", "provider"], ["OPENAI_API_KEY", "provider-two"]]));
 	for (const key of vectors) assert.equal(safe[key], undefined, `${key} is removed from the worker environment`);
 	assert.equal(safe.ANTHROPIC_API_KEY, "provider", "model provider auth remains available");
