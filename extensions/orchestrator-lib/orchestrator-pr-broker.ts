@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
@@ -8,7 +8,8 @@ import net from "node:net";
 /** The deliberately small opt-in authority delegated to a sandboxed worker. */
 export type PullRequestsConfig = { repositories: string[]; branchPrefixes: string[] };
 /** `branch` is deliberately absent until the first successful publish. */
-type GitMetadata = { entryDevice: number; entryInode: number; gitDir: string; configs: Array<{ path: string; device: number; inode: number; hash: string }> };
+type PinnedFileState = { path: string; device: number; inode: number; hash: string };
+type GitMetadata = { entryDevice: number; entryInode: number; gitDir: string; objectsDevice: number; objectsInode: number; objectInfoDevice: number; objectInfoInode: number; files: PinnedFileState[] };
 export type PinnedPullRequestTarget = { workspace: string; repository: string; remoteUrl: string; defaultBranch: string; generation: string; device: number; inode: number; git: GitMetadata; branch?: string };
 export type BrokerResult = { ok: boolean; message: string; repository?: string; branch?: string; defaultBranch?: string };
 export const PR_REQUEST_LIMIT = 16_384;
@@ -94,15 +95,46 @@ function metadata(workspace: string): GitMetadata | undefined {
 		if (!entryStat.isDirectory()) return undefined;
 		const gitDir = realpathSync(entry);
 		if (!statSync(gitDir).isDirectory()) return undefined;
-		const state = (path: string, required: boolean) => { try { const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("unsafe config"); const contents = readFileSync(path); if (/^\s*\[include(?:If)?\b/im.test(contents.toString("utf8"))) throw new Error("included config is not permitted"); return { path, device: stat.dev, inode: stat.ino, hash: createHash("sha256").update(contents).digest("hex") }; } catch { if (required) throw new Error("missing config"); return { path, device: -1, inode: -1, hash: "absent" }; } };
-		const configs = [state(join(gitDir, "config"), true)];
-		return { entryDevice: entryStat.dev, entryInode: entryStat.ino, gitDir, configs };
+		const objects = join(gitDir, "objects"), objectsStat = lstatSync(objects), objectInfo = join(objects, "info"), objectInfoStat = lstatSync(objectInfo);
+		if (!objectsStat.isDirectory() || objectsStat.isSymbolicLink() || !objectInfoStat.isDirectory() || objectInfoStat.isSymbolicLink()) return undefined;
+		const state = (path: string, required: boolean, rejectIncludes = false): PinnedFileState => {
+			try {
+				const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("unsafe repository metadata");
+				const contents = readFileSync(path);
+				if (rejectIncludes && /^\s*\[include(?:If)?\b/im.test(contents.toString("utf8"))) throw new Error("included config is not permitted");
+				return { path, device: stat.dev, inode: stat.ino, hash: createHash("sha256").update(contents).digest("hex") };
+			} catch (error) {
+				if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return { path, device: -1, inode: -1, hash: "absent" };
+				throw error;
+			}
+		};
+		const absent = (path: string): PinnedFileState => { const value = state(path, false); if (value.hash !== "absent") throw new Error("object alternates are not permitted"); return value; };
+		const files = [state(join(gitDir, "config"), true, true), absent(join(objectInfo, "alternates")), absent(join(objectInfo, "http-alternates"))];
+		return { entryDevice: entryStat.dev, entryInode: entryStat.ino, gitDir, objectsDevice: objectsStat.dev, objectsInode: objectsStat.ino, objectInfoDevice: objectInfoStat.dev, objectInfoInode: objectInfoStat.ino, files };
 	} catch { return undefined; }
 }
 function identity(cwd: string): { workspace: string; device: number; inode: number; git?: GitMetadata } | undefined { try { const workspace = realpathSync(cwd), stat = statSync(workspace), git = metadata(workspace); return stat.isDirectory() && !lstatSync(cwd).isSymbolicLink() ? { workspace, device: stat.dev, inode: stat.ino, ...(git ? { git } : {}) } : undefined; } catch { return undefined; } }
 /** Test-only inspection helper; production eligibility always obtains this through pinPullRequestTarget. */
 export function gitMetadataForTesting(workspace: string): GitMetadata | undefined { return metadata(workspace); }
-function sameMetadata(left: GitMetadata, right: GitMetadata | undefined): boolean { return !!right && left.entryDevice === right.entryDevice && left.entryInode === right.entryInode && left.gitDir === right.gitDir && left.configs.length === right.configs.length && left.configs.every((config, index) => config.path === right.configs[index]?.path && config.device === right.configs[index]?.device && config.inode === right.configs[index]?.inode && config.hash === right.configs[index]?.hash); }
+function sameMetadata(left: GitMetadata, right: GitMetadata | undefined): boolean { return !!right && left.entryDevice === right.entryDevice && left.entryInode === right.entryInode && left.gitDir === right.gitDir && left.objectsDevice === right.objectsDevice && left.objectsInode === right.objectsInode && left.objectInfoDevice === right.objectInfoDevice && left.objectInfoInode === right.objectInfoInode && left.files.length === right.files.length && left.files.every((file, index) => file.path === right.files[index]?.path && file.device === right.files[index]?.device && file.inode === right.files[index]?.inode && file.hash === right.files[index]?.hash); }
+function trustedCloneSafe(gitDir: string): boolean {
+	try {
+		const config = lstatSync(join(gitDir, "config")), objects = join(gitDir, "objects"), objectStat = lstatSync(objects);
+		if (!config.isFile() || config.isSymbolicLink() || !objectStat.isDirectory() || objectStat.isSymbolicLink()) return false;
+		const safeTree = (path: string): boolean => {
+			for (const name of readdirSync(path)) {
+				const child = join(path, name), stat = lstatSync(child);
+				if (stat.isSymbolicLink()) return false;
+				if (stat.isDirectory()) { if (!safeTree(child)) return false; }
+				else if (!stat.isFile()) return false;
+			}
+			return true;
+		};
+		if (!safeTree(objects)) return false;
+		for (const name of ["alternates", "http-alternates"]) try { lstatSync(join(objects, "info", name)); return false; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+		return true;
+	} catch { return false; }
+}
 function localDefault(ref: string | undefined): string | undefined { const branch = ref?.startsWith("origin/") ? ref.slice("origin/".length) : undefined; return branch && BRANCH.test(branch) ? branch : undefined; }
 function syncDefaultBranch(repository: string, local: string | undefined): string | undefined {
 	if (local) return local;
@@ -157,10 +189,12 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 	if (!head || !/^[a-f0-9]{40,64}$/i.test(head)) return { ok: false, message: "A committed HEAD is required." };
 	const tempParent = mkdtempSync(join(tmpdir(), "pio-pr-trusted-")), temp = join(tempParent, "view.git");
 	try {
-		// Clone is deliberately launched from a host-owned directory, never the
-		// checkout: local file transport is the only protocol permitted here.
+		// Recheck immediately before snapshotting. A local no-hardlinks clone copies
+		// repository files directly; unlike file:// transport, it never invokes a
+		// worker-configured upload-pack service.
+		if (!sameMetadata(target.git, metadata(target.workspace))) return { ok: false, message: "Repository metadata no longer matches the delegated target." };
 		const cloneEnv = { ...trustedEnv(process.env), ...GIT_ENV, GIT_ALLOW_PROTOCOL: "file", GIT_PROTOCOL_FROM_USER: "0" };
-		if (!(await runner("git", gitArgs("-c", "protocol.file.allow=always", "-c", "protocol.ssh.allow=never", "-c", "protocol.http.allow=never", "-c", "protocol.https.allow=never", "clone", "--bare", "--no-local", "--no-hardlinks", target.workspace, temp), { cwd: tempParent, env: cloneEnv, timeout: 30_000 })).ok) return { ok: false, message: "Could not prepare a trusted Git view." };
+		if (!(await runner("git", gitArgs("-c", "protocol.file.allow=always", "-c", "protocol.ssh.allow=never", "-c", "protocol.http.allow=never", "-c", "protocol.https.allow=never", "clone", "--bare", "--local", "--no-hardlinks", target.workspace, temp), { cwd: tempParent, env: cloneEnv, timeout: 30_000 })).ok || !trustedCloneSafe(temp)) return { ok: false, message: "Could not prepare a trusted Git view." };
 		const trustedOptions = { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 };
 		const fetched = await runner("git", gitArgs("fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), trustedOptions);
 		if (!fetched.ok) { const remote = await runner("git", gitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), trustedOptions); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }

@@ -46,6 +46,14 @@ function actualRunner(command: string, args: string[], options: { cwd?: string; 
 	return Promise.resolve({ ok: result.status === 0, stdout: result.stdout ?? "" });
 }
 
+/** Minimal destination for pure protocol tests whose injected runner fakes clone. */
+function fakeTrustedClone(args: string[]): void {
+	if (!args.includes("clone")) return;
+	const destination = args.at(-1)!;
+	mkdirSync(join(destination, "objects", "info"), { recursive: true });
+	writeFileSync(join(destination, "config"), "[core]\n\tbare = true\n");
+}
+
 function request(path: string, value: unknown): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
 		const socket = net.createConnection(path); let output = "";
@@ -95,6 +103,7 @@ test("publish uses only fixed git/gh argv and canonical remote with credential-f
 	const old = process.env.GITHUB_TOKEN; process.env.GITHUB_TOKEN = "never-forward";
 	const runner = async (command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; timeout?: number } = {}) => {
 		calls.push({ command, args, env: options.env, cwd: options.cwd });
+		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
@@ -142,6 +151,7 @@ test("disallowed first branch is rejected and a later branch change is rejected"
 	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 	let branch = "other/nope";
 	const runner = async (command: string, args: string[]) => {
+		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
@@ -169,6 +179,7 @@ test("failed PR create after push keeps the first branch pinned", async () => {
 	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 	let branch = "feat/first", pushes = 0;
 	const runner = async (command: string, args: string[]) => {
+		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
@@ -195,6 +206,7 @@ test("fork and wrong-base existing PR rows are rejected instead of edited", asyn
 	const workspace = gitWorkspace("pio-pr-pr-row-"); const stat = statSync(workspace);
 	const row = (extra: Record<string, unknown>) => [{ number: 7, headRefName: "feat/branch", baseRefName: "main", isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" }, ...extra }];
 	const makeRunner = (rows: unknown) => async (command: string, args: string[]) => {
+		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
 		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
@@ -214,6 +226,7 @@ test("rejecting handlers, concurrent publish, and total request exhaustion are b
 	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
 	let release!: () => void, rejectStatus = true; const held = new Promise<void>((resolve) => { release = resolve; });
 	const broker = startPullRequestBroker(target, policy, async (command, args) => {
+		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (rejectStatus && joined.includes("symbolic-ref --quiet --short HEAD")) throw new Error("must not leak");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
@@ -240,6 +253,7 @@ test("cleanup during a publish is idempotent and waits for the active handler", 
 	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
 	let release!: () => void; const held = new Promise<void>((resolve) => { release = resolve; });
 	const broker = startPullRequestBroker(target, policy, async (command, args) => {
+		fakeTrustedClone(args);
 		const joined = args.join(" "); if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
 		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" }; if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/held" };
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "f".repeat(40) }; if (args.includes("push")) await held; if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" }; return { ok: true, stdout: "" };
@@ -316,6 +330,27 @@ test("local include and includeIf config are rejected at pin time", async () => 
 	}
 });
 
+test("object alternates are rejected at pin time and when created or changed after pinning", async () => {
+	for (const name of ["alternates", "http-alternates"]) {
+		const present = gitWorkspace("pio-pr-alternates-present-");
+		try {
+			writeFileSync(join(present, ".git", "objects", "info", name), "/untrusted/objects\n");
+			assert.equal(await pinPullRequestTarget(present, policy), undefined);
+		} finally { rmSync(present, { recursive: true, force: true }); }
+
+		const changed = gitWorkspace("pio-pr-alternates-changed-"); let calls = 0;
+		try {
+			const target = await pinPullRequestTarget(changed, policy); assert.ok(target);
+			const path = join(changed, ".git", "objects", "info", name);
+			writeFileSync(path, "/first/untrusted/objects\n");
+			assert.equal((await publishPullRequest(target, policy, "t", "b", async () => { calls++; return { ok: false, stdout: "" }; })).ok, false);
+			writeFileSync(path, "/second/untrusted/objects\n");
+			assert.equal((await publishPullRequest(target, policy, "t", "b", async () => { calls++; return { ok: false, stdout: "" }; })).ok, false);
+			assert.equal(calls, 0, "alternates changes reject before Git, push, or gh commands");
+		} finally { rmSync(changed, { recursive: true, force: true }); }
+	}
+});
+
 test("explicit real status finds untracked files despite status.showUntrackedFiles=no", async () => {
 	const workspace = gitWorkspace("pio-pr-untracked-"); const mutations: string[] = [];
 	try {
@@ -345,6 +380,7 @@ test("hostile local Git config cannot execute commands or influence trusted clon
 		gitCommand(workspace, ["config", "core.sshCommand", command]);
 		gitCommand(workspace, ["config", "core.hooksPath", hooks]);
 		gitCommand(workspace, ["config", "core.fsmonitor", command]);
+		gitCommand(workspace, ["config", "uploadpack.packObjectsHook", command]);
 		const target = await pinPullRequestTarget(workspace, policy); assert.ok(target);
 		const runner = async (cmd: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) => {
 			calls.push({ command: cmd, args, cwd: options.cwd, env: options.env });
@@ -354,6 +390,7 @@ test("hostile local Git config cannot execute commands or influence trusted clon
 		assert.equal((await publishPullRequest(target, policy, "t", "b", runner)).ok, false);
 		const clone = calls.find((call) => call.command === "git" && call.args.includes("clone"));
 		assert.ok(clone && clone.cwd !== workspace && clone.env?.GIT_ALLOW_PROTOCOL === "file" && clone.env.GIT_PROTOCOL_FROM_USER === "0");
+		assert.ok(clone.args.includes("--local") && clone.args.includes("--no-hardlinks") && !clone.args.includes("--no-local"), "snapshot creation cannot invoke source-side upload-pack");
 		assert.ok(clone.args.includes("protocol.file.allow=always") && clone.args.includes("protocol.ssh.allow=never") && clone.args.includes("protocol.https.allow=never"));
 		assert.equal(existsSync(marker), false);
 		assert.equal(calls.some((call) => call.args.includes("push") || call.command === "gh"), false);

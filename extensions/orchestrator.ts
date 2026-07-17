@@ -453,10 +453,11 @@ class WorkerLaunchRejected extends Error {}
 
 export function brokerSafeWorkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const safe: NodeJS.ProcessEnv = {};
+	const blocked = new Set(["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GITHUB_CONFIG_DIR", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]);
 	for (const [key, value] of Object.entries(env)) {
-		// Preserve existing model-provider auth exactly; remove only GitHub/SSH
-		// credentials that are irrelevant to a worker using the host-side broker.
-		if (["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "GH_CONFIG_DIR", "GITHUB_CONFIG_DIR"].includes(key)) continue;
+		// Preserve model-provider auth exactly while removing worker-side GitHub,
+		// SSH, credential-helper, and command-capable Git configuration vectors.
+		if (blocked.has(key) || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) continue;
 		safe[key] = value;
 	}
 	return safe;

@@ -258,9 +258,11 @@ test("eligible Pi and Claude broker mounts retain provider auth while excluding 
 	assert.ok(piArgs.includes("/host/pi/auth.json"), "Pi provider auth mount is retained");
 	assert.ok(claudeArgs.includes("/host/claude-account"), "Claude provider account mount is retained");
 	assert.ok(piArgs.includes("/run/pio-pr") && claudeArgs.includes("/run/pio-pr"));
-	const safe = brokerSafeWorkerEnv({ GH_TOKEN: "gh", GITHUB_TOKEN: "github", SSH_AUTH_SOCK: "/ssh", GH_CONFIG_DIR: "/gh", ANTHROPIC_API_KEY: "provider" });
-	assert.equal(safe.GH_TOKEN, undefined); assert.equal(safe.GITHUB_TOKEN, undefined); assert.equal(safe.SSH_AUTH_SOCK, undefined); assert.equal(safe.GH_CONFIG_DIR, undefined);
+	const vectors = ["GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "GITHUB_CONFIG_DIR", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"];
+	const safe = brokerSafeWorkerEnv(Object.fromEntries([...vectors.map((key) => [key, "host-vector"]), ["ANTHROPIC_API_KEY", "provider"], ["OPENAI_API_KEY", "provider-two"]]));
+	for (const key of vectors) assert.equal(safe[key], undefined, `${key} is removed from the worker environment`);
 	assert.equal(safe.ANTHROPIC_API_KEY, "provider", "model provider auth remains available");
+	assert.equal(safe.OPENAI_API_KEY, "provider-two", "other model provider auth remains available");
 });
 
 test("mode off preserves legacy direct launch with inherited environment", () => {
