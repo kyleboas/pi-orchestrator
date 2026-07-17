@@ -38,6 +38,11 @@ export function claudeGatewayEnv(configDir: string): Record<string, string> {
   };
 }
 
+/** Gateway mode never forwards host provider IDs or Claude-expanded aliases. */
+export function effectiveWorkerModel(requestedModel: string, gateway?: Pick<GatewayConfig, "model">): string {
+  return gateway?.model ?? requestedModel;
+}
+
 /** The gateway model is intentionally shared by every worker tier. */
 export function gatewayPiModel(model: string): string {
   return `${GATEWAY_PI_PROVIDER}/${model}`;
