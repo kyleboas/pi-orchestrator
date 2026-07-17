@@ -6,6 +6,7 @@ import { defaultClaudeAccountStatePath } from "./orchestrator-accounts.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "./orchestrator-checkin.ts";
 import type { PiThinkingLevel, WorkerProfile } from "./orchestrator-core.ts";
 import { DEFAULT_SANDBOX_CONFIG, INVALID_SANDBOX_CONFIG, parseSandboxConfig, type SandboxConfig } from "./orchestrator-sandbox.ts";
+import { parsePullRequestsConfig, type PullRequestsConfig } from "./orchestrator-pr-broker.ts";
 
 export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
 export type OrchestratorConfig = {
@@ -16,6 +17,8 @@ export type OrchestratorConfig = {
 	sandbox: SandboxConfig;
 	/** When set, Claude workers rotate across these accounts and fail over on usage limits. */
 	claudeAccounts?: ClaudeAccountsConfig;
+	/** Opt-in exact GitHub repository/branch policy for the sandbox-only PR broker. */
+	pullRequests?: PullRequestsConfig;
 	/** Initial/base passive assessment interval in minutes; 0 disables. Healthy workers back off to 2x. */
 	checkInMinutes: number;
 	/** Context-use percentage for outcome-boundary rollover; 0 disables. */
@@ -116,6 +119,12 @@ function sandboxFrom(raw: unknown): { sandbox: SandboxConfig; warning?: string }
 	const parsed = parseSandboxConfig(raw.sandbox);
 	return parsed ? { sandbox: parsed } : { sandbox: { ...INVALID_SANDBOX_CONFIG }, warning: SANDBOX_INVALID_WARNING };
 }
+const PULL_REQUESTS_INVALID_WARNING = "Pull request broker configuration was invalid; the broker is disabled.";
+function pullRequestsFrom(raw: unknown): { pullRequests?: PullRequestsConfig; warning?: string } {
+	if (!object(raw) || raw.pullRequests === undefined) return {};
+	const pullRequests = parsePullRequestsConfig(raw.pullRequests);
+	return pullRequests ? { pullRequests } : { warning: PULL_REQUESTS_INVALID_WARNING };
+}
 function joinWarnings(...warnings: (string | undefined)[]): string | undefined {
 	const present = warnings.filter(nonempty);
 	return present.length ? present.join(" ") : undefined;
@@ -149,7 +158,8 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 		);
 	}
 	const { sandbox, warning: sandboxWarning } = sandboxFrom(raw);
-	const invalid = () => defaults(env, joinWarnings("Orchestrator configuration was invalid; using defaults.", sandboxWarning), sandbox);
+	const { pullRequests, warning: pullRequestsWarning } = pullRequestsFrom(raw);
+	const invalid = () => defaults(env, joinWarnings("Orchestrator configuration was invalid; using defaults.", sandboxWarning, pullRequestsWarning), sandbox);
 	if (!object(raw)) return invalid();
 	// A config without a workers key keeps its coordinator/commands and the
 	// default catalog; only a present-but-invalid catalog rejects the file.
@@ -174,7 +184,8 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 		sandbox,
 		checkInMinutes: checkInMinutes(raw.checkInMinutes),
 		rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
-		...(sandboxWarning ? { warning: sandboxWarning } : {}),
+		...(sandboxWarning || pullRequestsWarning ? { warning: joinWarnings(sandboxWarning, pullRequestsWarning) } : {}),
+		...(pullRequests ? { pullRequests } : {}),
 		...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 	};
 }

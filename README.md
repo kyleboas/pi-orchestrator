@@ -55,6 +55,23 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
 
 `workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string.
 
+### Restricted pull-request broker
+
+`pullRequests` is absent by default: no worker receives PR publishing authority. When explicitly configured, it is an exact, case-normalized GitHub allowlist and branch-prefix policy:
+
+```json
+{
+  "pullRequests": {
+    "repositories": ["owner/repository"],
+    "branchPrefixes": ["feat/", "fix/"]
+  }
+}
+```
+
+Both arrays are bounded, duplicate-free, and strictly validated; malformed broker configuration disables the broker with a generic warning. For an eligible **sandboxed** worker, the host pins the canonical repository `origin`, current non-default branch, and origin default branch before worker code starts. It then mounts only a per-worker `/pr` directory containing `/pr/pio-pr` and a mode-0600 Unix socket. The worker receives no host HOME, `gh` configuration, SSH files/agent socket, token environment variables, legacy auth/config/account mounts, or credentials through this feature.
+
+Workers may run `/pr/pio-pr status`. Only when the task explicitly requests a PR create/update, after committing everything and obtaining a clean worktree (including no untracked files), they may run `/pr/pio-pr publish "title" "body"`. Publish can only fast-forward the already pinned origin branch and create or update that branch's one open PR, always against the pinned default branch. It cannot select a remote, repository, base, or head, force-push, run git/gh/API commands, or merge, close, delete, review, label, or otherwise administer a PR. The trusted host broker uses host GitHub/SSH authentication without returning or logging credentials. A coordinator never delegates merge; it may merge only after an explicit user request, normally through takeover.
+
 ```json
 {
   "coordinator": {
@@ -65,6 +82,10 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
   "commands": { "pi": "pi", "claude": "claude-auto" },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,
+  "pullRequests": {
+    "repositories": ["example-owner/example-repository"],
+    "branchPrefixes": ["feat/", "fix/"]
+  },
   "workers": {
     "Builder": {
       "backend": "pi-rpc",

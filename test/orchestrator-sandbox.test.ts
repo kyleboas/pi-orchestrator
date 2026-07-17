@@ -240,6 +240,15 @@ test("buildBwrapArgs is deterministic and never uses a whole-root policy or env 
 	assert.ok(netNone.includes("--unshare-net"), "network none actually unshares the namespace");
 });
 
+test("PR broker mount is narrow and has no credential path or environment value", () => {
+	const req = request({ prBrokerDirectory: "/run/pio-pr-worker" });
+	const args = buildBwrapArgs(sandbox({ mode: "required", env: "allowlist" }), req, "/usr/bin/pi-real", []);
+	assert.ok(args.includes("/run/pio-pr-worker"));
+	assert.ok(args.includes("/pr"));
+	assert.ok(!args.join(" ").includes(".ssh"));
+	assert.ok(!args.join(" ").includes("SECRET_TOKEN"));
+});
+
 test("mode off preserves legacy direct launch with inherited environment", () => {
 	const launch = resolveWorkerLaunch(sandbox(), request(), fakeEnv, () => {
 		throw new Error("off must not probe");
