@@ -352,7 +352,10 @@ test("pi worker plan exposes only allowlisted files, never host .pi or broad con
 	assert.deepEqual(plan.fileMountsReadOnlyTry, [
 		{ source: "/home/user/.pi/agent/auth.json", dest: join(homeDir, "pi-agent", "auth.json") },
 		{ source: "/home/user/.pi/agent/models.json", dest: join(homeDir, "pi-agent", "models.json") },
-		{ source: "/home/user/.config/agent/gateway.token", dest: "/home/user/.config/agent/gateway.token" },
+		// Consumers resolve ~/.config/agent/gateway.token against $HOME, which is
+		// the isolated worker home inside the sandbox — a host-absolute
+		// destination would be invisible to them (live Luna hang regression).
+		{ source: "/home/user/.config/agent/gateway.token", dest: join(homeDir, ".config", "agent", "gateway.token") },
 	]);
 
 	const nvmFs: CommandFs = {
@@ -382,7 +385,13 @@ test("pi worker plan exposes only allowlisted files, never host .pi or broad con
 	]) {
 		assert.ok(!mountTargets.includes(forbidden), `must not mount ${forbidden}`);
 	}
-	assert.ok(mountTargets.includes("/home/user/.config/agent/gateway.token"), "only the exact token file is mounted");
+	// The host token path may appear exactly once, as a bind SOURCE whose
+	// destination is under the sandbox HOME where ~-relative consumers resolve.
+	const hostToken = "/home/user/.config/agent/gateway.token";
+	assert.equal(args.filter((arg) => arg === hostToken).length, 1, "host token path appears only as the bind source");
+	assert.equal(args[args.indexOf(hostToken) - 1], "--ro-bind-try");
+	assert.equal(args[args.indexOf(hostToken) + 1], join(homeDir, ".config", "agent", "gateway.token"));
+	assert.ok(mountTargets.includes(join(homeDir, ".config", "agent", "gateway.token")), "token lands inside the worker home");
 	assert.ok(args.includes(join(homeDir, "pi-agent", "auth.json")));
 	// nvm shape: the version root is the mounted runtime, and the isolated
 	// agent dir is what the worker's Pi reads.
@@ -398,9 +407,9 @@ test("file mount destination parents are created explicitly, deduplicated, and o
 	const args = buildBwrapArgs(sandbox({ mode: "required" }), request({ homeDir, ...plan }), "/usr/bin/pi-real", []);
 	const isolatedDir = join(homeDir, "pi-agent");
 	// Two files share the isolated dir: exactly one --dir for it, plus one for
-	// the token's parent (namespace-only; the host ~/.config is never touched).
+	// the token's parent under the sandbox HOME (namespace-only creation).
 	const dirTargets = args.flatMap((arg, index) => (arg === "--dir" ? [args[index + 1]!] : []));
-	assert.deepEqual(dirTargets, [isolatedDir, "/home/user/.config/agent"]);
+	assert.deepEqual(dirTargets, [isolatedDir, join(homeDir, ".config", "agent")]);
 	// Ordering: home bind, then each destination's --dir strictly before its file bind.
 	const homeBind = args.indexOf(homeDir);
 	for (const mount of plan.fileMountsReadOnlyTry) {
