@@ -18,6 +18,10 @@
   },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,
+  "pullRequests": {
+    "repositories": ["example-owner/example-repository"],
+    "branchPrefixes": ["feat/", "fix/"]
+  },
   "workers": {
     "Builder": {
       "backend": "pi-rpc",

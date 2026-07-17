@@ -27,6 +27,7 @@ import {
 	parseClaudeStreamLine,
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
+import { pinPullRequestTargetSync, startPullRequestBroker, type PullRequestBroker } from "./orchestrator-lib/orchestrator-pr-broker.ts";
 import {
 	cleanupWorkerHomeDir,
 	createWorkerHomeDir,
@@ -148,7 +149,7 @@ Workers run concurrently, and parallel delegation is your default: before delega
 
 Write progress updates and reviews as plain sentences that lead with the content itself. Never open with a label prefix such as "Checkpoint:", "Update:", "Status:", or similar.
 
-If the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
+Workers may use the restricted PR broker only when the user explicitly requested a PR create/update. Never delegate a merge: merge only after an explicit user request, normally by taking over the task yourself.\n\nIf the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
 }
 
 function workerWidgetLines(now = Date.now(), width = 80, options: WorkerPanelOptions = {}): string[] | undefined {
@@ -450,10 +451,22 @@ function handleClaudeLine(worker: Worker, line: string, config?: OrchestratorCon
 /** A sandbox-policy rejection: the worker process was never spawned. */
 class WorkerLaunchRejected extends Error {}
 
+export function brokerSafeWorkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const safe: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(env)) {
+		// Preserve model-provider auth exactly while removing every inherited
+		// worker-side GitHub, SSH, and Git credential/command/path vector.
+		if (["GH_", "GITHUB_", "SSH_", "GIT_"].some((prefix) => key.startsWith(prefix))) continue;
+		safe[key] = value;
+	}
+	return safe;
+}
+
 type SpawnedWorkerChild = {
 	child: Worker["process"];
 	sandboxed: boolean;
 	warning?: string;
+	prBroker?: PullRequestBroker;
 };
 
 /**
@@ -483,25 +496,48 @@ function spawnWorkerChild(
 		catch { cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected("Gateway relay failed its readiness check."); }
 	}
 	const node = relay ? resolveWorkerCommand(relay.nodePath, process.env) : undefined;
-	const launch = resolveWorkerLaunch(config.sandbox, { command, args, cwd, envOverrides, homeDir, ...paths,
+	const request = { command, args, cwd, envOverrides, homeDir, ...paths,
 		...(relay && node ? { gateway: { relayDirectory: relay.directory, nodePath: relay.nodePath, nodeRoot: node.readOnlyRoots[0]!, bootstrapPath: relay.bootstrapPath, entrypointPath: relay.entrypointPath } } : {}),
-	}, hostEnv);
+	};
+	const workerEnv = config.pullRequests ? brokerSafeWorkerEnv(hostEnv) : hostEnv;
+	let launch = resolveWorkerLaunch(config.sandbox, request, workerEnv);
 	if (!launch.ok) { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected(launch.error); }
+	// The broker is intentionally unavailable to direct/legacy workers: only a
+	// sandbox can expose its fixed /pr mount without exposing host credentials.
+	let prBroker: PullRequestBroker | undefined;
+	if (launch.sandboxed && config.pullRequests) {
+		const target = pinPullRequestTargetSync(cwd, config.pullRequests);
+		if (target) {
+			try {
+				prBroker = startPullRequestBroker(target, config.pullRequests);
+				// Add only /pr. Existing narrow Pi/Claude provider-auth/config mounts
+				// are required for model access and remain exactly as configured.
+				const brokerLaunch = resolveWorkerLaunch(config.sandbox, { ...request, prBrokerDirectory: prBroker.directory }, workerEnv);
+				if (brokerLaunch.ok) launch = brokerLaunch;
+				else { void prBroker.cleanup(); prBroker = undefined; }
+			} catch {
+				// A broker setup failure removes authority rather than preventing a
+				// normal delegation to an unlisted/unavailable repository.
+				if (prBroker) void prBroker.cleanup(); prBroker = undefined;
+			}
+		}
+	}
 	if (launch.sandboxed) createWorkerHomeDir(homeDir);
 	let child: Worker["process"];
 	try {
 		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const });
 	} catch (error) {
 		if (relay) void relay.cleanup().catch(() => {});
+		if (prBroker) void prBroker.cleanup();
 		if (launch.sandboxed) cleanupWorkerHomeDir(homeDir);
 		throw error;
 	}
 	if (launch.sandboxed) {
-		const clean = () => { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); };
+		const clean = () => { if (relay) void relay.cleanup().catch(() => {}); if (prBroker) void prBroker.cleanup(); cleanupWorkerHomeDir(homeDir); };
 		child.once("exit", clean);
 		child.once("error", clean);
 	}
-	return { child, sandboxed: launch.sandboxed, ...(launch.warning ? { warning: launch.warning } : {}) };
+	return { child, sandboxed: launch.sandboxed, ...(launch.warning ? { warning: launch.warning } : {}), ...(prBroker ? { prBroker } : {}) };
 }
 
 function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig, workerKey: string, accountDir?: string, resumeSessionId?: string): SpawnedWorkerChild {
@@ -669,9 +705,12 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		return worker;
 	}
 
+	const prInstructions = spawned.prBroker
+		? `\n\nA credential-free PR broker is available only for this delegated branch at /pr/pio-pr. Use it only when the task explicitly requests creating or updating a PR, after committing all work and ensuring the worktree (including untracked files) is clean: /pr/pio-pr status, then /pr/pio-pr publish "title" "body". It can only publish this pinned branch and create/update its open PR; do not seek GitHub, SSH, token, remote, merge, close, or review access.`
+		: "";
 	const prompt = `You are ${name}, an implementation worker. Work directly in ${cwd}.
 
-${task}
+${task}${prInstructions}
 
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Write it as plain sentences leading with the content — never open with a label prefix such as "Checkpoint:" or "Status:". Sol receives your final response directly and may send follow-up instructions while you work.`;
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });

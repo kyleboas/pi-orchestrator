@@ -25,6 +25,7 @@ import {
 	type WorkerLaunchRequest,
 } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
 import { loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
+import { brokerSafeWorkerEnv } from "../extensions/orchestrator.ts";
 
 function configFile(text: string): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-orchestrator-sandbox-"));
@@ -238,6 +239,30 @@ test("buildBwrapArgs is deterministic and never uses a whole-root policy or env 
 
 	const netNone = buildBwrapArgs(sandbox({ network: "none" }), req, "/usr/bin/pi-real", []);
 	assert.ok(netNone.includes("--unshare-net"), "network none actually unshares the namespace");
+});
+
+test("PR broker mount is narrow and has no credential path or environment value", () => {
+	const req = request({ prBrokerDirectory: "/run/pio-pr-worker" });
+	const args = buildBwrapArgs(sandbox({ mode: "required", env: "allowlist" }), req, "/usr/bin/pi-real", []);
+	assert.ok(args.includes("/run/pio-pr-worker"));
+	assert.ok(args.includes("/pr"));
+	assert.ok(!args.join(" ").includes(".ssh"));
+	assert.ok(!args.join(" ").includes("SECRET_TOKEN"));
+});
+
+test("eligible Pi and Claude broker mounts retain provider auth while excluding GitHub auth", () => {
+	const pi = request({ prBrokerDirectory: "/run/pio-pr", fileMountsReadOnlyTry: [{ source: "/host/pi/auth.json", dest: "/worker/pi/auth.json" }] });
+	const claude = request({ prBrokerDirectory: "/run/pio-pr", readWritePaths: ["/host/claude-account"] });
+	const piArgs = buildBwrapArgs(sandbox({ mode: "required", env: "allowlist" }), pi, "/usr/bin/pi-real", []);
+	const claudeArgs = buildBwrapArgs(sandbox({ mode: "required", env: "allowlist" }), claude, "/usr/bin/claude-real", []);
+	assert.ok(piArgs.includes("/host/pi/auth.json"), "Pi provider auth mount is retained");
+	assert.ok(claudeArgs.includes("/host/claude-account"), "Claude provider account mount is retained");
+	assert.ok(piArgs.includes("/run/pio-pr") && claudeArgs.includes("/run/pio-pr"));
+	const vectors = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GITHUB_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GITHUB_CONFIG_DIR", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+	const safe = brokerSafeWorkerEnv(Object.fromEntries([...vectors.map((key) => [key, "host-vector"]), ["ANTHROPIC_API_KEY", "provider"], ["OPENAI_API_KEY", "provider-two"]]));
+	for (const key of vectors) assert.equal(safe[key], undefined, `${key} is removed from the worker environment`);
+	assert.equal(safe.ANTHROPIC_API_KEY, "provider", "model provider auth remains available");
+	assert.equal(safe.OPENAI_API_KEY, "provider-two", "other model provider auth remains available");
 });
 
 test("mode off preserves legacy direct launch with inherited environment", () => {

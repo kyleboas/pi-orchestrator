@@ -308,6 +308,8 @@ export type WorkerLaunchRequest = {
 	fileMountsReadOnly?: SandboxFileMount[];
 	/** Trusted relay/bootstrap resources, present only for gateway launches. */
 	gateway?: { relayDirectory: string; nodePath: string; nodeRoot: string; bootstrapPath: string; entrypointPath: string };
+	/** Per-worker broker directory, mounted only at /pr (never host HOME/config). */
+	prBrokerDirectory?: string;
 	/** Host paths bound read-write (workspace extras such as a Claude account directory); must exist. */
 	readWritePaths?: string[];
 };
@@ -482,6 +484,9 @@ export function buildBwrapArgs(config: SandboxConfig, request: WorkerLaunchReque
 		args.push("--ro-bind", request.gateway.relayDirectory, "/g");
 		args.push("--dir", "/orchestrator", "--ro-bind", request.gateway.bootstrapPath, "/orchestrator/bootstrap.sh", "--ro-bind", request.gateway.entrypointPath, "/orchestrator/entrypoint.mjs");
 	}
+	// The directory contains only a mode-0600 Unix socket and the fixed client;
+	// it is the sole PR-broker mount and is never a host credential directory.
+	if (request.prBrokerDirectory) args.push("--dir", "/pr", "--ro-bind", request.prBrokerDirectory, "/pr");
 	args.push("--bind", request.cwd, request.cwd);
 	for (const path of [...new Set(request.readWritePaths ?? [])]) args.push("--bind", path, path);
 	args.push("--chdir", request.cwd);

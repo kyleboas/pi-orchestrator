@@ -77,6 +77,7 @@ test("configured map generates dynamic names, explicit Pi metadata, commands, an
 		assert.match(coordinatorInstructions(config.workers), /ask Fable/);
 		assert.match(coordinatorInstructions(config.workers), /unqualified new task, start with Luna/);
 		assert.match(coordinatorInstructions(config.workers), /Each distinct new task gets a new delegate/);
+		assert.match(coordinatorInstructions(config.workers), /Never delegate a merge/);
 		assert.equal(config.commands.pi, "pi-env"); assert.equal(config.commands.claude, "claude-auto");
 		const fable = config.workers.Fable!;
 		assert.equal(fable.backend, "claude-code");
@@ -97,6 +98,19 @@ test("configured list is accepted and malformed, missing-model, empty, or duplic
 	]) {
 		const file = configFile(value); try { const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file }); assert.deepEqual(config.workers, DEFAULT_WORKERS); assert.equal(config.warning, "Orchestrator configuration was invalid; using defaults."); } finally { remove(file); }
 	}
+});
+
+test("pull request broker config is opt-in and malformed policy fails closed", () => {
+	const absent = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "absent-pr-broker-config") });
+	assert.equal(absent.pullRequests, undefined);
+	const valid = configFile({ pullRequests: { repositories: ["Owner/Repository"], branchPrefixes: ["feat/"] } });
+	const invalid = configFile({ pullRequests: { repositories: ["owner/repository"], branchPrefixes: ["feat/", "feat/"] } });
+	try {
+		assert.deepEqual(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: valid }).pullRequests, { repositories: ["owner/repository"], branchPrefixes: ["feat/"] });
+		const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: invalid });
+		assert.equal(config.pullRequests, undefined);
+		assert.match(config.warning ?? "", /Pull request broker configuration was invalid/);
+	} finally { remove(valid); remove(invalid); }
 });
 
 test("environment command overrides are portable even when config is unavailable", () => {
