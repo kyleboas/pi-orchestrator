@@ -21,7 +21,7 @@ const PREFIX = /^(?!.*(?:^|\/)\.?\.?\/(?:|$))(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9][A-Z
 const BRANCH = /^(?!-)(?!.*(?:^|\/)\.?\.?\/(?:|$))(?!.*\.\.)(?!.*\/\/)(?!.*\.lock(?:\/|$))[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
 type CommandResult = { ok: boolean; stdout: string };
-export type BrokerRunner = (command: string, args: string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number }) => Promise<CommandResult>;
+export type BrokerRunner = (command: string, args: string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; signal?: AbortSignal }) => Promise<CommandResult>;
 function text(value: unknown, max: number): value is string { return typeof value === "string" && value.length > 0 && value.length <= max && !/[\0\r\n]/.test(value); }
 function normalizedRepository(value: string): string | undefined { const repository = value.trim().toLowerCase(); return REPOSITORY.test(repository) ? repository : undefined; }
 
@@ -54,21 +54,30 @@ function trustedEnv(host: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_SSH_COMMAND"]) if (host[key] !== undefined) env[key] = host[key];
 	return env;
 }
-function defaultRunner(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number } = {}): Promise<CommandResult> {
+function defaultRunner(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; signal?: AbortSignal } = {}): Promise<CommandResult> {
 	return new Promise((resolve) => {
 		let output = "", settled = false;
 		const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"] });
-		const finish = (ok: boolean) => { if (!settled) { settled = true; resolve({ ok, stdout: output.slice(0, PR_RESPONSE_LIMIT) }); } };
-		const timeout = setTimeout(() => {
-			// This is a direct child only; never signal a process group, PID 1, or ourselves.
-			if (child.pid && child.pid > 1 && child.pid !== process.pid) child.kill("SIGTERM");
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const finish = (ok: boolean) => { if (!settled) { settled = true; if (timeout) clearTimeout(timeout); options.signal?.removeEventListener("abort", terminate); resolve({ ok, stdout: output.slice(0, PR_RESPONSE_LIMIT) }); } };
+		let terminating = false;
+		const terminate = () => {
+			if (settled || terminating) return;
+			terminating = true;
+			// This is a validated direct child only; never signal a group, PID 1, or ourselves.
+			if (child.pid && child.pid > 1 && child.pid !== process.pid && child.exitCode === null) child.kill("SIGTERM");
 			setTimeout(() => { if (child.exitCode === null && child.pid && child.pid > 1 && child.pid !== process.pid) child.kill("SIGKILL"); }, 1_000).unref();
-			finish(false);
-		}, options.timeout ?? 30_000);
+			// Await direct-child exit when possible; KILL gives this bounded fallback
+			// so broker cleanup never resolves while its normal child is still live.
+			setTimeout(() => finish(false), 1_200).unref();
+		};
+		if (options.signal?.aborted) { terminate(); return; }
+		options.signal?.addEventListener("abort", terminate, { once: true });
+		timeout = setTimeout(terminate, options.timeout ?? 30_000);
 		child.stdout.on("data", (chunk: Buffer) => { if (output.length < PR_RESPONSE_LIMIT) output += chunk.toString("utf8").slice(0, PR_RESPONSE_LIMIT - output.length); });
 		child.stderr.on("data", () => {}); // Never retain auth/remote diagnostics and avoid pipe backpressure.
-		child.on("error", () => { clearTimeout(timeout); finish(false); });
-		child.on("exit", (code) => { clearTimeout(timeout); finish(code === 0); });
+		child.on("error", () => finish(false));
+		child.on("exit", (code) => finish(code === 0));
 	});
 }
 const GIT_ENV = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat" };
@@ -131,15 +140,29 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 		const fetched = await runner("git", gitArgs("-C", temp, "fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 });
 		if (!fetched.ok) { const remote = await runner("git", gitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 }); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }
 		else if (!(await runner("git", gitArgs("-C", temp, "merge-base", "--is-ancestor", `refs/remotes/pinned/${branch}`, head), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 })).ok) return { ok: false, message: "The branch is not a fast-forward update." };
-		// Recheck after all worker-controlled checkout reads and before the network mutation.
+		// Recheck after all worker-controlled checkout reads, then pin before any
+		// network mutation. A failed push/gh operation still permits only this branch.
 		if ((await currentAllowedBranch(target, policy, runner)) !== branch) return { ok: false, message: "The branch changed during publishing." };
+		target.branch ??= branch;
 		if (!(await runner("git", gitArgs("-C", temp, "push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
-		const env = trustedEnv(process.env), open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${branch}`, "--state=open", "--json=number", "--limit=2"], { env, timeout: 30_000 });
+		const env = trustedEnv(process.env), owner = target.repository.split("/")[0]!, open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${owner}:${branch}`, "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"], { env, timeout: 30_000 });
 		if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { ok: false, message: "Could not query the existing pull request." };
-		let number: number | undefined; try { const rows = JSON.parse(open.stdout) as unknown; if (Array.isArray(rows) && rows.length === 1 && typeof rows[0] === "object" && rows[0] && Number.isSafeInteger((rows[0] as { number?: unknown }).number)) number = (rows[0] as { number: number }).number; else if (Array.isArray(rows) && rows.length > 1) return { ok: false, message: "More than one open pull request matches this branch." }; } catch { return { ok: false, message: "Could not parse pull request status." }; }
+		let number: number | undefined;
+		try {
+			const rows = JSON.parse(open.stdout) as unknown;
+			if (!Array.isArray(rows)) return { ok: false, message: "Could not parse pull request status." };
+			if (rows.length > 1) return { ok: false, message: "More than one open pull request matches this branch." };
+			if (rows.length === 1) {
+				const row = rows[0] as Record<string, unknown>;
+				const repository = row.headRepository as { nameWithOwner?: unknown } | null;
+				const repositoryOwner = row.headRepositoryOwner as { login?: unknown } | null;
+				const headRepository = repository?.nameWithOwner, headOwner = repositoryOwner?.login;
+				if (!row || typeof row !== "object" || !Number.isSafeInteger(row.number) || row.headRefName !== branch || row.baseRefName !== target.defaultBranch || row.isCrossRepository !== false || typeof headRepository !== "string" || typeof headOwner !== "string" || headRepository.toLowerCase() !== target.repository || headOwner.toLowerCase() !== owner.toLowerCase()) return { ok: false, message: "Existing pull request does not match the pinned branch and base." };
+				number = row.number as number;
+			}
+		} catch { return { ok: false, message: "Could not parse pull request status." }; }
 		const args = number ? ["pr", "edit", String(number), `--repo=${target.repository}`, `--title=${title}`, `--body=${body}`] : ["pr", "create", `--repo=${target.repository}`, `--base=${target.defaultBranch}`, `--head=${branch}`, `--title=${title}`, `--body=${body}`];
 		if (!(await runner("gh", args, { env, timeout: 45_000 })).ok) return { ok: false, message: "Pull request create/update failed." };
-		target.branch ??= branch; // First successful publish atomically fixes this generation's branch.
 		return { ok: true, message: number ? "Updated the open pull request." : "Created an open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
 	} finally { try { rmSync(temp, { recursive: true, force: true }); } catch {} }
 }
@@ -157,31 +180,50 @@ async function brokerStatus(target: PinnedPullRequestTarget, policy: PullRequest
 export function startPullRequestBroker(target: PinnedPullRequestTarget, policy: PullRequestsConfig, runner: BrokerRunner = defaultRunner): PullRequestBroker {
 	const directory = mkdtempSync(join(tmpdir(), "pio-pr-broker-")); chmodSync(directory, 0o700);
 	const socketPath = join(directory, "broker.sock"), client = join(directory, "pio-pr"); writeFileSync(client, clientProgram(target.generation), { mode: 0o700 }); chmodSync(client, 0o700);
-	let sockets = 0, requests = 0, publishing = false;
-	const connections = new Set<net.Socket>();
+	let sockets = 0, requests = 0, publishing = false, closing = false, cleanupPromise: Promise<void> | undefined;
+	const connections = new Set<net.Socket>(), handlers = new Set<Promise<void>>(), abort = new AbortController();
+	const brokerRunner: BrokerRunner = async (command, args, options = {}) => {
+		if (closing || abort.signal.aborted) return { ok: false, stdout: "" };
+		const result = await runner(command, args, { ...options, signal: abort.signal });
+		return closing || abort.signal.aborted ? { ok: false, stdout: "" } : result;
+	};
 	const server = net.createServer((socket) => {
-		if (++sockets > PR_MAX_CONNECTIONS) { sockets--; socket.end(JSON.stringify({ ok: false, message: "Broker is busy." })); return; }
+		if (closing || ++sockets > PR_MAX_CONNECTIONS) { if (!closing) sockets--; socket.end(JSON.stringify({ ok: false, message: "Broker is unavailable." })); return; }
 		connections.add(socket);
-		let data = "", handled = false;
-		let timer = setTimeout(() => socket.destroy(), 20_000);
-		const done = (result: BrokerResult) => { clearTimeout(timer); if (!socket.destroyed) { const body = JSON.stringify(result); socket.end(body.length <= PR_RESPONSE_LIMIT ? body : JSON.stringify({ ok: false, message: "Broker response was too large." })); } };
+		let data = "", handled = false, timer = setTimeout(() => socket.destroy(), 20_000);
+		const done = (result: BrokerResult) => { clearTimeout(timer); if (!socket.destroyed && !closing) { const body = JSON.stringify(result); socket.end(body.length <= PR_RESPONSE_LIMIT ? body : JSON.stringify({ ok: false, message: "Broker response was too large." })); } };
 		socket.once("close", () => { sockets--; connections.delete(socket); clearTimeout(timer); });
 		socket.on("data", (chunk) => {
-			if (handled) return; data += chunk.toString("utf8");
+			if (handled || closing) return; data += chunk.toString("utf8");
 			if (data.length > PR_REQUEST_LIMIT) { handled = true; done({ ok: false, message: "Invalid broker request." }); return; }
 			if (!data.endsWith("\n")) return; handled = true;
 			if (++requests > PR_MAX_REQUESTS) { done({ ok: false, message: "Broker request limit reached." }); return; }
-			void (async () => { let request: Record<string, unknown> | undefined; try { request = JSON.parse(data) as Record<string, unknown>; } catch {}
-				if (!request || request.generation !== target.generation) return done({ ok: false, message: "Broker generation is unavailable." });
-				if (request.action === "status" && Object.keys(request).every((key) => key === "generation" || key === "action")) return done(await brokerStatus(target, policy, runner));
-				if (!validPublish(request)) return done({ ok: false, message: "Unsupported broker request." });
-				if (publishing) return done({ ok: false, message: "A publish is already in progress." });
-				clearTimeout(timer); timer = setTimeout(() => socket.destroy(), 90_000);
-				publishing = true; try { done(await publishPullRequest(target, policy, request.title, request.body, runner)); } finally { publishing = false; }
+			const handler = (async () => {
+				try {
+					let request: Record<string, unknown> | undefined; try { request = JSON.parse(data) as Record<string, unknown>; } catch {}
+					if (!request || request.generation !== target.generation) return done({ ok: false, message: "Broker generation is unavailable." });
+					if (request.action === "status" && Object.keys(request).every((key) => key === "generation" || key === "action")) return done(await brokerStatus(target, policy, brokerRunner));
+					if (!validPublish(request)) return done({ ok: false, message: "Unsupported broker request." });
+					if (publishing) return done({ ok: false, message: "A publish is already in progress." });
+					clearTimeout(timer); timer = setTimeout(() => socket.destroy(), 90_000);
+					publishing = true; try { done(await publishPullRequest(target, policy, request.title, request.body, brokerRunner)); } finally { publishing = false; }
+				} catch { done({ ok: false, message: "Broker operation failed." }); }
 			})();
+			handlers.add(handler); void handler.finally(() => handlers.delete(handler));
 		});
 	});
 	const ready = new Promise<void>((resolve, reject) => server.once("listening", () => { try { chmodSync(socketPath, 0o600); resolve(); } catch (error) { reject(error); } }).once("error", reject));
 	server.listen(socketPath);
-	return { directory, target, ready, cleanup: async () => { for (const socket of connections) socket.destroy(); if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve())); try { rmSync(directory, { recursive: true, force: true }); } catch {} } };
+	const cleanup = (): Promise<void> => cleanupPromise ??= (async () => {
+		closing = true; abort.abort(); for (const socket of connections) socket.destroy();
+		if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+		// Default-runner children receive direct TERM then KILL through abort. An
+		// injected runner is also gated after abort, so it cannot trigger later mutations.
+		await Promise.race([Promise.allSettled([...handlers]).then(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, 6_000))]);
+		try { rmSync(directory, { recursive: true, force: true }); } catch {}
+	})();
+	// Observe readiness internally too: a late listen/chmod failure never becomes
+	// an unhandled rejection and promptly removes broker authority.
+	void ready.catch(() => cleanup());
+	return { directory, target, ready, cleanup };
 }
