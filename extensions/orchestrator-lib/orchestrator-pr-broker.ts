@@ -104,6 +104,8 @@ function metadata(workspace: string): GitMetadata | undefined {
 	} catch { return undefined; }
 }
 function identity(cwd: string): { workspace: string; device: number; inode: number; git?: GitMetadata } | undefined { try { const workspace = realpathSync(cwd), stat = statSync(workspace), git = metadata(workspace); return stat.isDirectory() && !lstatSync(cwd).isSymbolicLink() ? { workspace, device: stat.dev, inode: stat.ino, ...(git ? { git } : {}) } : undefined; } catch { return undefined; } }
+/** Test-only inspection helper; production eligibility always obtains this through pinPullRequestTarget. */
+export function gitMetadataForTesting(workspace: string): GitMetadata | undefined { return metadata(workspace); }
 function sameMetadata(left: GitMetadata, right: GitMetadata | undefined): boolean { return !!right && left.entryDevice === right.entryDevice && left.entryInode === right.entryInode && left.gitDir === right.gitDir && left.configs.length === right.configs.length && left.configs.every((config, index) => config.path === right.configs[index]?.path && config.device === right.configs[index]?.device && config.inode === right.configs[index]?.inode && config.hash === right.configs[index]?.hash); }
 function localDefault(ref: string | undefined): string | undefined { const branch = ref?.startsWith("origin/") ? ref.slice("origin/".length) : undefined; return branch && BRANCH.test(branch) ? branch : undefined; }
 function syncDefaultBranch(repository: string, local: string | undefined): string | undefined {

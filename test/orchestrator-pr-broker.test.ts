@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 import test from "node:test";
 import {
 	branchAllowed,
+	gitMetadataForTesting,
 	normalizeGitHubRemote,
 	parsePullRequestsConfig,
 	PR_MAX_REQUESTS,
@@ -17,6 +18,8 @@ import {
 } from "../extensions/orchestrator-lib/orchestrator-pr-broker.ts";
 
 const policy = { repositories: ["owner/repository"], branchPrefixes: ["feat/", "fix/"] };
+
+function gitWorkspace(prefix: string): string { const workspace = mkdtempSync(join(tmpdir(), prefix)); mkdirSync(join(workspace, ".git")); writeFileSync(join(workspace, ".git", "config"), "[core]\nrepositoryformatversion = 0\n"); return workspace; }
 
 function request(path: string, value: unknown): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
@@ -56,9 +59,9 @@ test("broker socket is generation-bound, mode-restricted, and exposes no arbitra
 });
 
 test("publish uses only fixed git/gh argv and canonical remote with credential-free worker-facing output", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-test-"));
+	const workspace = gitWorkspace("pio-pr-test-");
 	const identity = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: identity.dev, inode: identity.ino };
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: identity.dev, inode: identity.ino, git: gitMetadataForTesting(workspace)! };
 	const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv; cwd?: string }> = [];
 	const old = process.env.GITHUB_TOKEN; process.env.GITHUB_TOKEN = "never-forward";
 	const runner = async (command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; timeout?: number } = {}) => {
@@ -88,7 +91,7 @@ test("publish uses only fixed git/gh argv and canonical remote with credential-f
 });
 
 test("default-branch startup defers branch pinning and falls back to trusted gh default lookup", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-pin-"));
+	const workspace = gitWorkspace("pio-pr-pin-");
 	const identity = statSync(workspace); const calls: string[] = [];
 	const runner = async (command: string, args: string[]) => {
 		calls.push(`${command} ${args.join(" ")}`); const joined = args.join(" ");
@@ -106,8 +109,8 @@ test("default-branch startup defers branch pinning and falls back to trusted gh 
 });
 
 test("disallowed first branch is rejected and a later branch change is rejected", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-branch-")); const stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino };
+	const workspace = gitWorkspace("pio-pr-branch-"); const stat = statSync(workspace);
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 	let branch = "other/nope";
 	const runner = async (command: string, args: string[]) => {
 		const joined = args.join(" ");
@@ -133,8 +136,8 @@ test("disallowed first branch is rejected and a later branch change is rejected"
 });
 
 test("failed PR create after push keeps the first branch pinned", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-failed-create-")); const stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino };
+	const workspace = gitWorkspace("pio-pr-failed-create-"); const stat = statSync(workspace);
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 	let branch = "feat/first", pushes = 0;
 	const runner = async (command: string, args: string[]) => {
 		const joined = args.join(" ");
@@ -160,7 +163,7 @@ test("failed PR create after push keeps the first branch pinned", async () => {
 });
 
 test("fork and wrong-base existing PR rows are rejected instead of edited", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-pr-row-")); const stat = statSync(workspace);
+	const workspace = gitWorkspace("pio-pr-pr-row-"); const stat = statSync(workspace);
 	const row = (extra: Record<string, unknown>) => [{ number: 7, headRefName: "feat/branch", baseRefName: "main", isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" }, ...extra }];
 	const makeRunner = (rows: unknown) => async (command: string, args: string[]) => {
 		const joined = args.join(" ");
@@ -171,15 +174,15 @@ test("fork and wrong-base existing PR rows are rejected instead of edited", asyn
 	};
 	try {
 		for (const rows of [row({ isCrossRepository: true, headRepository: { nameWithOwner: "fork/repository" }, headRepositoryOwner: { login: "fork" } }), row({ baseRefName: "release" })]) {
-			const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino };
+			const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 			assert.equal((await publishPullRequest(target, policy, "t", "b", makeRunner(rows))).ok, false);
 		}
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
 test("rejecting handlers, concurrent publish, and total request exhaustion are bounded", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-bounds-")), stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, branch: "feat/held" };
+	const workspace = gitWorkspace("pio-pr-bounds-"), stat = statSync(workspace);
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
 	let release!: () => void, rejectStatus = true; const held = new Promise<void>((resolve) => { release = resolve; });
 	const broker = startPullRequestBroker(target, policy, async (command, args) => {
 		const joined = args.join(" ");
@@ -204,8 +207,8 @@ test("rejecting handlers, concurrent publish, and total request exhaustion are b
 });
 
 test("cleanup during a publish is idempotent and waits for the active handler", async () => {
-	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-cleanup-")), stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, branch: "feat/held" };
+	const workspace = gitWorkspace("pio-pr-cleanup-"), stat = statSync(workspace);
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
 	let release!: () => void; const held = new Promise<void>((resolve) => { release = resolve; });
 	const broker = startPullRequestBroker(target, policy, async (command, args) => {
 		const joined = args.join(" "); if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
@@ -217,6 +220,17 @@ test("cleanup during a publish is idempotent and waits for the active handler", 
 		const first = broker.cleanup(), second = broker.cleanup(); assert.strictEqual(first, second); release(); await first; await pending.catch(() => {});
 		assert.equal(existsSync(broker.directory), false);
 	} finally { release?.(); await broker.cleanup(); rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("real metadata pin rejects .git/config replacement before a broker Git command", async () => {
+	const workspace = gitWorkspace("pio-pr-metadata-"); let calls = 0;
+	const runner = async (_command: string, args: string[]) => { calls++; const joined = args.join(" "); if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace }; if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" }; return { ok: false, stdout: "" }; };
+	try { const target = await pinPullRequestTarget(workspace, policy, runner); assert.ok(target); writeFileSync(join(workspace, ".git", "config"), "[core]\nrepositoryformatversion = 1\n"); calls = 0; assert.equal((await publishPullRequest(target!, policy, "t", "b", runner)).ok, false); assert.equal(calls, 0); } finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("local include config is rejected at pin time", async () => {
+	const workspace = gitWorkspace("pio-pr-include-"); writeFileSync(join(workspace, ".git", "config"), "[include]\npath = /tmp/evil\n");
+	try { assert.equal(await pinPullRequestTarget(workspace, policy, async () => ({ ok: true, stdout: "true" })), undefined); } finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
 test("broker request bound is finite", () => {
