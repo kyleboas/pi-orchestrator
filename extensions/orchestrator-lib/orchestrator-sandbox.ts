@@ -336,7 +336,6 @@ export function piWorkerSandboxPlan(homeDir: string, home: string = homedir(), g
 	if (gateway) return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
 		fileMountsReadOnly: [
-			{ source: join(sourceDir, "models.json"), dest: join(isolatedDir, "models.json") },
 			{ source: join(homeDir, ".gateway-placeholder"), dest: join(homeDir, ".config", "agent", "gateway.token") },
 		],
 	};

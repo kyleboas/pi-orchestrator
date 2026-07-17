@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GATEWAY_PLACEHOLDER, buildHostRelayBwrapArgs, startGatewayRelay, validateGatewayTokenFile } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
+import { GATEWAY_PLACEHOLDER, SANDBOX_GATEWAY_BASE_URL, buildHostRelayBwrapArgs, claudeGatewayEnv, startGatewayRelay, validateGatewayTokenFile, writeGatewayPiModels } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
 import { buildBwrapArgs, DEFAULT_SANDBOX_CONFIG, parseSandboxConfig, piWorkerSandboxPlan, resolveWorkerLaunch } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
 
 function requestUds(socketPath: string, body: string, path = "/v1/messages", method = "POST"): Promise<{ status: number; body: string }> {
@@ -68,16 +68,40 @@ test("gateway bwrap plan has exactly two bootstrap caps, argv-only bootstrap, UD
   assert.ok(bootstrap.includes("exec /usr/bin/setpriv"));
   assert.ok(!bootstrap.includes(" -c "));
   assert.equal(plan.fileMountsReadOnly.some((m) => m.source.includes("auth.json") || m.source.includes("gateway.token")), false);
-  assert.ok(plan.fileMountsReadOnly.some((m) => m.source.endsWith("models.json")));
+  assert.equal(plan.fileMountsReadOnly.some((m) => m.source.endsWith("models.json")), false, "host model configuration is not mounted in gateway mode");
   assert.ok(plan.fileMountsReadOnly.some((m) => m.source.endsWith(".gateway-placeholder")));
-  assert.equal(GATEWAY_PLACEHOLDER, "PI_ORCHESTRATOR_GATEWAY_PLACEHOLDER");
+  assert.match(GATEWAY_PLACEHOLDER, /^[^.]+\.[^.]+\.[^.]+$/);
+});
+
+test("gateway client environments contain only loopback routing and non-secret placeholders", () => {
+  assert.deepEqual(claudeGatewayEnv("/isolated/.claude"), {
+    PI_ORCHESTRATOR_WORKER: "1",
+    CLAUDE_CODE_BUBBLEWRAP: "1",
+    CLAUDE_CONFIG_DIR: "/isolated/.claude",
+    ANTHROPIC_BASE_URL: SANDBOX_GATEWAY_BASE_URL,
+    ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER,
+    ANTHROPIC_API_KEY: GATEWAY_PLACEHOLDER,
+  });
+});
+
+test("gateway Pi model override contains only a loopback provider and non-secret placeholder", () => {
+  const root = mkdtempSync(join(tmpdir(), "pio-gw-models-"));
+  try {
+    const file = writeGatewayPiModels(root, "openai-codex");
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual(parsed, { providers: { "openai-codex": { baseUrl: SANDBOX_GATEWAY_BASE_URL, apiKey: GATEWAY_PLACEHOLDER } } });
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.equal(statSync(join(root, "pi-agent")).mode & 0o777, 0o700);
+    assert.throws(() => writeGatewayPiModels(root, "../escape"), /invalid/);
+    assert.throws(() => writeGatewayPiModels(root, "openai-codex"), /EEXIST/, "an existing model override is never silently replaced");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("host relay streams bodies and responses, rewrites worker auth, sanitizes failures, and cleans up", async () => {
   const root = mkdtempSync(join(tmpdir(), "pio-gw-"));
   const tokenFile = join(root, "token"); writeFileSync(tokenFile, "real-test-token\n", { mode: 0o600 });
-  let observed: http.IncomingHttpHeaders = {}; let observedBody = ""; let upstreamRequests = 0;
-  const upstream = http.createServer((req, res) => { upstreamRequests++; observed = req.headers; req.on("data", (c) => observedBody += c); req.on("end", () => { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("data: one\n\n"); setTimeout(() => res.end("data: two\n\n"), 10); }); });
+  let observed: http.IncomingHttpHeaders = {}; let observedBody = ""; let observedPath = ""; let upstreamRequests = 0;
+  const upstream = http.createServer((req, res) => { upstreamRequests++; observed = req.headers; observedPath = req.url ?? ""; req.on("data", (c) => observedBody += c); req.on("end", () => { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("data: one\n\n"); setTimeout(() => res.end("data: two\n\n"), 10); }); });
   await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const address = upstream.address(); assert.ok(address && typeof address === "object");
   const relay = startGatewayRelay("test", { upstreamUrl: `http://127.0.0.1:${address.port}`, tokenFile }, join(root, "r"));
@@ -86,8 +110,9 @@ test("host relay streams bodies and responses, rewrites worker auth, sanitizes f
       const denied = await requestUds(relay.socketPath, "denied", path!, method!); assert.equal(denied.status, 404);
     }
     assert.equal(upstreamRequests, 0, "denied requests never reach the credential-bearing upstream");
-    const response = await requestUds(relay.socketPath, "streamed-body", "/v1/messages?beta=test");
+    const response = await requestUds(relay.socketPath, "streamed-body", "/codex/responses?stream=true");
     assert.equal(response.status, 200); assert.equal(response.body, "data: one\n\ndata: two\n\n"); assert.equal(observedBody, "streamed-body");
+    assert.equal(observedPath, "/v1/responses?stream=true", "the Codex transport is normalized to the gateway Responses endpoint");
     assert.equal(upstreamRequests, 1); assert.equal(observed.authorization, "Bearer real-test-token"); assert.equal(observed["proxy-authorization"], undefined); assert.equal(observed["x-api-key"], undefined);
     upstream.close(); await new Promise((r) => setTimeout(r, 20));
     const failed = await requestUds(relay.socketPath, "x"); assert.equal(failed.status, 502); assert.equal(failed.body, "gateway unavailable\n");

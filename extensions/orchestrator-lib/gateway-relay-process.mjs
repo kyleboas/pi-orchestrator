@@ -23,7 +23,7 @@ if (!token || token.length > 8192 || /[\r\n\0]/.test(token)) fail();
 try { const s = lstatSync(socketPath); if (s.isSocket()) unlinkSync(socketPath); else fail(); } catch (error) { if (error?.code !== "ENOENT") fail(); }
 const hop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
 const credentials = new Set(["authorization", "proxy-authorization", "x-api-key"]);
-const inferenceRoutes = new Set(["/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens"]);
+const inferenceRoutes = new Set(["/codex/responses", "/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens"]);
 function filtered(headers, response = false) {
   const blocked = new Set(hop);
   for (const item of String(headers.connection ?? "").split(",")) if (item.trim()) blocked.add(item.trim().toLowerCase());
@@ -43,7 +43,10 @@ const server = http.createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 120
   const headers = filtered(req.headers);
   headers.host = upstream.host;
   headers.authorization = `Bearer ${token}`;
-  const proxy = http.request({ protocol: "http:", hostname: upstream.hostname.replace(/^\[|\]$/g, ""), port: upstream.port || 80, method: req.method, path: req.url, headers, timeout: 115_000 }, (reply) => {
+  // Pi's openai-codex API uses ChatGPT's /codex/responses path. The local
+  // gateway exposes the equivalent OpenAI-compatible /v1/responses endpoint.
+  const upstreamPath = target.pathname === "/codex/responses" ? `/v1/responses${target.search}` : req.url;
+  const proxy = http.request({ protocol: "http:", hostname: upstream.hostname.replace(/^\[|\]$/g, ""), port: upstream.port || 80, method: req.method, path: upstreamPath, headers, timeout: 115_000 }, (reply) => {
     res.writeHead(reply.statusCode ?? 502, filtered(reply.headers, true));
     reply.pipe(res);
   });
