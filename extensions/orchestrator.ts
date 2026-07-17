@@ -79,10 +79,19 @@ import {
 	isOutcomeRolloverEligible,
 } from "./orchestrator-lib/orchestrator-rollover.ts";
 import {
+	TASK_CATEGORIES,
+	TASK_COMPLEXITIES,
+	acceptReviewedRuns,
+	classifyTask,
+	cleanStatsLedger,
 	loadStats,
 	recordWorkerOutcome,
 	recordWorkerSteer,
 	statsSummary,
+	updateWorkerRunStatus,
+	type TaskCategory,
+	type TaskComplexity,
+	type WorkerRunStatus,
 } from "./orchestrator-lib/orchestrator-stats.ts";
 import {
 	isDownKey,
@@ -111,13 +120,13 @@ export function coordinatorInstructions(catalog: WorkerCatalog, statsText?: stri
 
 Before delegating, use your read-only tools to inspect the relevant files, locate the root cause, and decide the approach. Then delegate with orchestrator_delegate, choosing one of: ${names}. Give a precise implementation brief: files to change, the change and why, edge cases, and validation. Workers implement your plan — do not send them off to investigate what you could determine yourself. Configured names are intentional: natural requests such as ${workerNames(catalog).map((name) => `“ask ${name}”`).join(", ")} select that worker and always win.
 
-For every unqualified new task, start with Luna unless the scope you already inspected demonstrably requires Sol or Terra. Escalate only when substantial complexity is known up front or Luna's cheaper attempt cannot complete the task. Each distinct new task gets a new delegate; orchestrator_steer is only for continuation or correction of the same task, never as a substitute for a new delegation.
+For every unqualified new task, start with Luna unless the scope you already inspected demonstrably requires Sol or Terra. Escalate only when substantial complexity is known up front or Luna's cheaper attempt cannot complete the task. Each distinct new task gets a new delegate; orchestrator_steer is only for continuation or correction of the same task, never as a substitute for a new delegation. For a separately delegated retry of prior work, pass retryOf with that prior root task ID so its lineage is joined; otherwise it is a new root.
 
 Worker tiers, cheapest first, with what each is for:
 ${workerNames(catalog).map((name) => `- ${workerDescription(name, catalog[name]!)}`).join("\n")}
 Default to Luna for unqualified new work, then use the cheapest tier that the inspected scope demonstrably requires; escalate only when the task's difficulty is known or a cheaper attempt has not completed it.${stats}
 
-Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Do not use /end or request an end-of-task summary.
+Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Mark each steer kind: correction means the reported attempt needs rework; continuation means its result is accepted and work continues on the same root task. Do not use /end or request an end-of-task summary.
 
 Never steer a worker just to ask how it is doing: status-report steers interrupt the work and waste its context. Healthy passive checks are silently retained for your next real turn and need no acknowledgement. Only suspicious passive checks wake you; review their concrete signals and steer only to correct actual drift.
 
@@ -179,29 +188,33 @@ function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 	}
 }
 
-/** Write one ledger outcome per run, at whichever terminal transition fires first. */
-function recordRunOutcome(worker: Worker, failed: boolean): void {
+/** Write one ledger attempt per lifecycle run. Later review changes only its status. */
+function recordRunOutcome(worker: Worker, status: WorkerRunStatus): void {
 	if (worker.statsRecordedRun === worker.run) return;
 	worker.statsRecordedRun = worker.run;
 	const start = worker.lastActivityAt?.getTime() ?? worker.startedAt.getTime();
 	recordWorkerOutcome(worker.name, {
-		failed,
+		status,
+		runId: worker.runId,
+		rootTaskId: worker.rootTaskId,
+		...(worker.retryOf ? { retryOf: worker.retryOf } : {}),
+		category: worker.category,
+		complexity: worker.complexity,
 		durationMs: Math.max(0, (worker.settledAt?.getTime() ?? Date.now()) - start),
 		tokens: Math.max(0, (worker.tokens ?? 0) - (worker.runTokensBase ?? 0)),
 		...(worker.costUsd === undefined ? {} : { costUsd: Math.max(0, worker.costUsd - (worker.runCostBase ?? 0)) }),
 		costKind: worker.profile.backend === "claude-code" ? "estimated" : "reported",
 		backend: worker.profile.backend,
 		model: worker.profile.model,
-		task: worker.task,
 	});
 }
 
-function failWorker(worker: Worker, message: string): void {
+function failWorker(worker: Worker, message: string, status: WorkerRunStatus = "failed"): void {
 	if (worker.state === "stopped" || worker.state === "failed") return;
 	worker.state = "failed";
 	worker.settledAt ??= new Date();
 	worker.lastError = message;
-	recordRunOutcome(worker, true);
+	recordRunOutcome(worker, status);
 	reportWorkerResult(worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
@@ -210,7 +223,7 @@ function sendRpc(worker: Worker, message: Record<string, unknown>): boolean {
 	if (!canSteerWorker(worker, worker.process)) return false;
 	try {
 		worker.process.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
-			if (error) failWorker(worker, "Pi RPC worker stdin failed.");
+			if (error) failWorker(worker, "Pi RPC worker stdin failed.", "unavailable");
 		});
 		return true;
 	} catch {
@@ -222,7 +235,7 @@ function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
 	if (!canSteerWorker(worker, worker.process)) return false;
 	try {
 		worker.process.stdin.write(`${JSON.stringify(claudeUserEvent(instructions))}\n`, (error) => {
-			if (error) failWorker(worker, "Claude Code worker stdin failed.");
+			if (error) failWorker(worker, "Claude Code worker stdin failed.", "unavailable");
 		});
 		queueClaudeTurn(worker);
 		worker.lastInstruction = instructions;
@@ -308,7 +321,7 @@ async function settleWorker(worker: Worker): Promise<void> {
 	const text = selectFinalWorkerText(worker.lastResult, latest);
 	if (text) worker.lastResult = text;
 	if (finishWorkerSettlement(worker, run)) {
-		recordRunOutcome(worker, false);
+		recordRunOutcome(worker, "completed");
 		reportWorkerResult(worker);
 	}
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -330,7 +343,7 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 	if (settlement.isError && isUsageLimitText(settlement.result) && config?.claudeAccounts) {
 		if (failoverClaudeWorker(worker, config, settlement.result ?? "")) return;
 		const reset = earliestAccountReset(config.claudeAccounts);
-		failWorker(worker, `Usage limit reached and every Claude account is in cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`);
+		failWorker(worker, `Usage limit reached and every Claude account is in cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
 		return;
 	}
 	// A result for an earlier turn (one that was already streaming when a
@@ -347,12 +360,12 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 		worker.state = "failed";
 		worker.settledAt ??= new Date();
 		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
-		recordRunOutcome(worker, true);
+		recordRunOutcome(worker, "failed");
 		reportWorkerResult(worker);
 	} else {
 		worker.lastResult = settlement.result;
 		if (finishWorkerSettlement(worker, run)) {
-			recordRunOutcome(worker, false);
+			recordRunOutcome(worker, "completed");
 			reportWorkerResult(worker);
 		}
 	}
@@ -457,7 +470,7 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 	child.on("error", () => {
 		if (worker.process !== child) return;
 		rejectPendingRpc(worker, new Error("Worker process failed to start."));
-		failWorker(worker, "Worker process failed to start.");
+		failWorker(worker, "Worker process failed to start.", "unavailable");
 	});
 	child.on("exit", (code, signal) => {
 		if (worker.process !== child) return;
@@ -465,7 +478,7 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 		if (worker.state !== "stopped" && worker.state !== "idle") {
 			failWorker(worker, code === 0
 				? "Worker process exited before returning a result."
-				: `Worker exited with code ${code ?? "null"} (${signal ?? "no signal"}).`);
+				: `Worker exited with code ${code ?? "null"} (${signal ?? "no signal"}).`, worker.state === "starting" ? "unavailable" : "failed");
 		}
 		notifyOrchestratorStateChange(getOrchestratorRuntime());
 	});
@@ -505,14 +518,14 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	});
 	const instruction = worker.lastInstruction ?? worker.task;
 	if (!sendWorkerInstruction(worker, instruction, true)) {
-		failWorker(worker, "Worker stdin was unavailable after an account failover.");
+		failWorker(worker, "Worker stdin was unavailable after an account failover.", "unavailable");
 		return true; // Handled: the worker is already failed, no double-report.
 	}
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 	return true;
 }
 
-function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig): Worker {
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const child = profile.backend === "pi-rpc"
@@ -527,6 +540,11 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		name,
 		profile,
 		task,
+		rootTaskId: lineage.rootTaskId,
+		runId: `${id}:run-1`,
+		...(lineage.retryOf ? { retryOf: lineage.retryOf } : {}),
+		category: lineage.category,
+		complexity: lineage.complexity,
 		cwd,
 		process: child,
 		state: "starting",
@@ -543,7 +561,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	wireWorkerChild(worker, child, config);
 	if (profile.backend === "claude-code" && config.claudeAccounts && !account) {
 		const reset = earliestAccountReset(config.claudeAccounts);
-		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`);
+		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
 		child.kill();
 		return worker;
 	}
@@ -554,7 +572,7 @@ ${task}
 
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Write it as plain sentences leading with the content — never open with a label prefix such as "Checkpoint:" or "Status:". Sol receives your final response directly and may send follow-up instructions while you work.`;
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
-	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.");
+	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
 	return worker;
 }
 
@@ -564,6 +582,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const catalog = config.workers;
 	const catalogNames = catalogText(catalog);
 	const delegateWorkerSchema = createWorkerSchema(catalog);
+	// One safe, backed-up normalization pass removes pre-v3 phantom aggregate keys.
+	cleanStatsLedger(undefined, workerNames(catalog));
 
 	// Workers are unref'd so a settled -p host can exit; make sure that exit
 	// also reaps any still-running worker processes instead of orphaning them.
@@ -923,14 +943,22 @@ export default function orchestrator(pi: ExtensionAPI) {
 		return { action: "continue" };
 	});
 
-	pi.on("before_agent_start", async (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${solToolMode.takeoverActive
-			? TAKEOVER_SYSTEM_INSTRUCTIONS(takeoverReason)
-			: coordinatorInstructions(catalog, statsSummary(loadStats(), workerNames(catalog)))}`,
-	}));
+	pi.on("before_agent_start", async (event) => {
+		const prompt = typeof (event as { prompt?: unknown }).prompt === "string" ? (event as { prompt: string }).prompt : "";
+		const classification = classifyTask(prompt);
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${solToolMode.takeoverActive
+				? TAKEOVER_SYSTEM_INSTRUCTIONS(takeoverReason)
+				: coordinatorInstructions(catalog, statsSummary(loadStats(undefined, workerNames(catalog)), workerNames(catalog), classification))}`,
+		};
+	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		const restrictedTools = solToolMode.settle();
+		// This is the first boundary after a result follow-up and its coordinator
+		// review. A still-idle reported run was accepted; correction steers resolve
+		// it to rework before they begin their next lifecycle run.
+		acceptReviewedRuns(runtime.workers.values());
 		if (restrictedTools) pi.setActiveTools(restrictedTools);
 		// agent_settled is Pi's safe boundary: unlike agent_end, no automatic
 		// retry, compaction retry, or queued follow-up remains active.
@@ -983,26 +1011,42 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Independent workstreams may be delegated to different workers in one turn; they run in parallel.`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Independent workstreams may be delegated to different workers in one turn; they run in parallel. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
 		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
 			task: Type.String({ description: "Implementation brief built from YOUR OWN investigation: state the root cause or design you already determined, the exact files and changes to make, edge cases, and the validation to run. Never ask the worker to 'diagnose', 'investigate', or 'find' something you already read — hand it your conclusions and acceptance criteria." }),
+			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
+			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
+			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const name = params.worker as string;
-			const worker = launchWorker(name, catalog[name]!, params.task, ctx.cwd, config);
-			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id });
+			const requestedRetry = typeof params.retryOf === "string" ? params.retryOf.trim() : "";
+			const activeMatch = [...runtime.workers.values()].find((candidate) => candidate.rootTaskId === requestedRetry || candidate.id === requestedRetry || candidate.runId === requestedRetry);
+			const storedMatch = requestedRetry ? loadStats(undefined, workerNames(catalog)).recentRuns.find((run) => run.rootTaskId === requestedRetry || run.runId === requestedRetry) : undefined;
+			const rootTaskId = activeMatch?.rootTaskId ?? storedMatch?.rootTaskId ?? `task-${randomUUID()}`;
+			const fallback = classifyTask(params.task);
+			const suppliedCategory: unknown = params.category;
+			const suppliedComplexity: unknown = params.complexity;
+			const worker = launchWorker(name, catalog[name]!, params.task, ctx.cwd, config, {
+				rootTaskId,
+				...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
+				category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
+				complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
+			});
+			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
 		},
 	});
 
 	pi.registerTool({
 		name: "orchestrator_steer",
 		label: "Steer worker",
-		description: `Send immediate follow-up instructions to a live configured worker (${catalogNames}). Use this to correct scope, request tests, or review fixes without ending it.`,
+		description: `Send immediate follow-up instructions to a live configured worker (${catalogNames}). Set kind to correction when the preceding completed result needs rework, or continuation when it is accepted and work continues on the same root. Omitted kind conservatively means correction.`,
 		parameters: Type.Object({
 			workerId: Type.String({ description: "Worker ID returned by orchestrator_delegate." }),
 			instructions: Type.String({ description: "Concrete follow-up instructions for the worker." }),
+			kind: Type.Optional(Type.Union([Type.Literal("correction"), Type.Literal("continuation")])),
 		}),
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
@@ -1010,20 +1054,27 @@ export default function orchestrator(pi: ExtensionAPI) {
 			if (!canSteerWorker(worker, worker.process)) {
 				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
 			}
+			const kind = params.kind === "continuation" ? "continuation" : "correction";
+			// Resolve a completed reported attempt before creating the next unique
+			// attempt ID. An active run has no completion to relabel yet.
+			if (worker.state === "idle" && worker.reportedRun === worker.run) {
+				updateWorkerRunStatus(worker.runId, kind === "correction" ? "rework" : "accepted", undefined, "completed");
+			}
 			// A stream-json Claude turn (and a Pi RPC steer) belongs to a new
 			// lifecycle generation before it is written, so a late prior result
 			// cannot settle or report this follow-up.
 			beginWorkerRun(worker);
+			worker.runId = `${worker.id}:run-${worker.run}`;
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
 			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: params.instructions });
 			if (!sendWorkerInstruction(worker, params.instructions, true)) {
-				failWorker(worker, "Worker stdin failed while sending follow-up instructions.");
+				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
 				return content(`${worker.id} could not accept follow-up instructions.`);
 			}
-			recordWorkerSteer(worker.name);
+			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
-			return content(`Sent follow-up instructions to ${worker.id}.`);
+			return content(`Sent ${kind} follow-up instructions to ${worker.id}.`);
 		},
 	});
 
@@ -1046,6 +1097,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
 			if (!worker) return content(`No worker exists with ID ${params.workerId}.`);
+			// Do not overwrite a completed/reviewed result. An explicit stop only
+			// creates a cancelled outcome for an actually active attempt.
+			if (worker.state === "starting" || worker.state === "working") {
+				worker.settledAt = new Date();
+				recordRunOutcome(worker, "cancelled");
+			}
 			stopWorker(worker);
 			worker.process.kill();
 			refreshWorkerWidget();
