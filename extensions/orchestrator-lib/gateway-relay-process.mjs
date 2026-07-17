@@ -1,6 +1,5 @@
 import http from "node:http";
-import { readFileSync, chmodSync, lstatSync, rmSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, chmodSync, lstatSync, unlinkSync } from "node:fs";
 
 const socketPath = process.env.PI_ORCHESTRATOR_RELAY_SOCKET;
 const upstreamText = process.env.PI_ORCHESTRATOR_GATEWAY_UPSTREAM;
@@ -24,6 +23,7 @@ if (!token || token.length > 8192 || /[\r\n\0]/.test(token)) fail();
 try { const s = lstatSync(socketPath); if (s.isSocket()) unlinkSync(socketPath); else fail(); } catch (error) { if (error?.code !== "ENOENT") fail(); }
 const hop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
 const credentials = new Set(["authorization", "proxy-authorization", "x-api-key"]);
+const inferenceRoutes = new Set(["/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens"]);
 function filtered(headers, response = false) {
   const blocked = new Set(hop);
   for (const item of String(headers.connection ?? "").split(",")) if (item.trim()) blocked.add(item.trim().toLowerCase());
@@ -36,7 +36,10 @@ function filtered(headers, response = false) {
   return out;
 }
 const server = http.createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 120_000, headersTimeout: 10_000 }, (req, res) => {
-  if (!req.url || req.url.startsWith("http://") || req.url.startsWith("https://") || req.method === "CONNECT" || req.headers.upgrade) { res.writeHead(400); res.end("invalid request\n"); return; }
+  let target;
+  try { target = req.url?.startsWith("/") && !req.url.startsWith("//") ? new URL(req.url, "http://worker") : undefined; } catch {}
+  const allowed = req.method === "POST" && target && !target.hash && inferenceRoutes.has(target.pathname);
+  if (!allowed || req.method === "CONNECT" || req.headers.upgrade) { req.resume(); res.writeHead(404, { connection: "close" }); res.end("not found\n"); return; }
   const headers = filtered(req.headers);
   headers.host = upstream.host;
   headers.authorization = `Bearer ${token}`;
@@ -49,11 +52,13 @@ const server = http.createServer({ maxHeaderSize: 16 * 1024, requestTimeout: 120
   req.on("aborted", () => proxy.destroy());
   req.pipe(proxy);
 });
-server.on("clientError", (_error, socket) => socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"));
+server.on("clientError", (_error, socket) => socket.destroy());
+server.on("connect", (_req, socket) => socket.destroy());
+server.on("upgrade", (_req, socket) => socket.destroy());
 server.on("error", fail);
 server.listen(socketPath, () => { try { chmodSync(socketPath, 0o600); process.stdout.write("ready\n"); } catch { fail(); } });
 function stop() {
-  server.close(() => { try { rmSync(dirname(socketPath), { recursive: true, force: true }); } catch {} process.exit(0); });
+  server.close(() => { try { unlinkSync(socketPath); } catch {} process.exit(0); });
   setTimeout(() => process.exit(1), 1000).unref();
 }
 process.on("SIGTERM", stop); process.on("SIGINT", stop);

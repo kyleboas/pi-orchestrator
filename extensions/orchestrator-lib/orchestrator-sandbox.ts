@@ -115,6 +115,9 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 		gateway = { upstreamUrl: url.href.replace(/\/$/, ""), tokenFile };
 	}
 	if ((network === "gateway") !== !!gateway) return undefined;
+	// Gateway is a containment mode, never a modifier for a legacy direct spawn.
+	// Rejecting this combination also guarantees no relay is created for mode:off.
+	if (network === "gateway" && mode === "off") return undefined;
 	// An explicitly enabled sandbox defaults to the credential-safe allowlist;
 	// only mode "off" (legacy direct spawn) defaults to full inheritance.
 	const env = raw.env === undefined ? (mode === "off" ? "inherit" : "allowlist") : raw.env;
@@ -580,7 +583,7 @@ export function createWorkerHomeDir(dir: string): string {
 }
 
 /** Path-component containment; a bare prefix check would match sibling dirs like "pi-orchestrator-evil". */
-function isPathInside(base: string, path: string): boolean {
+export function isPathInside(base: string, path: string): boolean {
 	const rel = relative(base, path);
 	return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }

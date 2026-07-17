@@ -489,18 +489,18 @@ function spawnWorkerChild(
 	const launch = resolveWorkerLaunch(config.sandbox, { command, args, cwd, envOverrides, homeDir, ...paths,
 		...(relay && node ? { gateway: { relayDirectory: relay.directory, nodePath: relay.nodePath, nodeRoot: node.readOnlyRoots[0]!, bootstrapPath: relay.bootstrapPath, entrypointPath: relay.entrypointPath } } : {}),
 	}, hostEnv);
-	if (!launch.ok) { relay?.cleanup(); cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected(launch.error); }
+	if (!launch.ok) { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected(launch.error); }
 	if (launch.sandboxed) createWorkerHomeDir(homeDir);
 	let child: Worker["process"];
 	try {
 		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const });
 	} catch (error) {
-		relay?.cleanup();
+		if (relay) void relay.cleanup().catch(() => {});
 		if (launch.sandboxed) cleanupWorkerHomeDir(homeDir);
 		throw error;
 	}
 	if (launch.sandboxed) {
-		const clean = () => { relay?.cleanup(); cleanupWorkerHomeDir(homeDir); };
+		const clean = () => { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); };
 		child.once("exit", clean);
 		child.once("error", clean);
 	}

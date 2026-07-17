@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GATEWAY_PLACEHOLDER, startGatewayRelay } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
-import { buildBwrapArgs, DEFAULT_SANDBOX_CONFIG, parseSandboxConfig, piWorkerSandboxPlan } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
+import { GATEWAY_PLACEHOLDER, buildHostRelayBwrapArgs, startGatewayRelay, validateGatewayTokenFile } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
+import { buildBwrapArgs, DEFAULT_SANDBOX_CONFIG, parseSandboxConfig, piWorkerSandboxPlan, resolveWorkerLaunch } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
 
-function requestUds(socketPath: string, body: string): Promise<{ status: number; body: string }> {
+function requestUds(socketPath: string, body: string, path = "/v1/messages", method = "POST"): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const req = http.request({ socketPath, path: "/v1/messages", method: "POST", headers: { authorization: "worker-secret", "proxy-authorization": "bad", "x-api-key": "bad", connection: "close", "content-type": "text/plain" } }, (res) => {
+    const req = http.request({ socketPath, path, method, headers: { authorization: "worker-secret", "proxy-authorization": "bad", "x-api-key": "bad", connection: "close", "content-type": "text/plain" } }, (res) => {
       let text = ""; res.on("data", (chunk) => text += chunk); res.on("end", () => resolve({ status: res.statusCode!, body: text }));
     });
     req.on("error", reject); req.end(body);
@@ -19,6 +19,10 @@ function requestUds(socketPath: string, body: string): Promise<{ status: number;
 test("gateway config accepts only an HTTP loopback origin and safe absolute token path", () => {
   const good = parseSandboxConfig({ mode: "required", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/home/user/.config/agent/gateway.token" } });
   assert.equal(good?.gateway?.upstreamUrl, "http://127.0.0.1:4000");
+  assert.equal(parseSandboxConfig({ mode: "off", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x" } }), undefined, "off+gateway is rejected before any relay can start");
+  const preferred = parseSandboxConfig({ mode: "preferred", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x" } })!;
+  const failed = resolveWorkerLaunch(preferred, { command: "pi", args: [], cwd: "/work", homeDir: "/tmp/home", envOverrides: {} }, {}, () => ({ ok: false, reason: "probe failed" }));
+  assert.ok(!failed.ok, "preferred gateway must never fall back to a direct spawn");
   for (const bad of [
     { network: "gateway" },
     { network: "host", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x" } },
@@ -28,6 +32,23 @@ test("gateway config accepts only an HTTP loopback origin and safe absolute toke
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "relative" } },
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", token: "never" } },
   ]) assert.equal(parseSandboxConfig(bad), undefined);
+});
+
+test("host relay mount plan is minimal and token validation rejects links and loose permissions", () => {
+  const args = buildHostRelayBwrapArgs("/node24", "/package/relay.mjs", "/safe/token", "/runtime/relay");
+  assert.ok(!args.some((arg, i) => arg === "/" && args[i - 1] === "--ro-bind"), "never mount the host root");
+  for (const forbidden of ["/home", "/root", "/run", "/etc", "/usr"]) assert.ok(!args.includes(forbidden));
+  assert.ok(args.join(" ").includes("--ro-bind /node24 /runtime"));
+  assert.ok(args.join(" ").includes("--ro-bind /package/relay.mjs /orchestrator/relay.mjs"));
+  assert.ok(args.join(" ").includes("--ro-bind /safe/token /gateway.token"));
+  assert.ok(args.includes("--cap-drop") && args.includes("ALL"));
+  const root = mkdtempSync(join(tmpdir(), "pio-token-"));
+  try {
+    const token = join(root, "token"); writeFileSync(token, "fake\n", { mode: 0o600 });
+    assert.equal(validateGatewayTokenFile(token), token);
+    chmodSync(token, 0o644); assert.throws(() => validateGatewayTokenFile(token), /unsafe/); chmodSync(token, 0o600);
+    const link = join(root, "link"); symlinkSync(token, link); assert.throws(() => validateGatewayTokenFile(link), /unsafe/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("gateway bwrap plan has exactly two bootstrap caps, argv-only bootstrap, UDS bind, and complete drop", () => {
@@ -55,16 +76,41 @@ test("gateway bwrap plan has exactly two bootstrap caps, argv-only bootstrap, UD
 test("host relay streams bodies and responses, rewrites worker auth, sanitizes failures, and cleans up", async () => {
   const root = mkdtempSync(join(tmpdir(), "pio-gw-"));
   const tokenFile = join(root, "token"); writeFileSync(tokenFile, "real-test-token\n", { mode: 0o600 });
-  let observed: http.IncomingHttpHeaders = {}; let observedBody = "";
-  const upstream = http.createServer((req, res) => { observed = req.headers; req.on("data", (c) => observedBody += c); req.on("end", () => { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("data: one\n\n"); setTimeout(() => res.end("data: two\n\n"), 10); }); });
+  let observed: http.IncomingHttpHeaders = {}; let observedBody = ""; let upstreamRequests = 0;
+  const upstream = http.createServer((req, res) => { upstreamRequests++; observed = req.headers; req.on("data", (c) => observedBody += c); req.on("end", () => { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("data: one\n\n"); setTimeout(() => res.end("data: two\n\n"), 10); }); });
   await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const address = upstream.address(); assert.ok(address && typeof address === "object");
   const relay = startGatewayRelay("test", { upstreamUrl: `http://127.0.0.1:${address.port}`, tokenFile }, join(root, "r"));
   try {
-    const response = await requestUds(relay.socketPath, "streamed-body");
+    for (const [path, method] of [["/admin/keys", "POST"], ["/v1/users", "GET"], ["/v1/messages", "DELETE"], ["http://127.0.0.1/v1/messages", "POST"], ["/v1/messages%2fadmin", "POST"]]) {
+      const denied = await requestUds(relay.socketPath, "denied", path!, method!); assert.equal(denied.status, 404);
+    }
+    assert.equal(upstreamRequests, 0, "denied requests never reach the credential-bearing upstream");
+    const response = await requestUds(relay.socketPath, "streamed-body", "/v1/messages?beta=test");
     assert.equal(response.status, 200); assert.equal(response.body, "data: one\n\ndata: two\n\n"); assert.equal(observedBody, "streamed-body");
-    assert.equal(observed.authorization, "Bearer real-test-token"); assert.equal(observed["proxy-authorization"], undefined); assert.equal(observed["x-api-key"], undefined);
+    assert.equal(upstreamRequests, 1); assert.equal(observed.authorization, "Bearer real-test-token"); assert.equal(observed["proxy-authorization"], undefined); assert.equal(observed["x-api-key"], undefined);
     upstream.close(); await new Promise((r) => setTimeout(r, 20));
     const failed = await requestUds(relay.socketPath, "x"); assert.equal(failed.status, 502); assert.equal(failed.body, "gateway unavailable\n");
-  } finally { relay.cleanup(); upstream.closeAllConnections(); await new Promise<void>((resolve) => upstream.close(() => resolve())); rmSync(root, { recursive: true, force: true }); }
+  } finally { await relay.cleanup(); upstream.closeAllConnections(); await new Promise<void>((resolve) => upstream.close(() => resolve())); rmSync(root, { recursive: true, force: true }); }
+  assert.throws(() => readFileSync(relay.socketPath), /ENOENT/);
+});
+
+test("relay spawn errors and readiness timeouts leave no orphan directory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pio-gw-fail-")); const tokenFile = join(root, "token"); writeFileSync(tokenFile, "fake\n", { mode: 0o600 }); const base = join(root, "relays"); mkdirSync(base);
+  try {
+    assert.throws(() => startGatewayRelay("broken", { upstreamUrl: "http://127.0.0.1:9", tokenFile }, base, "/definitely/missing-bwrap", 20), /readiness/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(readdirSync(base), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("relay teardown permits immediate same-key reuse without stale generation directories", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pio-gw-life-")); const tokenFile = join(root, "token"); writeFileSync(tokenFile, "fake\n", { mode: 0o600 });
+  const upstream = http.createServer((_req, res) => res.end("ok")); await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address(); assert.ok(address && typeof address === "object"); const config = { upstreamUrl: `http://127.0.0.1:${address.port}`, tokenFile };
+  try {
+    const first = startGatewayRelay("same", config, join(root, "relays")); await first.cleanup();
+    const second = startGatewayRelay("same", config, join(root, "relays")); assert.notEqual(second.directory, first.directory); await second.cleanup();
+    assert.deepEqual(readFileSync(join(root, "token"), "utf8"), "fake\n");
+  } finally { upstream.closeAllConnections(); await new Promise<void>((resolve) => upstream.close(() => resolve())); rmSync(root, { recursive: true, force: true }); }
 });

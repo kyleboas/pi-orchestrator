@@ -13,6 +13,7 @@ import {
 	resetSandboxProbeCacheForTesting,
 	cleanupWorkerHomeDir,
 	createWorkerHomeDir,
+	isPathInside,
 	piWorkerSandboxPlan,
 	resolveWorkerCommand,
 	resolveWorkerLaunch,
@@ -454,16 +455,12 @@ test("worker home creation repairs permissions on pre-existing directories", () 
 });
 
 test("cleanup containment is path-component-safe, not a bare prefix match", () => {
-	// A sibling of the allowed base that shares its string prefix must survive.
-	const evil = mkdtempSync(join(homedir(), ".cache", "pi-orchestrator-evil-"));
-	try {
-		cleanupWorkerHomeDir(evil);
-		assert.ok(statSync(evil).isDirectory(), "prefix-sharing sibling must not be deleted");
-	} finally {
-		rmSync(evil, { recursive: true, force: true });
-	}
-	// The allowed base itself is not a valid worker home either.
-	cleanupWorkerHomeDir(join(homedir(), ".cache", "pi-orchestrator"));
+	// Synthetic paths avoid assuming that the coordinator HOME exists or is
+	// writable while exercising the exact predicate used by cleanup.
+	const base = join("/fixture", "home", ".cache", "pi-orchestrator");
+	assert.equal(isPathInside(base, `${base}-evil-1234`), false, "prefix-sharing sibling must be rejected");
+	assert.equal(isPathInside(base, base), false, "the allowed base itself is not a worker home");
+	assert.equal(isPathInside(base, join(base, "worker-homes", "w1")), true);
 	// A genuine worker home under tmpdir (smoke-test shape) is removable.
 	const ok = mkdtempSync(join(tmpdir(), "pi-orchestrator-home-"));
 	cleanupWorkerHomeDir(ok);
