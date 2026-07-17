@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
@@ -45,15 +45,15 @@ export function normalizeGitHubRemote(value: string): { repository: string; remo
 	if (!match) try { const url = new URL(raw); if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" || url.port || url.username || url.password || url.search || url.hash) return undefined; match = /^\/([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(url.pathname); } catch { return undefined; }
 	if (!match) return undefined;
 	const repository = normalizedRepository(`${match[1]}/${match[2]}`);
-	return repository ? { repository, remoteUrl: `git@github.com:${repository}.git` } : undefined;
+	return repository ? { repository, remoteUrl: `https://github.com/${repository}.git` } : undefined;
 }
 export function branchAllowed(branch: string, config: PullRequestsConfig, defaultBranch?: string): boolean { return BRANCH.test(branch) && branch !== defaultBranch && config.branchPrefixes.some((prefix) => branch.startsWith(prefix)); }
 
 function trustedEnv(host: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-	// gh reads only its host configuration here. Tokens are intentionally not
-	// inherited; SSH-agent access remains exclusively in this trusted process.
+	// gh reads its host login from HOME. Deliberately retain no SSH or Git
+	// transport state, and never inherit token-shaped environment variables.
 	const env: NodeJS.ProcessEnv = {};
-	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_SSH_COMMAND"]) if (host[key] !== undefined) env[key] = host[key];
+	for (const key of ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM"]) if (host[key] !== undefined) env[key] = host[key];
 	return env;
 }
 function defaultRunner(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; signal?: AbortSignal } = {}): Promise<CommandResult> {
@@ -82,7 +82,42 @@ function defaultRunner(command: string, args: string[], options: { cwd?: string;
 		child.on("exit", (code) => finish(code === 0));
 	});
 }
-const GIT_ENV = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat" };
+const GIT_ENV = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_PAGER: "cat" };
+const ASKPASS_SOURCE = `import { spawnSync } from "node:child_process";
+const prompt = process.argv[2];
+if (prompt === "Username for 'https://github.com': ") process.stdout.write("x-access-token\\n");
+else if (prompt === "Password for 'https://x-access-token@github.com': ") {
+  const result = spawnSync("gh", ["auth", "token", "--hostname", "github.com"], { shell: false, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 10000, maxBuffer: 1025 });
+  const output = typeof result.stdout === "string" ? result.stdout : "";
+  const match = result.status === 0 && !result.error && !result.signal && /^([A-Za-z0-9_]{1,512})\\n?$/.exec(output);
+  if (!match) process.exit(1);
+  else process.stdout.write(match[1] + "\\n");
+} else process.exit(1);
+`;
+function createAskpass(tempParent: string): string {
+	const path = join(tempParent, "git-askpass");
+	// Use this process's resolved Node binary rather than PATH in the shebang.
+	writeFileSync(path, `#!${process.execPath}\n${ASKPASS_SOURCE}`, { mode: 0o700 });
+	chmodSync(path, 0o700);
+	return path;
+}
+function trustedBareConfig(head: string): string {
+	return head.length === 64
+		? "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+		: "[core]\n\trepositoryformatversion = 0\n\tbare = true\n";
+}
+function replaceTrustedCloneConfig(gitDir: string, head: string): boolean {
+	try {
+		const config = trustedBareConfig(head), destination = join(gitDir, "config"), replacement = join(gitDir, "config.broker-new");
+		writeFileSync(replacement, config, { mode: 0o600 }); chmodSync(replacement, 0o600);
+		renameSync(replacement, destination);
+		return trustedCloneSafe(gitDir, config);
+	} catch { return false; }
+}
+function networkGitOptions(cwd: string, askpass: string): { cwd: string; env: NodeJS.ProcessEnv; timeout: number } {
+	return { cwd, env: { ...trustedEnv(process.env), ...GIT_ENV, GIT_ALLOW_PROTOCOL: "https", GIT_PROTOCOL_FROM_USER: "0", GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: askpass }, timeout: 30_000 };
+}
+function networkGitArgs(...args: string[]): string[] { return gitArgs("-c", "credential.helper=", ...args); }
 function gitArgs(...args: string[]): string[] { return ["--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", ...args]; }
 async function git(runner: BrokerRunner, cwd: string, ...args: string[]): Promise<CommandResult> { return runner("git", gitArgs(...args), { cwd, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 }); }
 async function line(runner: BrokerRunner, cwd: string, ...args: string[]): Promise<string | undefined> { const result = await git(runner, cwd, ...args); const value = result.stdout.trim(); return result.ok && value && value.length <= 512 && !/[\0\r\n]/.test(value) ? value : undefined; }
@@ -117,10 +152,10 @@ function identity(cwd: string): { workspace: string; device: number; inode: numb
 /** Test-only inspection helper; production eligibility always obtains this through pinPullRequestTarget. */
 export function gitMetadataForTesting(workspace: string): GitMetadata | undefined { return metadata(workspace); }
 function sameMetadata(left: GitMetadata, right: GitMetadata | undefined): boolean { return !!right && left.entryDevice === right.entryDevice && left.entryInode === right.entryInode && left.gitDir === right.gitDir && left.objectsDevice === right.objectsDevice && left.objectsInode === right.objectsInode && left.objectInfoDevice === right.objectInfoDevice && left.objectInfoInode === right.objectInfoInode && left.files.length === right.files.length && left.files.every((file, index) => file.path === right.files[index]?.path && file.device === right.files[index]?.device && file.inode === right.files[index]?.inode && file.hash === right.files[index]?.hash); }
-function trustedCloneSafe(gitDir: string): boolean {
+function trustedCloneSafe(gitDir: string, expectedConfig?: string): boolean {
 	try {
-		const config = lstatSync(join(gitDir, "config")), objects = join(gitDir, "objects"), objectStat = lstatSync(objects);
-		if (!config.isFile() || config.isSymbolicLink() || !objectStat.isDirectory() || objectStat.isSymbolicLink()) return false;
+		const configPath = join(gitDir, "config"), config = lstatSync(configPath), objects = join(gitDir, "objects"), objectStat = lstatSync(objects);
+		if (!config.isFile() || config.isSymbolicLink() || (expectedConfig !== undefined && readFileSync(configPath, "utf8") !== expectedConfig) || !objectStat.isDirectory() || objectStat.isSymbolicLink()) return false;
 		const safeTree = (path: string): boolean => {
 			for (const name of readdirSync(path)) {
 				const child = join(path, name), stat = lstatSync(child);
@@ -186,8 +221,9 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 	const dirty = await git(runner, target.workspace, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none");
 	if (!dirty.ok || dirty.stdout.trim()) return { ok: false, message: "Commit or remove all tracked and untracked changes before publishing." };
 	const head = await line(runner, target.workspace, "rev-parse", "--verify", "HEAD^{commit}");
-	if (!head || !/^[a-f0-9]{40,64}$/i.test(head)) return { ok: false, message: "A committed HEAD is required." };
+	if (!head || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) return { ok: false, message: "A committed HEAD is required." };
 	const tempParent = mkdtempSync(join(tmpdir(), "pio-pr-trusted-")), temp = join(tempParent, "view.git");
+	chmodSync(tempParent, 0o700);
 	try {
 		// Recheck immediately before snapshotting. A local no-hardlinks clone copies
 		// repository files directly; unlike file:// transport, it never invokes a
@@ -195,15 +231,21 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 		if (!sameMetadata(target.git, metadata(target.workspace))) return { ok: false, message: "Repository metadata no longer matches the delegated target." };
 		const cloneEnv = { ...trustedEnv(process.env), ...GIT_ENV, GIT_ALLOW_PROTOCOL: "file", GIT_PROTOCOL_FROM_USER: "0" };
 		if (!(await runner("git", gitArgs("-c", "protocol.file.allow=always", "-c", "protocol.ssh.allow=never", "-c", "protocol.http.allow=never", "-c", "protocol.https.allow=never", "clone", "--bare", "--local", "--no-hardlinks", target.workspace, temp), { cwd: tempParent, env: cloneEnv, timeout: 30_000 })).ok || !trustedCloneSafe(temp)) return { ok: false, message: "Could not prepare a trusted Git view." };
-		const trustedOptions = { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 };
-		const fetched = await runner("git", gitArgs("fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), trustedOptions);
-		if (!fetched.ok) { const remote = await runner("git", gitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), trustedOptions); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }
-		else if (!(await runner("git", gitArgs("merge-base", "--is-ancestor", `refs/remotes/pinned/${branch}`, head), trustedOptions)).ok) return { ok: false, message: "The branch is not a fast-forward update." };
+		// The snapshot copied worker-controlled config. Replace it before a network
+		// command so URL rewrites, credential helpers, proxies, TLS settings, and
+		// askpass hooks cannot influence authenticated Git.
+		if (!replaceTrustedCloneConfig(temp, head)) return { ok: false, message: "Could not prepare a trusted Git view." };
+		const localTrustedOptions = { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 };
+		if (!(await runner("git", gitArgs("cat-file", "-e", `${head}^{commit}`), localTrustedOptions)).ok) return { ok: false, message: "Could not prepare a trusted Git view." };
+		const trustedOptions = networkGitOptions(temp, createAskpass(tempParent));
+		const fetched = await runner("git", networkGitArgs("fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), trustedOptions);
+		if (!fetched.ok) { const remote = await runner("git", networkGitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), trustedOptions); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }
+		else if (!(await runner("git", gitArgs("merge-base", "--is-ancestor", `refs/remotes/pinned/${branch}`, head), localTrustedOptions)).ok) return { ok: false, message: "The branch is not a fast-forward update." };
 		// Recheck after all worker-controlled checkout reads, then pin before any
 		// network mutation. A failed push/gh operation still permits only this branch.
 		if ((await currentAllowedBranch(target, policy, runner)) !== branch) return { ok: false, message: "The branch changed during publishing." };
 		target.branch ??= branch;
-		if (!(await runner("git", gitArgs("push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
+		if (!(await runner("git", networkGitArgs("push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { ...trustedOptions, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
 		const env = trustedEnv(process.env), owner = target.repository.split("/")[0]!, open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${owner}:${branch}`, "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"], { env, timeout: 30_000 });
 		if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { ok: false, message: "Could not query the existing pull request." };
 		let number: number | undefined;
