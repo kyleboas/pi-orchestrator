@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type SandboxMode = "off" | "preferred" | "required";
 export type SandboxNetwork = "host" | "none";
@@ -88,7 +88,9 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 	if (!MODES.has(mode as SandboxMode)) return undefined;
 	const network = raw.network === undefined ? "host" : raw.network;
 	if (!NETWORKS.has(network as SandboxNetwork)) return undefined;
-	const env = raw.env === undefined ? "inherit" : raw.env;
+	// An explicitly enabled sandbox defaults to the credential-safe allowlist;
+	// only mode "off" (legacy direct spawn) defaults to full inheritance.
+	const env = raw.env === undefined ? (mode === "off" ? "inherit" : "allowlist") : raw.env;
 	if (!ENV_POLICIES.has(env as SandboxEnvPolicy)) return undefined;
 	const envAllow: string[] = [];
 	if (raw.envAllow !== undefined) {
@@ -203,8 +205,19 @@ export function resolveWorkerCommand(
 	} catch {
 		return undefined;
 	}
+	// An npm-installed CLI resolves into <prefix>/lib/node_modules/<pkg>/...;
+	// the runtime root is the prefix (e.g. an nvm Node version dir), which
+	// carries bin/node, the launcher symlink, and every package dependency.
+	// Mounting only the package dist directory would strand the interpreter.
 	const realDir = dirname(execPath);
-	const root = basename(realDir) === "bin" ? dirname(realDir) : realDir;
+	const marker = execPath.indexOf("/node_modules/");
+	let root: string;
+	if (marker > 0) {
+		root = execPath.slice(0, marker);
+		if (basename(root) === "lib") root = dirname(root);
+	} else {
+		root = basename(realDir) === "bin" ? dirname(realDir) : realDir;
+	}
 	const pathDirs = [...new Set([dirname(candidate), realDir])];
 	return { execPath, readOnlyRoots: [root], pathDirs };
 }
@@ -231,19 +244,52 @@ const SYSTEM_RO_TRY: readonly string[] = [
 	"/etc/localtime",
 ];
 
+export type SandboxFileMount = { source: string; dest: string };
+
 export type WorkerLaunchRequest = {
 	command: string;
 	args: string[];
 	cwd: string;
-	/** Values the launch must set regardless of env policy (worker marker, CLAUDE_CONFIG_DIR). */
+	/** Values the launch must set regardless of env policy (worker marker, a rotation-selected CLAUDE_CONFIG_DIR). */
 	envOverrides: Record<string, string>;
+	/** Values applied ONLY when the launch is actually sandboxed (paths that exist only inside the sandbox home). */
+	sandboxEnvOverrides?: Record<string, string>;
 	/** Host directory bound as the worker's isolated HOME when sandboxed. */
 	homeDir: string;
-	/** Host paths bound read-only if they exist (per-backend config dirs); absence is tolerated. */
+	/** Host paths bound read-only if they exist; absence is tolerated. */
 	readOnlyTryPaths?: string[];
+	/** Individual files bound read-only if they exist (narrow credential/config allowlists, never whole directories). */
+	fileMountsReadOnlyTry?: SandboxFileMount[];
 	/** Host paths bound read-write (workspace extras such as a Claude account directory); must exist. */
 	readWritePaths?: string[];
 };
+
+/** The only files a sandboxed Pi RPC worker may see from the host Pi agent directory. */
+export const PI_WORKER_CONFIG_FILES: readonly string[] = ["auth.json", "models.json"];
+
+/**
+ * Isolation plan for a Pi RPC worker: an isolated agent dir inside the worker
+ * home receives only the allowlisted auth/model files, and PI_CODING_AGENT_DIR
+ * points at it, so host sessions, chat, logs, secret-store, prompts, and other
+ * private state under ~/.pi are never mounted. The gateway token, when Pi's
+ * provider config references it, is mounted as that single file — never the
+ * surrounding ~/.config/agent directory.
+ */
+export function piWorkerSandboxPlan(homeDir: string, home: string = homedir()): {
+	sandboxEnvOverrides: Record<string, string>;
+	fileMountsReadOnlyTry: SandboxFileMount[];
+} {
+	const sourceDir = join(home, ".pi", "agent");
+	const isolatedDir = join(homeDir, "pi-agent");
+	const gatewayToken = join(home, ".config", "agent", "gateway.token");
+	return {
+		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
+		fileMountsReadOnlyTry: [
+			...PI_WORKER_CONFIG_FILES.map((name) => ({ source: join(sourceDir, name), dest: join(isolatedDir, name) })),
+			{ source: gatewayToken, dest: gatewayToken },
+		],
+	};
+}
 
 export type LaunchSpec = {
 	command: string;
@@ -302,6 +348,9 @@ export function buildBwrapArgs(config: SandboxConfig, request: WorkerLaunchReque
 	for (const path of strictRo) args.push("--ro-bind", path, path);
 	for (const path of [...new Set(request.readOnlyTryPaths ?? [])]) args.push("--ro-bind-try", path, path);
 	args.push("--bind", request.homeDir, request.homeDir);
+	// File mounts land after the home bind: destinations inside the worker home
+	// must overlay it, not be shadowed by it.
+	for (const mount of request.fileMountsReadOnlyTry ?? []) args.push("--ro-bind-try", mount.source, mount.dest);
 	args.push("--bind", request.cwd, request.cwd);
 	for (const path of [...new Set(request.readWritePaths ?? [])]) args.push("--bind", path, path);
 	args.push("--chdir", request.cwd);
@@ -348,7 +397,7 @@ export function resolveWorkerLaunch(
 		: resolveWorkerCommand(request.command, hostEnv);
 	if (!resolved) return fail("the worker executable could not be resolved to a real path");
 
-	const env = buildEnv(config, hostEnv, { ...request.envOverrides, HOME: request.homeDir, TMPDIR: "/tmp" }, resolved.pathDirs);
+	const env = buildEnv(config, hostEnv, { ...request.envOverrides, ...request.sandboxEnvOverrides, HOME: request.homeDir, TMPDIR: "/tmp" }, resolved.pathDirs);
 	return {
 		ok: true,
 		sandboxed: true,
@@ -372,12 +421,28 @@ export function workerHomeDirPath(workerKey: string, baseDir: string = workerHom
 
 export function createWorkerHomeDir(dir: string): string {
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	// mkdir's mode only applies to newly created directories: repair permissions
+	// on pre-existing worker homes and their state parent too.
+	for (const path of [dir, dirname(dir)]) {
+		try {
+			chmodSync(path, 0o700);
+		} catch {
+			// Permission repair is best-effort; the mkdir above already succeeded.
+		}
+	}
 	return dir;
 }
 
+/** Path-component containment; a bare prefix check would match sibling dirs like "pi-orchestrator-evil". */
+function isPathInside(base: string, path: string): boolean {
+	const rel = relative(base, path);
+	return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
 export function cleanupWorkerHomeDir(dir: string): void {
-	// Only remove directories this module created; never a caller mistake like "/".
-	if (!dir.startsWith(join(homedir(), ".cache", "pi-orchestrator")) && !dir.startsWith(tmpdir())) return;
+	// Only remove directories this module (or the smoke test under tmpdir) created.
+	const allowedBases = [join(homedir(), ".cache", "pi-orchestrator"), tmpdir()];
+	if (!allowedBases.some((base) => isPathInside(base, dir))) return;
 	try {
 		rmSync(dir, { recursive: true, force: true });
 	} catch {

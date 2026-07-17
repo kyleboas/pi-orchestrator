@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,6 +11,9 @@ import {
 	parseSandboxConfig,
 	probeBwrap,
 	resetSandboxProbeCacheForTesting,
+	cleanupWorkerHomeDir,
+	createWorkerHomeDir,
+	piWorkerSandboxPlan,
 	resolveWorkerCommand,
 	resolveWorkerLaunch,
 	workerHomeDirPath,
@@ -66,7 +69,12 @@ test("parseSandboxConfig accepts valid blocks and applies defaults", () => {
 		parseSandboxConfig({ mode: "required", network: "none", env: "allowlist", envAllow: ["ANTHROPIC_BASE_URL"], readOnlyPaths: ["~/runtime"], command: "bwrap" }),
 		sandbox({ mode: "required", network: "none", env: "allowlist", envAllow: ["ANTHROPIC_BASE_URL"], readOnlyPaths: [join(homedir(), "runtime")] }),
 	);
-	assert.deepEqual(parseSandboxConfig({ mode: "preferred" }), sandbox({ mode: "preferred" }));
+	// Enabling the sandbox flips the env default to the credential-safe
+	// allowlist; only explicit config opts back into full inheritance.
+	assert.deepEqual(parseSandboxConfig({ mode: "preferred" }), sandbox({ mode: "preferred", env: "allowlist" }));
+	assert.deepEqual(parseSandboxConfig({ mode: "required" }), sandbox({ mode: "required", env: "allowlist" }));
+	assert.deepEqual(parseSandboxConfig({ mode: "required", env: "inherit" }), sandbox({ mode: "required", env: "inherit" }));
+	assert.equal(parseSandboxConfig({})!.env, "inherit");
 });
 
 test("parseSandboxConfig rejects every malformed field without echoing values", () => {
@@ -311,6 +319,118 @@ test("launch specs cover every worker path shape: pi rpc, claude initial, claude
 	assert.ok(claudeResume.ok && claudeResume.sandboxed);
 	assert.deepEqual(claudeResume.spec.args.slice(-2), ["--resume", "session-1"]);
 	assert.ok(claudeResume.spec.args.join(" ").includes("/home/user/.claude-account2"));
+});
+
+test("nvm npm-bin symlink shape mounts the Node version root, not the package dist dir", () => {
+	// Real-filesystem regression for the actual VPS layout:
+	// <home>/.nvm/versions/node/<v>/bin/pi -> ../lib/node_modules/<pkg>/dist/cli.js
+	const home = mkdtempSync(join(tmpdir(), "pi-orchestrator-nvm-"));
+	const versionRoot = join(home, ".nvm", "versions", "node", "v24.15.0");
+	const distDir = join(versionRoot, "lib", "node_modules", "@earendil-works", "pi-coding-agent", "dist");
+	const binDir = join(versionRoot, "bin");
+	try {
+		mkdirSync(distDir, { recursive: true });
+		mkdirSync(binDir, { recursive: true });
+		writeFileSync(join(distDir, "cli.js"), "#!/usr/bin/env node\n");
+		writeFileSync(join(binDir, "node"), "");
+		symlinkSync(join("..", "lib", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"), join(binDir, "pi"));
+		const resolved = resolveWorkerCommand("pi", { PATH: `${binDir}:/usr/bin` });
+		assert.ok(resolved);
+		assert.equal(resolved.execPath, join(distDir, "cli.js"));
+		assert.deepEqual(resolved.readOnlyRoots, [versionRoot], "the whole Node version root must be mounted, not dist/");
+		assert.ok(resolved.pathDirs.includes(binDir), "bin/node must be resolvable via PATH inside the sandbox");
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+test("pi worker plan exposes only allowlisted files, never host .pi or broad config dirs", () => {
+	const home = "/home/user";
+	const homeDir = "/home/user/.cache/pi-orchestrator/worker-homes/luna-1";
+	const plan = piWorkerSandboxPlan(homeDir, home);
+	assert.deepEqual(plan.sandboxEnvOverrides, { PI_CODING_AGENT_DIR: join(homeDir, "pi-agent") });
+	assert.deepEqual(plan.fileMountsReadOnlyTry, [
+		{ source: "/home/user/.pi/agent/auth.json", dest: join(homeDir, "pi-agent", "auth.json") },
+		{ source: "/home/user/.pi/agent/models.json", dest: join(homeDir, "pi-agent", "models.json") },
+		{ source: "/home/user/.config/agent/gateway.token", dest: "/home/user/.config/agent/gateway.token" },
+	]);
+
+	const nvmFs: CommandFs = {
+		existsSync: (path) => path === "/home/user/.nvm/versions/node/v24.15.0/bin/pi",
+		realpathSync: () => "/home/user/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+	};
+	const launch = resolveWorkerLaunch(
+		sandbox({ mode: "required", env: "allowlist" }),
+		request({ homeDir, ...plan }),
+		fakeEnv,
+		() => ({ ok: true, unshareNet: true }),
+		nvmFs,
+	);
+	assert.ok(launch.ok && launch.sandboxed);
+	const args = launch.spec.args;
+	// Negative argv assertions: private host state must not be mountable.
+	const mountTargets = args.filter((arg, index) => index > 0 && /bind/.test(args[index - 1] ?? "") || /bind/.test(args[index - 2] ?? ""));
+	for (const forbidden of [
+		"/home/user/.pi",
+		"/home/user/.pi/agent",
+		"/home/user/.pi/agent/sessions",
+		"/home/user/.pi/agent/chat",
+		"/home/user/.pi/agent/secret-store",
+		"/home/user/.config/agent",
+		"/home/user/.config/pi",
+	]) {
+		assert.ok(!args.includes(forbidden), `must not mount ${forbidden}`);
+	}
+	assert.ok(mountTargets.includes("/home/user/.config/agent/gateway.token"), "only the exact token file is mounted");
+	assert.ok(args.includes(join(homeDir, "pi-agent", "auth.json")));
+	// nvm shape: the version root is the mounted runtime, and the isolated
+	// agent dir is what the worker's Pi reads.
+	assert.ok(args.join(" ").includes("--ro-bind /home/user/.nvm/versions/node/v24.15.0 /home/user/.nvm/versions/node/v24.15.0"));
+	assert.equal(launch.spec.env.PI_CODING_AGENT_DIR, join(homeDir, "pi-agent"));
+	// File mounts overlay the writable home, so they must come after its bind.
+	assert.ok(args.indexOf(join(homeDir, "pi-agent", "auth.json")) > args.indexOf(homeDir));
+});
+
+test("sandbox-only env overrides never leak into unsandboxed launches", () => {
+	const plan = piWorkerSandboxPlan("/home/user/.cache/pi-orchestrator/worker-homes/w1", "/home/user");
+	const fallback = resolveWorkerLaunch(sandbox({ mode: "preferred" }), request(plan), fakeEnv, () => ({ ok: false, reason: "missing" }), fakeFs);
+	assert.ok(fallback.ok && !fallback.sandboxed);
+	assert.equal(fallback.spec.env.PI_CODING_AGENT_DIR, undefined, "an isolated dir that only exists inside the sandbox must not be set for direct spawns");
+	const off = resolveWorkerLaunch(sandbox(), request(plan), fakeEnv, () => ({ ok: true, unshareNet: true }), fakeFs);
+	assert.ok(off.ok && !off.sandboxed);
+	assert.equal(off.spec.env.PI_CODING_AGENT_DIR, undefined);
+});
+
+test("worker home creation repairs permissions on pre-existing directories", () => {
+	const base = mkdtempSync(join(tmpdir(), "pi-orchestrator-homes-"));
+	const dir = join(base, "worker-homes", "w1");
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o755 });
+		chmodSync(dir, 0o755);
+		chmodSync(join(base, "worker-homes"), 0o755);
+		createWorkerHomeDir(dir);
+		assert.equal(statSync(dir).mode & 0o777, 0o700);
+		assert.equal(statSync(join(base, "worker-homes")).mode & 0o777, 0o700);
+	} finally {
+		rmSync(base, { recursive: true, force: true });
+	}
+});
+
+test("cleanup containment is path-component-safe, not a bare prefix match", () => {
+	// A sibling of the allowed base that shares its string prefix must survive.
+	const evil = mkdtempSync(join(homedir(), ".cache", "pi-orchestrator-evil-"));
+	try {
+		cleanupWorkerHomeDir(evil);
+		assert.ok(statSync(evil).isDirectory(), "prefix-sharing sibling must not be deleted");
+	} finally {
+		rmSync(evil, { recursive: true, force: true });
+	}
+	// The allowed base itself is not a valid worker home either.
+	cleanupWorkerHomeDir(join(homedir(), ".cache", "pi-orchestrator"));
+	// A genuine worker home under tmpdir (smoke-test shape) is removable.
+	const ok = mkdtempSync(join(tmpdir(), "pi-orchestrator-home-"));
+	cleanupWorkerHomeDir(ok);
+	assert.throws(() => statSync(ok));
 });
 
 test("worker home paths are stable, sanitized, and scoped to the orchestrator cache", () => {

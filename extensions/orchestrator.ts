@@ -30,8 +30,10 @@ import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-
 import {
 	cleanupWorkerHomeDir,
 	createWorkerHomeDir,
+	piWorkerSandboxPlan,
 	resolveWorkerLaunch,
 	workerHomeDirPath,
+	type WorkerLaunchRequest,
 } from "./orchestrator-lib/orchestrator-sandbox.ts";
 import {
 	earliestAccountReset,
@@ -464,28 +466,30 @@ function spawnWorkerChild(
 	envOverrides: Record<string, string>,
 	config: OrchestratorConfig,
 	hostEnv: NodeJS.ProcessEnv,
-	paths: { readOnlyTryPaths?: string[]; readWritePaths?: string[] } = {},
+	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "readWritePaths"> = {},
 ): SpawnedWorkerChild {
 	const homeDir = workerHomeDirPath(workerKey);
 	const launch = resolveWorkerLaunch(config.sandbox, { command, args, cwd, envOverrides, homeDir, ...paths }, hostEnv);
 	if (!launch.ok) throw new WorkerLaunchRejected(launch.error);
 	if (launch.sandboxed) createWorkerHomeDir(homeDir);
-	const child = spawn(launch.spec.command, launch.spec.args, {
-		cwd,
-		env: launch.spec.env,
-		stdio: ["pipe", "pipe", "pipe"] as const,
-	});
+	let child: Worker["process"];
+	try {
+		child = spawn(launch.spec.command, launch.spec.args, {
+			cwd,
+			env: launch.spec.env,
+			stdio: ["pipe", "pipe", "pipe"] as const,
+		});
+	} catch (error) {
+		// A synchronous spawn failure must not strand the just-created home.
+		if (launch.sandboxed) cleanupWorkerHomeDir(homeDir);
+		throw error;
+	}
 	if (launch.sandboxed) {
 		const clean = () => cleanupWorkerHomeDir(homeDir);
 		child.once("exit", clean);
 		child.once("error", clean);
 	}
 	return { child, sandboxed: launch.sandboxed, ...(launch.warning ? { warning: launch.warning } : {}) };
-}
-
-/** Host config dirs a sandboxed Pi worker needs read-only to authenticate and resolve models. */
-function piWorkerReadOnlyTryPaths(): string[] {
-	return [resolve(homedir(), ".pi"), resolve(homedir(), ".config/pi"), resolve(homedir(), ".config/agent")];
 }
 
 function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig, workerKey: string, accountDir?: string, resumeSessionId?: string): SpawnedWorkerChild {
@@ -495,19 +499,23 @@ function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig
 	const hostEnv: NodeJS.ProcessEnv = { ...process.env };
 	delete hostEnv.CLAUDE_CONFIG_DIR;
 	// A sandboxed worker's isolated HOME has no ~/.claude, so the selected
-	// account directory (or the host default) is mounted and pinned explicitly.
-	// That directory's credentials remain visible to that worker until a
-	// gateway-based auth relay replaces direct provider credentials.
-	const effectiveAccountDir = accountDir ?? (config.sandbox.mode !== "off" ? resolve(homedir(), ".claude") : undefined);
+	// account directory (or the host default when no rotation is configured) is
+	// mounted and pinned explicitly — sandbox-only, so unsandboxed launches
+	// keep exact legacy behavior. That directory's credentials remain visible
+	// to that worker until a gateway-based auth relay replaces them.
+	const sandboxAccountDir = accountDir ?? resolve(homedir(), ".claude");
 	return spawnWorkerChild(
 		workerKey,
 		config.commands.claude,
 		[...claudeCodeArgs(model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
-		{ PI_ORCHESTRATOR_WORKER: "1", ...(effectiveAccountDir ? { CLAUDE_CONFIG_DIR: effectiveAccountDir } : {}) },
+		{ PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
 		config,
 		hostEnv,
-		effectiveAccountDir ? { readWritePaths: [effectiveAccountDir] } : {},
+		{
+			...(accountDir ? {} : { sandboxEnvOverrides: { CLAUDE_CONFIG_DIR: sandboxAccountDir } }),
+			readWritePaths: [sandboxAccountDir],
+		},
 	);
 }
 
@@ -604,7 +612,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const spawned = profile.backend === "pi-rpc"
-		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, { readOnlyTryPaths: piWorkerReadOnlyTryPaths() })
+		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, piWorkerSandboxPlan(workerHomeDirPath(id)))
 		: spawnClaudeChild(profile.model, cwd, config, id, account?.configDir);
 	const child = spawned.child;
 	const worker: Worker = {
