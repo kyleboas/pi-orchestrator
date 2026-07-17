@@ -38,7 +38,7 @@ import {
 	workerHomeDirPath,
 	type WorkerLaunchRequest,
 } from "./orchestrator-lib/orchestrator-sandbox.ts";
-import { GATEWAY_PLACEHOLDER, startGatewayRelay } from "./orchestrator-lib/orchestrator-gateway.ts";
+import { GATEWAY_PLACEHOLDER, claudeGatewayEnv, startGatewayRelay, writeGatewayPiModels } from "./orchestrator-lib/orchestrator-gateway.ts";
 import {
 	earliestAccountReset,
 	isUsageLimitText,
@@ -470,7 +470,7 @@ function spawnWorkerChild(
 	envOverrides: Record<string, string>,
 	config: OrchestratorConfig,
 	hostEnv: NodeJS.ProcessEnv,
-	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "fileMountsReadOnly" | "readWritePaths"> = {},
+	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "fileMountsReadOnly" | "readWritePaths"> & { gatewayPiProvider?: string } = {},
 ): SpawnedWorkerChild {
 	const homeDir = workerHomeDirPath(workerKey);
 	let relay: ReturnType<typeof startGatewayRelay> | undefined;
@@ -482,7 +482,10 @@ function spawnWorkerChild(
 			writeFileSync(`${homeDir}/.gateway-placeholder`, placeholder, { mode: 0o400 });
 			chmodSync(`${homeDir}/.gateway-placeholder`, 0o400);
 		}
-		try { relay = startGatewayRelay(workerKey, config.sandbox.gateway, undefined, config.sandbox.command); }
+		try {
+			if (paths.gatewayPiProvider) writeGatewayPiModels(homeDir, paths.gatewayPiProvider);
+			relay = startGatewayRelay(workerKey, config.sandbox.gateway, undefined, config.sandbox.command);
+		}
 		catch { cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected("Gateway relay failed its readiness check."); }
 	}
 	const node = relay ? resolveWorkerCommand(relay.nodePath, process.env) : undefined;
@@ -526,7 +529,7 @@ function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig
 		[...claudeCodeArgs(model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
 		gateway
-			? { PI_ORCHESTRATOR_WORKER: "1", CLAUDE_CONFIG_DIR: resolve(workerHomeDirPath(workerKey), ".claude-gateway"), ANTHROPIC_BASE_URL: "http://127.0.0.1:4000", ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER, ANTHROPIC_API_KEY: GATEWAY_PLACEHOLDER }
+			? claudeGatewayEnv(resolve(workerHomeDirPath(workerKey), ".claude-gateway"))
 			: { PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
 		config,
 		hostEnv,
@@ -629,8 +632,12 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" ? pickClaudeAccount(config.claudeAccounts) : undefined;
+	const gateway = config.sandbox.network === "gateway";
 	const spawned = profile.backend === "pi-rpc"
-		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, piWorkerSandboxPlan(workerHomeDirPath(id), homedir(), config.sandbox.network === "gateway"))
+		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, {
+			...piWorkerSandboxPlan(workerHomeDirPath(id), homedir(), gateway),
+			...(gateway ? { gatewayPiProvider: profile.model.split("/", 1)[0] } : {}),
+		})
 		: spawnClaudeChild(profile.model, cwd, config, id, account?.configDir);
 	const child = spawned.child;
 	const worker: Worker = {

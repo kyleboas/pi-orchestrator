@@ -1,12 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, realpathSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GatewayConfig } from "./orchestrator-sandbox.ts";
 
-export const GATEWAY_PLACEHOLDER = "PI_ORCHESTRATOR_GATEWAY_PLACEHOLDER";
+// This is deliberately not a credential. The JWT-shaped value lets Pi's
+// openai-codex provider derive a non-sensitive placeholder account ID before
+// the relay strips it and injects the host-owned gateway credential.
+export const GATEWAY_PLACEHOLDER = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoicGktb3JjaGVzdHJhdG9yLXBsYWNlaG9sZGVyIn19.placeholder";
+export const SANDBOX_GATEWAY_BASE_URL = "http://127.0.0.1:4000";
 export const SANDBOX_RELAY_DIR = "/g";
 export const SANDBOX_RELAY_SOCKET = "/g/r";
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
@@ -22,6 +26,30 @@ export type GatewayRelay = {
 };
 
 export function gatewayRuntimeBase(): string { return join(homedir(), ".cache", "pi-orchestrator", "gateway-relays"); }
+
+export function claudeGatewayEnv(configDir: string): Record<string, string> {
+  return {
+    PI_ORCHESTRATOR_WORKER: "1",
+    CLAUDE_CODE_BUBBLEWRAP: "1",
+    CLAUDE_CONFIG_DIR: configDir,
+    ANTHROPIC_BASE_URL: SANDBOX_GATEWAY_BASE_URL,
+    ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER,
+    ANTHROPIC_API_KEY: GATEWAY_PLACEHOLDER,
+  };
+}
+
+/** Write the only Pi provider override visible in gateway mode. */
+export function writeGatewayPiModels(homeDir: string, provider: string): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(provider)) throw new Error("Gateway Pi provider is invalid.");
+  const agentDir = join(homeDir, "pi-agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  chmodSync(agentDir, 0o700);
+  const modelsFile = join(agentDir, "models.json");
+  const contents = `${JSON.stringify({ providers: { [provider]: { baseUrl: SANDBOX_GATEWAY_BASE_URL, apiKey: GATEWAY_PLACEHOLDER } } }, null, 2)}\n`;
+  writeFileSync(modelsFile, contents, { mode: 0o600, flag: "wx" });
+  chmodSync(modelsFile, 0o600);
+  return modelsFile;
+}
 
 export function validateGatewayTokenFile(path: string, uid = process.getuid?.()): string {
   if (uid === undefined) throw new Error("Gateway token ownership cannot be verified.");
