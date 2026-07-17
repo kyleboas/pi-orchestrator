@@ -170,15 +170,17 @@ function trustedCloneSafe(gitDir: string, expectedConfig?: string): boolean {
 		return true;
 	} catch { return false; }
 }
-function localDefault(ref: string | undefined): string | undefined { const branch = ref?.startsWith("origin/") ? ref.slice("origin/".length) : undefined; return branch && BRANCH.test(branch) ? branch : undefined; }
-function syncDefaultBranch(repository: string, local: string | undefined): string | undefined {
-	if (local) return local;
-	try { const result = spawnSync("gh", ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], { env: trustedEnv(process.env), stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 15_000, maxBuffer: PR_RESPONSE_LIMIT }); const value = result.status === 0 ? (result.stdout ?? "").trim() : ""; return value && BRANCH.test(value) ? value : undefined; } catch { return undefined; }
+function defaultBranchArgs(repository: string): string[] { return ["api", "--method=GET", `repos/${repository}`, "--jq=.default_branch"]; }
+function syncDefaultBranch(repository: string): string | undefined {
+	try {
+		const result = spawnSync("gh", defaultBranchArgs(repository), { shell: false, env: trustedEnv(process.env), stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 15_000, maxBuffer: PR_RESPONSE_LIMIT });
+		const branch = result.status === 0 && !result.error && !result.signal ? (result.stdout ?? "").trim() : "";
+		return BRANCH.test(branch) ? branch : undefined;
+	} catch { return undefined; }
 }
-async function resolveDefaultBranch(repository: string, local: string | undefined, runner: BrokerRunner): Promise<string | undefined> {
-	if (local) return local;
-	const result = await runner("gh", ["repo", "view", repository, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], { env: trustedEnv(process.env), timeout: 15_000 });
-	const branch = result.ok && result.stdout.length <= 512 ? result.stdout.trim() : "";
+async function resolveDefaultBranch(repository: string, runner: BrokerRunner): Promise<string | undefined> {
+	const result = await runner("gh", defaultBranchArgs(repository), { env: trustedEnv(process.env), timeout: 15_000 });
+	const branch = result.ok && result.stdout.length <= PR_RESPONSE_LIMIT ? result.stdout.trim() : "";
 	return BRANCH.test(branch) ? branch : undefined;
 }
 
@@ -189,14 +191,14 @@ export function pinPullRequestTargetSync(cwd: string, policy: PullRequestsConfig
 	if (get("rev-parse", "--is-inside-work-tree") !== "true" || get("rev-parse", "--show-toplevel") !== file.workspace) return undefined;
 	const remote = get("remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
 	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
-	const defaultBranch = syncDefaultBranch(parsed.repository, localDefault(get("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")));
+	const defaultBranch = syncDefaultBranch(parsed.repository);
 	return defaultBranch ? { ...file, git: file.git, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }
 export async function pinPullRequestTarget(cwd: string, policy: PullRequestsConfig, runner: BrokerRunner = defaultRunner): Promise<PinnedPullRequestTarget | undefined> {
 	const file = identity(cwd); if (!file || !file.git || (await line(runner, file.workspace, "rev-parse", "--is-inside-work-tree")) !== "true" || (await line(runner, file.workspace, "rev-parse", "--show-toplevel")) !== file.workspace) return undefined;
 	const remote = await line(runner, file.workspace, "remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
 	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
-	const ref = await line(runner, file.workspace, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"), defaultBranch = await resolveDefaultBranch(parsed.repository, localDefault(ref), runner);
+	const defaultBranch = await resolveDefaultBranch(parsed.repository, runner);
 	return defaultBranch ? { ...file, git: file.git, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }
 async function currentAllowedBranch(target: PinnedPullRequestTarget, policy: PullRequestsConfig, runner: BrokerRunner): Promise<string | undefined> { const branch = await line(runner, target.workspace, "symbolic-ref", "--quiet", "--short", "HEAD"); return branch && branchAllowed(branch, policy, target.defaultBranch) ? branch : undefined; }
