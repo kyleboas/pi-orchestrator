@@ -211,10 +211,13 @@ export type PullRequestBroker = { directory: string; target: PinnedPullRequestTa
 function validPublish(request: Record<string, unknown>): request is { generation: string; action: "publish"; title: string; body: string } { return Object.keys(request).every((key) => key === "generation" || key === "action" || key === "title" || key === "body") && request.action === "publish" && typeof request.generation === "string" && typeof request.title === "string" && request.title.length > 0 && request.title.length <= PR_TITLE_LIMIT && !/[\0\r\n]/.test(request.title) && typeof request.body === "string" && request.body.length <= PR_BODY_LIMIT && !/\0/.test(request.body); }
 type OpenPullRequest = { kind: "none" } | { kind: "one"; number: number } | { kind: "error"; message: string };
 
-/** gh 2.45 cannot reliably filter same-repository PRs with owner:branch, so verify its branch-only result ourselves. */
+// Project only the identity fields required below. Null/deleted head repositories
+// remain null-valued and are rejected by the same strict validation.
+const OPEN_PULL_REQUEST_JQ = "[.[] | {number: .number, headRefName: .head.ref, baseRefName: .base.ref, isCrossRepository: (.head.repo.full_name != .base.repo.full_name), headRepository: {nameWithOwner: .head.repo.full_name}, headRepositoryOwner: {login: .head.repo.owner.login}}]";
+/** gh 2.45 has incompatible PR-list JSON; REST is both stable and explicitly query-encoded. */
 async function findOpenPullRequest(target: PinnedPullRequestTarget, branch: string, runner: BrokerRunner, env: NodeJS.ProcessEnv): Promise<OpenPullRequest> {
 	const owner = target.repository.split("/")[0]!;
-	const open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${branch}`, "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"], { env, timeout: 30_000 });
+	const open = await runner("gh", ["api", "--method=GET", `repos/${target.repository}/pulls`, "--raw-field=state=open", `--raw-field=head=${owner}:${branch}`, `--raw-field=base=${target.defaultBranch}`, "--raw-field=per_page=2", `--jq=${OPEN_PULL_REQUEST_JQ}`], { env, timeout: 30_000 });
 	if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { kind: "error", message: "Could not query the existing pull request." };
 	try {
 		const rows = JSON.parse(open.stdout) as unknown;
