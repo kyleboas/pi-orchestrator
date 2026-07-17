@@ -1,0 +1,14 @@
+{
+  "sandbox": {
+    "mode": "required",
+    "network": "gateway",
+    "gateway": {
+      "upstreamUrl": "http://127.0.0.1:4000",
+      "tokenFile": "~/.config/agent/gateway.token"
+    },
+    "env": "allowlist",
+    "envAllow": [],
+    "readOnlyPaths": [],
+    "workspaceRoots": ["~/code"]
+  }
+}
