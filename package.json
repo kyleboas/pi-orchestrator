@@ -19,7 +19,8 @@
   "scripts": {
     "test": "tsx --test test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "smoke": "tsx -e \"import('./extensions/orchestrator.ts')\""
+    "smoke": "tsx -e \"import('./extensions/orchestrator.ts')\"",
+    "smoke:bwrap": "PI_ORCHESTRATOR_BWRAP_SMOKE=1 tsx --test test/orchestrator-sandbox-smoke.test.ts"
   },
   "engines": { "node": ">=24" }
 }

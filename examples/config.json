@@ -8,6 +8,13 @@
     "pi": "pi",
     "claude": "claude-auto"
   },
+  "sandbox": {
+    "mode": "off",
+    "network": "host",
+    "env": "allowlist",
+    "envAllow": [],
+    "readOnlyPaths": []
+  },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,
   "workers": {

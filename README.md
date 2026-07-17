@@ -6,7 +6,7 @@ Features: Pi RPC and Claude Code stream-json workers; exact-once result delivery
 
 ## Install
 
-> **Runtime trust warning:** Run this only in repositories you trust. Repository content and delegated instructions can cause workers to read or modify files, run commands, access inherited credentials, and make network requests. For untrusted code, use a container, VM, or other isolated environment with a sanitized, minimal environment. This orchestrator does not provide a sandbox or security boundary.
+> **Runtime trust warning:** Run this only in repositories you trust. Repository content and delegated instructions can cause workers to read or modify files, run commands, access inherited credentials, and make network requests. The optional bubblewrap worker sandbox below limits filesystem and process access for worker processes, but it is not a complete security boundary: see its explicit non-guarantees. For untrusted code, still prefer a container, VM, or other isolated environment.
 
 ```sh
 pi install git:github.com/kyleboas/pi-orchestrator
@@ -88,6 +88,50 @@ Executable overrides are command names or executable paths, never shell snippets
 ```sh
 PI_ORCHESTRATOR_PI_BIN=pi PI_ORCHESTRATOR_CLAUDE_BIN=claude-auto pi
 ```
+
+## Worker sandbox (Linux, bubblewrap)
+
+An optional `sandbox` config block runs every delegated worker process (Pi RPC, Claude Code, and Claude account-failover respawns) inside [bubblewrap](https://github.com/containers/bubblewrap). It defaults to `off` for backward compatibility; after validating it on your host, public/VPS users should explicitly set `"mode": "required"`.
+
+```json
+{
+  "sandbox": {
+    "mode": "required",
+    "network": "host",
+    "env": "allowlist",
+    "envAllow": [],
+    "readOnlyPaths": []
+  }
+}
+```
+
+Ubuntu install and verification:
+
+```sh
+sudo apt install bubblewrap
+npm run smoke:bwrap   # in a checkout: opt-in real-bwrap smoke test
+```
+
+Modes:
+
+- `off` (default): legacy direct spawn.
+- `preferred`: sandbox when a cached functional probe passes; otherwise the worker launches unsandboxed with a prominent warning in the delegate result and worker transcript.
+- `required`: fail closed. A missing binary, failed namespace probe, unresolvable worker executable, or unenforceable `network: "none"` rejects the delegation; nothing ever silently falls back. A malformed `sandbox` block also disables delegation rather than quietly becoming `off`.
+
+What a sandboxed worker gets: the workspace (coordinator cwd) read-write; a private per-worker HOME (removed on exit) and tmpfs `/tmp`; system runtimes, certificates, and the resolved worker executable's runtime root (nvm-style Node trees and standalone Claude installs are handled) read-only; minimal `/proc` and `/dev`; new PID/IPC/UTS namespaces with parent-death teardown, so killing the worker reliably kills its whole process tree. The rest of the home directory, `/root`, `/var`, and unrelated `/etc` are not mounted. `readOnlyPaths` adds strict read-only mounts (a missing path fails the launch loudly).
+
+`env: "allowlist"` is the default whenever the sandbox is enabled (`preferred` or `required`): it passes only conservative non-credential names (PATH, HOME, TERM, locale, and similar) plus explicit `envAllow` additions — provider/gateway variables must be named explicitly. `env: "inherit"` keeps the full environment and must be opted into; `mode: "off"` keeps legacy full inheritance. Environment values are passed via the process environment, never in bwrap argv, so they cannot leak into process listings.
+
+Pi workers do not see the host `~/.pi` directory. Each sandboxed Pi worker gets an isolated agent directory inside its private HOME (`PI_CODING_AGENT_DIR`), into which only `auth.json` and `models.json` are bound read-only as individual files; sessions, chat data, logs, secret stores, prompts, and other private state under `~/.pi` are never mounted. Similarly only the exact `~/.config/agent/gateway.token` file is mounted (read-only) for gateway-routed provider configs, never the surrounding directory.
+
+`network: "host"` (default) shares host networking because a host-local model gateway on `127.0.0.1` requires it. `network: "none"` unshares the network namespace entirely and is verified by the probe; workers that must reach any model API will not function under it today.
+
+Exact non-guarantees — this is containment, not a full security boundary:
+
+- **Network egress is not restricted** under `network: "host"`: a worker can reach the host loopback and the internet, and prompts inherently send mounted repository content to the model provider.
+- **Active provider credentials remain visible to their worker.** A Claude worker mounts its selected account directory (or `~/.claude` when no accounts are configured) read-write, and a Pi worker can read the narrowly mounted `auth.json`, `models.json`, and `gateway.token` files. The mounts are minimal, but those live credentials are still readable by that worker until gateway-based auth isolation replaces them.
+- **The coordinator itself is not sandboxed.** It runs host-side with its normal tools; whole-session containment needs a future external launcher, not this extension.
+- No resource limits (CPU/memory) are imposed yet, and macOS/Podman backends are not implemented.
 
 ## Worker session view
 

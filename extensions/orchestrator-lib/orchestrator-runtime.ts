@@ -36,6 +36,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	claudeAccount?: string;
 	/** Latest instruction sent; resent after a usage-limit account failover. */
 	lastInstruction?: string;
+	/** Bounded preferred-mode fallback notice: this worker launched WITHOUT sandbox containment. */
+	sandboxWarning?: string;
 	tokens?: number;
 	/** Cumulative provider-reported run/session total when available. */
 	costUsd?: number;

@@ -5,12 +5,15 @@ import type { ClaudeAccountsConfig } from "./orchestrator-accounts.ts";
 import { defaultClaudeAccountStatePath } from "./orchestrator-accounts.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "./orchestrator-checkin.ts";
 import type { PiThinkingLevel, WorkerProfile } from "./orchestrator-core.ts";
+import { DEFAULT_SANDBOX_CONFIG, INVALID_SANDBOX_CONFIG, parseSandboxConfig, type SandboxConfig } from "./orchestrator-sandbox.ts";
 
 export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
 export type OrchestratorConfig = {
 	coordinator: CoordinatorConfig;
 	commands: { pi: string; claude: string };
 	workers: Record<string, WorkerProfile>;
+	/** Worker process containment policy; defaults to off for backward compatibility. */
+	sandbox: SandboxConfig;
 	/** When set, Claude workers rotate across these accounts and fail over on usage limits. */
 	claudeAccounts?: ClaudeAccountsConfig;
 	/** Initial/base passive assessment interval in minutes; 0 disables. Healthy workers back off to 2x. */
@@ -102,8 +105,23 @@ function rolloverContextPercent(value: unknown): number {
 	if (value === undefined) return DEFAULT_ROLLOVER_CONTEXT_PERCENT;
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : DEFAULT_ROLLOVER_CONTEXT_PERCENT;
 }
-function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
-	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, ...(warning ? { warning } : {}) };
+const SANDBOX_INVALID_WARNING = "Sandbox configuration was invalid; worker delegation is disabled until it is corrected.";
+/**
+ * Sandbox parsing is fail-closed and independent of the generic
+ * invalid-config-uses-defaults recovery: a present-but-malformed sandbox block
+ * must never quietly become "off", even when the rest of the file is rejected.
+ */
+function sandboxFrom(raw: unknown): { sandbox: SandboxConfig; warning?: string } {
+	if (!object(raw) || raw.sandbox === undefined) return { sandbox: { ...DEFAULT_SANDBOX_CONFIG } };
+	const parsed = parseSandboxConfig(raw.sandbox);
+	return parsed ? { sandbox: parsed } : { sandbox: { ...INVALID_SANDBOX_CONFIG }, warning: SANDBOX_INVALID_WARNING };
+}
+function joinWarnings(...warnings: (string | undefined)[]): string | undefined {
+	const present = warnings.filter(nonempty);
+	return present.length ? present.join(" ") : undefined;
+}
+function defaults(env: NodeJS.ProcessEnv, warning?: string, sandbox: SandboxConfig = { ...DEFAULT_SANDBOX_CONFIG }): OrchestratorConfig {
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, sandbox, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, ...(warning ? { warning } : {}) };
 }
 
 /** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
@@ -111,34 +129,52 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 	const requested = nonempty(env.PI_ORCHESTRATOR_CONFIG) ? expandHome(env.PI_ORCHESTRATOR_CONFIG.trim()) : resolve(homedir(), ".config/pi-orchestrator/config.json");
 	const explicit = nonempty(env.PI_ORCHESTRATOR_CONFIG);
 	if (!existsSync(requested)) return defaults(env, explicit ? "Orchestrator configuration was unavailable; using defaults." : undefined);
+	let text: string;
 	try {
-		const raw: unknown = JSON.parse(readFileSync(requested, "utf8"));
-		if (!object(raw)) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
-		// A config without a workers key keeps its coordinator/commands and the
-		// default catalog; only a present-but-invalid catalog rejects the file.
-		const configuredWorkers = raw.workers === undefined ? { ...DEFAULT_WORKERS } : workers(raw.workers);
-		if (!configuredWorkers) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
-		const coordinatorRaw = raw.coordinator === undefined ? {} : raw.coordinator;
-		if (!object(coordinatorRaw) || !THINKING.has((coordinatorRaw.thinking ?? "high") as PiThinkingLevel) ||
-			(coordinatorRaw.provider !== undefined && !nonempty(coordinatorRaw.provider)) ||
-			(coordinatorRaw.id !== undefined && !nonempty(coordinatorRaw.id))) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
-		const commandsRaw = raw.commands === undefined ? {} : raw.commands;
-		if (!object(commandsRaw)) return defaults(env, "Orchestrator configuration was invalid; using defaults.");
-		return {
-			coordinator: {
-				...(nonempty(coordinatorRaw.provider) ? { provider: coordinatorRaw.provider.trim() } : {}),
-				...(nonempty(coordinatorRaw.id) ? { id: coordinatorRaw.id.trim() } : {}),
-				thinking: (coordinatorRaw.thinking ?? "high") as PiThinkingLevel,
-			},
-			commands: {
-				pi: command(env.PI_ORCHESTRATOR_PI_BIN, command(commandsRaw.pi, "pi")),
-				claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
-			}, workers: configuredWorkers,
-			checkInMinutes: checkInMinutes(raw.checkInMinutes),
-			rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
-			...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
-		};
+		text = readFileSync(requested, "utf8");
 	} catch {
 		return defaults(env, "Orchestrator configuration was invalid; using defaults.");
 	}
+	let raw: unknown;
+	try {
+		raw = JSON.parse(text);
+	} catch {
+		// Unparseable JSON that mentions a sandbox block still fails closed: the
+		// requested containment intent is unreadable, so delegation stays disabled.
+		const wantedSandbox = /"sandbox"/.test(text);
+		return defaults(
+			env,
+			joinWarnings("Orchestrator configuration was invalid; using defaults.", wantedSandbox ? SANDBOX_INVALID_WARNING : undefined),
+			wantedSandbox ? { ...INVALID_SANDBOX_CONFIG } : undefined,
+		);
+	}
+	const { sandbox, warning: sandboxWarning } = sandboxFrom(raw);
+	const invalid = () => defaults(env, joinWarnings("Orchestrator configuration was invalid; using defaults.", sandboxWarning), sandbox);
+	if (!object(raw)) return invalid();
+	// A config without a workers key keeps its coordinator/commands and the
+	// default catalog; only a present-but-invalid catalog rejects the file.
+	const configuredWorkers = raw.workers === undefined ? { ...DEFAULT_WORKERS } : workers(raw.workers);
+	if (!configuredWorkers) return invalid();
+	const coordinatorRaw = raw.coordinator === undefined ? {} : raw.coordinator;
+	if (!object(coordinatorRaw) || !THINKING.has((coordinatorRaw.thinking ?? "high") as PiThinkingLevel) ||
+		(coordinatorRaw.provider !== undefined && !nonempty(coordinatorRaw.provider)) ||
+		(coordinatorRaw.id !== undefined && !nonempty(coordinatorRaw.id))) return invalid();
+	const commandsRaw = raw.commands === undefined ? {} : raw.commands;
+	if (!object(commandsRaw)) return invalid();
+	return {
+		coordinator: {
+			...(nonempty(coordinatorRaw.provider) ? { provider: coordinatorRaw.provider.trim() } : {}),
+			...(nonempty(coordinatorRaw.id) ? { id: coordinatorRaw.id.trim() } : {}),
+			thinking: (coordinatorRaw.thinking ?? "high") as PiThinkingLevel,
+		},
+		commands: {
+			pi: command(env.PI_ORCHESTRATOR_PI_BIN, command(commandsRaw.pi, "pi")),
+			claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
+		}, workers: configuredWorkers,
+		sandbox,
+		checkInMinutes: checkInMinutes(raw.checkInMinutes),
+		rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
+		...(sandboxWarning ? { warning: sandboxWarning } : {}),
+		...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
+	};
 }
