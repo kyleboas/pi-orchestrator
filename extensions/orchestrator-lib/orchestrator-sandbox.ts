@@ -5,7 +5,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 
 export type SandboxMode = "off" | "preferred" | "required";
 export type SandboxNetwork = "host" | "none" | "gateway";
-export type GatewayConfig = { upstreamUrl: string; tokenFile: string };
+export type GatewayConfig = { upstreamUrl: string; tokenFile: string; model: string };
+export const DEFAULT_GATEWAY_MODEL = "coding-main";
 export type SandboxEnvPolicy = "inherit" | "allowlist";
 
 export type SandboxConfig = {
@@ -104,7 +105,9 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 	if (raw.gateway !== undefined) {
 		if (!raw.gateway || typeof raw.gateway !== "object" || Array.isArray(raw.gateway)) return undefined;
 		const value = raw.gateway as Record<string, unknown>;
-		if (Object.keys(value).some((key) => key !== "upstreamUrl" && key !== "tokenFile")) return undefined;
+		if (Object.keys(value).some((key) => key !== "upstreamUrl" && key !== "tokenFile" && key !== "model")) return undefined;
+		const model = value.model === undefined ? DEFAULT_GATEWAY_MODEL : value.model;
+		if (typeof model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(model)) return undefined;
 		if (!nonempty(value.tokenFile) || value.tokenFile.split("/").includes("..")) return undefined;
 		const tokenFile = safePath(value.tokenFile);
 		if (!tokenFile || tokenFile === "/" || tokenFile.endsWith("/") || tokenFile.split("/").includes("..")) return undefined;
@@ -112,7 +115,7 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 		let url: URL;
 		try { url = new URL(value.upstreamUrl); } catch { return undefined; }
 		if (url.protocol !== "http:" || url.username || url.password || !["127.0.0.1", "[::1]"].includes(url.hostname) || (url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) return undefined;
-		gateway = { upstreamUrl: url.href.replace(/\/$/, ""), tokenFile };
+		gateway = { upstreamUrl: url.href.replace(/\/$/, ""), tokenFile, model };
 	}
 	if ((network === "gateway") !== !!gateway) return undefined;
 	// Gateway is a containment mode, never a modifier for a legacy direct spawn.
@@ -316,12 +319,9 @@ export const PI_WORKER_CONFIG_FILES: readonly string[] = ["auth.json", "models.j
  * Isolation plan for a Pi RPC worker: an isolated agent dir inside the worker
  * home receives only the allowlisted auth/model files, and PI_CODING_AGENT_DIR
  * points at it, so host sessions, chat, logs, secret-store, prompts, and other
- * private state under ~/.pi are never mounted. The gateway token, when Pi's
- * provider config references it, is mounted as that single file at
- * ~/.config/agent/gateway.token RELATIVE TO THE SANDBOX HOME: consumers
- * resolve that path against $HOME, which is the isolated worker home inside
- * the sandbox, so a host-absolute destination would be invisible to them.
- * The surrounding host ~/.config/agent directory is never mounted.
+ * private state under ~/.pi are never mounted. Gateway mode generates a
+ * provider-only models.json inside the isolated HOME and mounts no Pi auth,
+ * host model configuration, token file, or surrounding config directory.
  */
 export function piWorkerSandboxPlan(homeDir: string, home?: string, gateway?: false): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry: SandboxFileMount[] };
 export function piWorkerSandboxPlan(homeDir: string, home: string | undefined, gateway: true): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnly: SandboxFileMount[] };
@@ -335,9 +335,7 @@ export function piWorkerSandboxPlan(homeDir: string, home: string = homedir(), g
 	const isolatedDir = join(homeDir, "pi-agent");
 	if (gateway) return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
-		fileMountsReadOnly: [
-			{ source: join(homeDir, ".gateway-placeholder"), dest: join(homeDir, ".config", "agent", "gateway.token") },
-		],
+		fileMountsReadOnly: [],
 	};
 	return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },

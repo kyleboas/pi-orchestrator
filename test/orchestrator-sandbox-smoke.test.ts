@@ -198,7 +198,7 @@ test("real bwrap: gateway-only loopback has zero caps, streaming relay, blocked 
 		const workerScript = join(cwd, "worker.mjs");
 		writeFileSync(workerScript, `import http from"node:http";import{readFileSync,writeFileSync}from"node:fs";const caps=Object.fromEntries(readFileSync("/proc/self/status","utf8").split("\\n").filter(x=>x.startsWith("Cap")).map(x=>x.split(":").map(y=>y.trim())));const request=(host,port,timeout=500)=>new Promise(ok=>{const q=http.request({host,port,path:"/v1/messages",method:"POST",timeout},r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>ok({ok:true,b}))});q.on("timeout",()=>q.destroy());q.on("error",()=>ok({ok:false}));q.end("stream")});const good=await request("127.0.0.1",4000);const external=await request("192.0.2.1",80);const other=await request("127.0.0.1",4001);let immutable=false;try{writeFileSync("/g/x","x")}catch{immutable=true}let secret=false;try{readFileSync(${JSON.stringify(sentinel)}) ;secret=true}catch{}console.log(JSON.stringify({caps,good,external,other,immutable,secret,placeholder:process.env.ANTHROPIC_AUTH_TOKEN}));`);
 		const node = resolveWorkerCommand(process.execPath)!;
-		const config = { ...DEFAULT_SANDBOX_CONFIG, mode: "required", network: "gateway", env: "allowlist", gateway: { upstreamUrl: `http://127.0.0.1:${port}`, tokenFile } } as const;
+		const config = { ...DEFAULT_SANDBOX_CONFIG, mode: "required", network: "gateway", env: "allowlist", gateway: { upstreamUrl: `http://127.0.0.1:${port}`, tokenFile, model: "coding-main" } } as const;
 		const launch = resolveWorkerLaunch(config, {
 			command: process.execPath, args: [workerScript], cwd, homeDir: home,
 			envOverrides: { ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER },

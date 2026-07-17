@@ -6,11 +6,11 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GatewayConfig } from "./orchestrator-sandbox.ts";
 
-// This is deliberately not a credential. The JWT-shaped value lets Pi's
-// openai-codex provider derive a non-sensitive placeholder account ID before
-// the relay strips it and injects the host-owned gateway credential.
-export const GATEWAY_PLACEHOLDER = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoicGktb3JjaGVzdHJhdG9yLXBsYWNlaG9sZGVyIn19.placeholder";
+// Deliberately not a credential: the host relay strips it and injects the
+// host-owned gateway credential only after route validation.
+export const GATEWAY_PLACEHOLDER = "PI_ORCHESTRATOR_GATEWAY_PLACEHOLDER";
 export const SANDBOX_GATEWAY_BASE_URL = "http://127.0.0.1:4000";
+export const GATEWAY_PI_PROVIDER = "pi-orchestrator-gateway";
 export const SANDBOX_RELAY_DIR = "/g";
 export const SANDBOX_RELAY_SOCKET = "/g/r";
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
@@ -38,14 +38,25 @@ export function claudeGatewayEnv(configDir: string): Record<string, string> {
   };
 }
 
-/** Write the only Pi provider override visible in gateway mode. */
-export function writeGatewayPiModels(homeDir: string, provider: string): string {
-  if (!/^[A-Za-z0-9._-]+$/.test(provider)) throw new Error("Gateway Pi provider is invalid.");
+/** The gateway model is intentionally shared by every worker tier. */
+export function gatewayPiModel(model: string): string {
+  return `${GATEWAY_PI_PROVIDER}/${model}`;
+}
+
+/** Write the only Pi provider/model definition visible in gateway mode. */
+export function writeGatewayPiModels(homeDir: string, model: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(model)) throw new Error("Gateway model is invalid.");
   const agentDir = join(homeDir, "pi-agent");
   mkdirSync(agentDir, { recursive: true, mode: 0o700 });
   chmodSync(agentDir, 0o700);
   const modelsFile = join(agentDir, "models.json");
-  const contents = `${JSON.stringify({ providers: { [provider]: { baseUrl: SANDBOX_GATEWAY_BASE_URL, apiKey: GATEWAY_PLACEHOLDER } } }, null, 2)}\n`;
+  const provider = {
+    baseUrl: `${SANDBOX_GATEWAY_BASE_URL}/v1`,
+    apiKey: GATEWAY_PLACEHOLDER,
+    api: "openai-completions",
+    models: [{ id: model, name: `Gateway ${model}`, reasoning: true, input: ["text", "image"], contextWindow: 128_000, maxTokens: 32_768 }],
+  };
+  const contents = `${JSON.stringify({ providers: { [GATEWAY_PI_PROVIDER]: provider } }, null, 2)}\n`;
   writeFileSync(modelsFile, contents, { mode: 0o600, flag: "wx" });
   chmodSync(modelsFile, 0o600);
   return modelsFile;
@@ -84,7 +95,7 @@ export function buildHostRelayBwrapArgs(runtimeRoot: string, relayScript: string
 }
 
 /** Start a minimal-mount, zero-cap host-side relay and fail before worker spawn unless ready. */
-export function startGatewayRelay(workerKey: string, config: GatewayConfig, base = gatewayRuntimeBase(), bwrapCommand = "bwrap", readinessMs = 4_000): GatewayRelay {
+export function startGatewayRelay(workerKey: string, config: Pick<GatewayConfig, "upstreamUrl" | "tokenFile">, base = gatewayRuntimeBase(), bwrapCommand = "bwrap", readinessMs = 4_000): GatewayRelay {
   const tokenFile = validateGatewayTokenFile(config.tokenFile);
   mkdirSync(base, { recursive: true, mode: 0o700 }); chmodSync(base, 0o700);
   const safe = workerKey.replace(/[^A-Za-z0-9-]/g, "-").slice(0, 48) || "worker";
