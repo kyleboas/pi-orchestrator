@@ -128,10 +128,12 @@ test("publish uses HTTPS, fixed credential-free argv, and a host-only askpass", 
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" };
 		if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "a".repeat(64) };
 		if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" };
+		if (command === "gh" && args[0] === "api" && args.includes("--method=POST")) return { ok: true, stdout: "https://github.com/owner/repository/pull/42\n" };
 		return { ok: true, stdout: "" };
 	};
 	try {
-		const result = await publishPullRequest(target, policy, "Safe title", "Safe body", runner);
+		const title = "- Safe title with spaces", body = "- leading punctuation\nwith a newline";
+		const result = await publishPullRequest(target, policy, title, body, runner);
 		assert.equal(result.ok, true);
 		assert.equal(target.branch, "feat/broker", "first successful publish pins the worker-created branch");
 		const clone = calls.find((call) => call.command === "git" && call.args.includes("clone"));
@@ -139,7 +141,12 @@ test("publish uses HTTPS, fixed credential-free argv, and a host-only askpass", 
 		const network = calls.filter((call) => call.command === "git" && (call.args.includes("fetch") || call.args.includes("ls-remote") || call.args.includes("push")));
 		assert.ok(network.length && network.every((call) => call.args.includes("credential.helper=") && call.args.includes("https://github.com/owner/repository.git") && call.env?.GIT_ASKPASS && call.env.GIT_TERMINAL_PROMPT === "0"));
 		assert.ok(calls.filter((call) => call.command === "git" && !network.includes(call)).every((call) => call.env?.GIT_ASKPASS === undefined));
-		assert.ok(calls.some((call) => call.command === "gh" && call.args.includes("create") && call.args.includes("--base=main")));
+		const query = calls.find((call) => call.command === "gh" && call.args[0] === "pr" && call.args[1] === "list");
+		assert.deepEqual(query?.args, ["pr", "list", "--repo=owner/repository", "--head=feat/broker", "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"]);
+		const create = calls.find((call) => call.command === "gh" && call.args[0] === "api" && call.args.includes("--method=POST"));
+		assert.deepEqual(create?.args, ["api", "--method=POST", "repos/owner/repository/pulls", `--raw-field=title=${title}`, `--raw-field=body=${body}`, "--raw-field=head=feat/broker", "--raw-field=base=main", "--jq=.html_url"]);
+		assert.match(result.message, /^Created an open pull request: https:\/\/github\.com\/owner\/repository\/pull\/42$/);
+		assert.ok(!calls.some((call) => call.args.some((arg) => arg.startsWith("--field=") || arg.startsWith("--input=") || arg.startsWith("--raw-field=@") || arg === "pr" && (call.args.includes("create") || call.args.includes("edit")))));
 		assert.ok(calls.every((call) => call.command === "git" || call.command === "gh"));
 		assert.ok(calls.every((call) => Object.keys(saved).every((key) => call.env?.[key] === undefined)));
 		assert.ok(!calls.some((call) => call.args.includes("test_token") || Object.values(call.env ?? {}).includes("test_token") || call.args.join(" ").includes("test_token")));
@@ -180,6 +187,7 @@ test("disallowed first branch is rejected and a later branch change is rejected"
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" };
 		if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "b".repeat(40) };
 		if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" };
+		if (command === "gh" && args[0] === "api" && args.includes("--method=POST")) return { ok: true, stdout: "https://github.com/owner/repository/pull/9\n" };
 		return { ok: true, stdout: "" };
 	};
 	try {
@@ -209,7 +217,7 @@ test("failed PR create after push keeps the first branch pinned", async () => {
 		if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "c".repeat(40) };
 		if (args.includes("push")) { pushes++; return { ok: true, stdout: "" }; }
 		if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" };
-		if (command === "gh" && joined.includes("pr create")) return { ok: false, stdout: "" };
+		if (command === "gh" && args[0] === "api" && args.includes("--method=POST")) return { ok: false, stdout: "" };
 		return { ok: true, stdout: "" };
 	};
 	try {
@@ -221,21 +229,88 @@ test("failed PR create after push keeps the first branch pinned", async () => {
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("fork and wrong-base existing PR rows are rejected instead of edited", async () => {
+test("branch-only discovery still rejects fork, owner, repository, base, head, and ambiguous PR rows", async () => {
 	const workspace = gitWorkspace("pio-pr-pr-row-"); const stat = statSync(workspace);
 	const row = (extra: Record<string, unknown>) => [{ number: 7, headRefName: "feat/branch", baseRefName: "main", isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" }, ...extra }];
-	const makeRunner = (rows: unknown) => async (command: string, args: string[]) => {
-		fakeTrustedClone(args);
+	const makeRunner = (rows: unknown, calls: string[][]) => async (command: string, args: string[]) => {
+		fakeTrustedClone(args); calls.push(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
 		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
 		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/branch" }; if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "d".repeat(40) };
-		if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: JSON.stringify(rows) }; return { ok: true, stdout: "" };
+		if (command === "gh" && args[0] === "pr" && args[1] === "list") return { ok: true, stdout: JSON.stringify(rows) }; return { ok: true, stdout: "" };
 	};
 	try {
-		for (const rows of [row({ isCrossRepository: true, headRepository: { nameWithOwner: "fork/repository" }, headRepositoryOwner: { login: "fork" } }), row({ baseRefName: "release" })]) {
+		const invalid = [
+			row({ isCrossRepository: true, headRepository: { nameWithOwner: "fork/repository" }, headRepositoryOwner: { login: "fork" } }), row({ headRepository: { nameWithOwner: "other/repository" } }), row({ headRepositoryOwner: { login: "other" } }), row({ baseRefName: "release" }), row({ headRefName: "feat/other" }),
+			[row({})[0], { ...row({})[0], number: 8 }],
+		];
+		for (const rows of invalid) {
+			const calls: string[][] = [], target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+			assert.equal((await publishPullRequest(target, policy, "t", "b", makeRunner(rows, calls))).ok, false);
+			assert.equal(calls.some((args) => args[0] === "api"), false, "a mismatched or ambiguous PR is never mutated");
+		}
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("existing exact PRs are updated through REST PATCH, never gh pr edit", async () => {
+	const workspace = gitWorkspace("pio-pr-rest-patch-"), stat = statSync(workspace), calls: string[][] = [];
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+	const runner = async (command: string, args: string[]) => {
+		fakeTrustedClone(args); calls.push(args); const joined = args.join(" ");
+		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
+		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/rest" }; if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "a".repeat(40) };
+		if (command === "gh" && args[0] === "pr") return { ok: true, stdout: JSON.stringify([{ number: 73, headRefName: "feat/rest", baseRefName: "main", isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" } }]) };
+		return { ok: true, stdout: "" };
+	};
+	try {
+		const title = "Leading - title", body = "- literal body\nwith spaces";
+		assert.equal((await publishPullRequest(target, policy, title, body, runner)).ok, true);
+		assert.deepEqual(calls.find((args) => args[0] === "api"), ["api", "--method=PATCH", "repos/owner/repository/pulls/73", `--raw-field=title=${title}`, `--raw-field=body=${body}`, "--silent"]);
+		assert.equal(calls.some((args) => args[0] === "pr" && args.includes("edit")), false);
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("failed REST POST re-queries exactly once and updates only a revalidated exact PR", async () => {
+	const workspace = gitWorkspace("pio-pr-rest-race-"), stat = statSync(workspace), calls: string[][] = [];
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+	let queries = 0;
+	const runner = async (command: string, args: string[]) => {
+		fakeTrustedClone(args); calls.push(args); const joined = args.join(" ");
+		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
+		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/race" }; if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "b".repeat(40) };
+		if (command === "gh" && args[0] === "pr") return { ok: true, stdout: JSON.stringify(++queries === 1 ? [] : [{ number: 91, headRefName: "feat/race", baseRefName: "main", isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" } }]) };
+		if (command === "gh" && args[0] === "api" && args.includes("--method=POST")) return { ok: false, stdout: "" };
+		return { ok: true, stdout: "" };
+	};
+	try {
+		assert.equal((await publishPullRequest(target, policy, "t", "b", runner)).ok, true);
+		assert.equal(queries, 2); assert.equal(calls.filter((args) => args[0] === "api" && args.includes("--method=POST")).length, 1);
+		assert.ok(calls.some((args) => args[0] === "api" && args.includes("--method=PATCH") && args.includes("repos/owner/repository/pulls/91")));
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("failed or invalid REST POST fails closed without an exact re-query match", async () => {
+	const workspace = gitWorkspace("pio-pr-rest-closed-"), stat = statSync(workspace);
+	const exact = { number: 2, headRefName: "feat/closed", baseRefName: "main", isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" } };
+	try {
+		for (const [post, fresh] of [[{ ok: false, stdout: "" }, []], [{ ok: false, stdout: "" }, [{ ...exact, baseRefName: "release" }]], [{ ok: false, stdout: "" }, [exact, { ...exact, number: 3 }]], [{ ok: true, stdout: "https://github.com/owner/repository/issues/2\n" }, []]] as const) {
+			const calls: string[][] = []; let queries = 0;
 			const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
-			assert.equal((await publishPullRequest(target, policy, "t", "b", makeRunner(rows))).ok, false);
+			const runner = async (command: string, args: string[]) => {
+				fakeTrustedClone(args); calls.push(args); const joined = args.join(" ");
+				if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
+				if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
+				if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/closed" }; if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "c".repeat(40) };
+				if (command === "gh" && args[0] === "pr") return { ok: true, stdout: JSON.stringify(++queries === 1 ? [] : fresh) };
+				if (command === "gh" && args[0] === "api" && args.includes("--method=POST")) return post;
+				return { ok: true, stdout: "" };
+			};
+			const result = await publishPullRequest(target, policy, "t", "b", runner);
+			assert.deepEqual(result, { ok: false, message: "Pull request create/update failed." }); assert.equal(queries, 2);
+			assert.equal(calls.some((args) => args[0] === "api" && args.includes("--method=PATCH")), false);
 		}
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
