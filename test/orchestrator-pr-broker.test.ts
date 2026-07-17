@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import net from "node:net";
 import test from "node:test";
 import {
@@ -70,8 +70,8 @@ test("PR policy is opt-in, bounded, normalized, and fails closed", () => {
 });
 
 test("only canonical GitHub origins and safe non-default prefix branches qualify", () => {
-	assert.deepEqual(normalizeGitHubRemote("git@github.com:Owner/Repository.git"), { repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git" });
-	assert.deepEqual(normalizeGitHubRemote("https://github.com/owner/repository"), { repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git" });
+	assert.deepEqual(normalizeGitHubRemote("git@github.com:Owner/Repository.git"), { repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git" });
+	assert.deepEqual(normalizeGitHubRemote("https://github.com/owner/repository"), { repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git" });
 	for (const remote of ["https://token@github.com/owner/repository", "https://github.com/owner/repository/extra", "git@gitlab.com:owner/repository.git"]) assert.equal(normalizeGitHubRemote(remote), undefined);
 	assert.equal(branchAllowed("feat/broker", policy, "main"), true);
 	for (const branch of ["main", "fix/../main", "other/work", "feat//bad"]) assert.equal(branchAllowed(branch, policy, "main"), false);
@@ -95,23 +95,38 @@ test("broker socket is generation-bound, mode-restricted, and exposes no arbitra
 	} finally { await broker.cleanup(); rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("publish uses only fixed git/gh argv and canonical remote with credential-free worker-facing output", async () => {
-	const workspace = gitWorkspace("pio-pr-test-");
+test("publish uses HTTPS, fixed credential-free argv, and a host-only askpass", async () => {
+	const workspace = gitWorkspace("pio-pr-test-"), ghBin = mkdtempSync(join(tmpdir(), "pio-pr-gh-")), record = join(ghBin, "record");
 	const identity = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: identity.dev, inode: identity.ino, git: gitMetadataForTesting(workspace)! };
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: identity.dev, inode: identity.ino, git: gitMetadataForTesting(workspace)! };
 	const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv; cwd?: string }> = [];
-	const old = process.env.GITHUB_TOKEN; process.env.GITHUB_TOKEN = "never-forward";
+	const saved = Object.fromEntries(["GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_SSH_COMMAND"].map((key) => [key, process.env[key]]));
+	for (const key of Object.keys(saved)) process.env[key] = "never-forward";
+	let askpass: string | undefined;
+	writeFileSync(join(ghBin, "gh"), "#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(process.env.GH_TEST_RECORD, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write(process.env.GH_TEST_OUTPUT ?? 'test_token');\n", { mode: 0o700 });
 	const runner = async (command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; timeout?: number } = {}) => {
 		calls.push({ command, args, env: options.env, cwd: options.cwd });
 		fakeTrustedClone(args);
+		if (command === "git" && args.includes("fetch")) {
+			askpass = options.env?.GIT_ASKPASS;
+			assert.ok(askpass && (statSync(askpass).mode & 0o777) === 0o700 && (statSync(dirname(askpass)).mode & 0o777) === 0o700);
+			assert.match(readFileSync(askpass, "utf8"), /spawnSync\("gh", \["auth", "token", "--hostname", "github.com"\]/);
+			assert.equal(readFileSync(join(options.cwd!, "config"), "utf8"), "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n");
+			const env = { ...options.env, PATH: `${ghBin}:${process.env.PATH}`, GH_TEST_RECORD: record };
+			assert.deepEqual(spawnSync(askpass, ["Username for 'https://github.com': "], { env, encoding: "utf8" }).stdout, "x-access-token\n");
+			assert.deepEqual(spawnSync(askpass, ["Password for 'https://x-access-token@github.com': "], { env, encoding: "utf8" }).stdout, "test_token\n");
+			assert.notEqual(spawnSync(askpass, ["unexpected prompt"], { env, encoding: "utf8" }).status, 0);
+			assert.notEqual(spawnSync(askpass, ["Password for 'https://x-access-token@github.com': "], { env: { ...env, GH_TEST_OUTPUT: "bad\nsecond\n" }, encoding: "utf8" }).status, 0);
+			assert.deepEqual(JSON.parse(readFileSync(record, "utf8")), ["auth", "token", "--hostname", "github.com"]);
+		}
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" };
 		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/broker" };
 		if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" };
-		if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "a".repeat(40) };
+		if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "a".repeat(64) };
 		if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" };
 		return { ok: true, stdout: "" };
 	};
@@ -121,11 +136,15 @@ test("publish uses only fixed git/gh argv and canonical remote with credential-f
 		assert.equal(target.branch, "feat/broker", "first successful publish pins the worker-created branch");
 		const clone = calls.find((call) => call.command === "git" && call.args.includes("clone"));
 		assert.ok(clone && clone.cwd !== workspace && clone.env?.GIT_ALLOW_PROTOCOL === "file" && clone.args.includes("protocol.ssh.allow=never"));
-		assert.ok(calls.some((call) => call.command === "git" && call.args.includes("push") && call.args.includes("git@github.com:owner/repository.git") && call.cwd !== workspace));
+		const network = calls.filter((call) => call.command === "git" && (call.args.includes("fetch") || call.args.includes("ls-remote") || call.args.includes("push")));
+		assert.ok(network.length && network.every((call) => call.args.includes("credential.helper=") && call.args.includes("https://github.com/owner/repository.git") && call.env?.GIT_ASKPASS && call.env.GIT_TERMINAL_PROMPT === "0"));
+		assert.ok(calls.filter((call) => call.command === "git" && !network.includes(call)).every((call) => call.env?.GIT_ASKPASS === undefined));
 		assert.ok(calls.some((call) => call.command === "gh" && call.args.includes("create") && call.args.includes("--base=main")));
 		assert.ok(calls.every((call) => call.command === "git" || call.command === "gh"));
-		assert.ok(calls.every((call) => call.env?.GITHUB_TOKEN === undefined));
-	} finally { old === undefined ? delete process.env.GITHUB_TOKEN : process.env.GITHUB_TOKEN = old; rmSync(workspace, { recursive: true, force: true }); }
+		assert.ok(calls.every((call) => Object.keys(saved).every((key) => call.env?.[key] === undefined)));
+		assert.ok(!calls.some((call) => call.args.includes("test_token") || Object.values(call.env ?? {}).includes("test_token") || call.args.join(" ").includes("test_token")));
+		assert.ok(askpass && !existsSync(askpass), "temp askpass is removed after publication");
+	} finally { for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value; rmSync(ghBin, { recursive: true, force: true }); rmSync(workspace, { recursive: true, force: true }); }
 });
 
 test("default-branch startup defers branch pinning and falls back to trusted gh default lookup", async () => {
@@ -135,7 +154,7 @@ test("default-branch startup defers branch pinning and falls back to trusted gh 
 		calls.push(`${command} ${args.join(" ")}`); const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" };
 		if (command === "gh") return { ok: true, stdout: "main" };
 		return { ok: false, stdout: "" }; // origin/HEAD intentionally absent
 	};
@@ -148,14 +167,14 @@ test("default-branch startup defers branch pinning and falls back to trusted gh 
 
 test("disallowed first branch is rejected and a later branch change is rejected", async () => {
 	const workspace = gitWorkspace("pio-pr-branch-"); const stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 	let branch = "other/nope";
 	const runner = async (command: string, args: string[]) => {
 		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" };
 		if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
 		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: branch };
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" };
@@ -176,14 +195,14 @@ test("disallowed first branch is rejected and a later branch change is rejected"
 
 test("failed PR create after push keeps the first branch pinned", async () => {
 	const workspace = gitWorkspace("pio-pr-failed-create-"); const stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 	let branch = "feat/first", pushes = 0;
 	const runner = async (command: string, args: string[]) => {
 		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" };
 		if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
 		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: branch };
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" };
@@ -209,13 +228,13 @@ test("fork and wrong-base existing PR rows are rejected instead of edited", asyn
 		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
 		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/branch" }; if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "d".repeat(40) };
 		if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: JSON.stringify(rows) }; return { ok: true, stdout: "" };
 	};
 	try {
 		for (const rows of [row({ isCrossRepository: true, headRepository: { nameWithOwner: "fork/repository" }, headRepositoryOwner: { login: "fork" } }), row({ baseRefName: "release" })]) {
-			const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+			const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
 			assert.equal((await publishPullRequest(target, policy, "t", "b", makeRunner(rows))).ok, false);
 		}
 	} finally { rmSync(workspace, { recursive: true, force: true }); }
@@ -223,14 +242,14 @@ test("fork and wrong-base existing PR rows are rejected instead of edited", asyn
 
 test("rejecting handlers, concurrent publish, and total request exhaustion are bounded", async () => {
 	const workspace = gitWorkspace("pio-pr-bounds-"), stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
 	let release!: () => void, rejectStatus = true; const held = new Promise<void>((resolve) => { release = resolve; });
 	const broker = startPullRequestBroker(target, policy, async (command, args) => {
 		fakeTrustedClone(args);
 		const joined = args.join(" ");
 		if (rejectStatus && joined.includes("symbolic-ref --quiet --short HEAD")) throw new Error("must not leak");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" };
 		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/held" }; if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "e".repeat(40) };
 		if (args.includes("push")) await held; if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" }; return { ok: true, stdout: "" };
 	});
@@ -250,12 +269,12 @@ test("rejecting handlers, concurrent publish, and total request exhaustion are b
 
 test("cleanup during a publish is idempotent and waits for the active handler", async () => {
 	const workspace = gitWorkspace("pio-pr-cleanup-"), stat = statSync(workspace);
-	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)!, branch: "feat/held" };
 	let release!: () => void; const held = new Promise<void>((resolve) => { release = resolve; });
 	const broker = startPullRequestBroker(target, policy, async (command, args) => {
 		fakeTrustedClone(args);
 		const joined = args.join(" "); if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
-		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" }; if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/held" };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" }; if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: "feat/held" };
 		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" }; if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "f".repeat(40) }; if (args.includes("push")) await held; if (command === "gh" && joined.includes("pr list")) return { ok: true, stdout: "[]" }; return { ok: true, stdout: "" };
 	});
 	try {
@@ -384,7 +403,12 @@ test("hostile local Git config cannot execute commands or influence trusted clon
 		const target = await pinPullRequestTarget(workspace, policy); assert.ok(target);
 		const runner = async (cmd: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) => {
 			calls.push({ command: cmd, args, cwd: options.cwd, env: options.env });
-			if (cmd === "gh" || args.includes("fetch") || args.includes("ls-remote") || args.includes("push")) return { ok: false, stdout: "" };
+			if (args.includes("fetch")) {
+				assert.equal(readFileSync(join(options.cwd!, "config"), "utf8"), "[core]\n\trepositoryformatversion = 0\n\tbare = true\n");
+				assert.equal(options.env?.GIT_ASKPASS !== undefined, true);
+				return { ok: false, stdout: "" };
+			}
+			if (cmd === "gh" || args.includes("ls-remote") || args.includes("push")) return { ok: false, stdout: "" };
 			return actualRunner(cmd, args, options);
 		};
 		assert.equal((await publishPullRequest(target, policy, "t", "b", runner)).ok, false);
