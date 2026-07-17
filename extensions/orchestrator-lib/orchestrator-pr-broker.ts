@@ -209,6 +209,30 @@ else { let tries = 0; const run = () => { const socket = net.createConnection('/
 `; }
 export type PullRequestBroker = { directory: string; target: PinnedPullRequestTarget; ready: Promise<void>; cleanup: () => Promise<void> };
 function validPublish(request: Record<string, unknown>): request is { generation: string; action: "publish"; title: string; body: string } { return Object.keys(request).every((key) => key === "generation" || key === "action" || key === "title" || key === "body") && request.action === "publish" && typeof request.generation === "string" && typeof request.title === "string" && request.title.length > 0 && request.title.length <= PR_TITLE_LIMIT && !/[\0\r\n]/.test(request.title) && typeof request.body === "string" && request.body.length <= PR_BODY_LIMIT && !/\0/.test(request.body); }
+type OpenPullRequest = { kind: "none" } | { kind: "one"; number: number } | { kind: "error"; message: string };
+
+/** gh 2.45 cannot reliably filter same-repository PRs with owner:branch, so verify its branch-only result ourselves. */
+async function findOpenPullRequest(target: PinnedPullRequestTarget, branch: string, runner: BrokerRunner, env: NodeJS.ProcessEnv): Promise<OpenPullRequest> {
+	const owner = target.repository.split("/")[0]!;
+	const open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${branch}`, "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"], { env, timeout: 30_000 });
+	if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { kind: "error", message: "Could not query the existing pull request." };
+	try {
+		const rows = JSON.parse(open.stdout) as unknown;
+		if (!Array.isArray(rows)) return { kind: "error", message: "Could not parse pull request status." };
+		if (rows.length > 1) return { kind: "error", message: "More than one open pull request matches this branch." };
+		if (!rows.length) return { kind: "none" };
+		const row = rows[0];
+		if (!row || typeof row !== "object") return { kind: "error", message: "Existing pull request does not match the pinned branch and base." };
+		const value = row as Record<string, unknown>, repository = value.headRepository as { nameWithOwner?: unknown } | null, repositoryOwner = value.headRepositoryOwner as { login?: unknown } | null;
+		const headRepository = repository?.nameWithOwner, headOwner = repositoryOwner?.login;
+		if (typeof value.number !== "number" || !Number.isSafeInteger(value.number) || value.number <= 0 || value.headRefName !== branch || value.baseRefName !== target.defaultBranch || value.isCrossRepository !== false || typeof headRepository !== "string" || typeof headOwner !== "string" || headRepository.toLowerCase() !== target.repository || headOwner.toLowerCase() !== owner.toLowerCase()) return { kind: "error", message: "Existing pull request does not match the pinned branch and base." };
+		return { kind: "one", number: value.number };
+	} catch { return { kind: "error", message: "Could not parse pull request status." }; }
+}
+function createdPullRequestUrl(repository: string, output: string): string | undefined {
+	const match = /^https:\/\/github\.com\/([a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d][a-z\d._-]{0,99})\/pull\/([1-9]\d*)\n?$/.exec(output);
+	return match && match[1] === repository ? output.endsWith("\n") ? output.slice(0, -1) : output : undefined;
+}
 
 export async function publishPullRequest(target: PinnedPullRequestTarget, policy: PullRequestsConfig, title: string, body: string, runner: BrokerRunner): Promise<BrokerResult> {
 	// Do this before any checkout Git command: .git and its config are
@@ -246,25 +270,21 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 		if ((await currentAllowedBranch(target, policy, runner)) !== branch) return { ok: false, message: "The branch changed during publishing." };
 		target.branch ??= branch;
 		if (!(await runner("git", networkGitArgs("push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { ...trustedOptions, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
-		const env = trustedEnv(process.env), owner = target.repository.split("/")[0]!, open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${owner}:${branch}`, "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"], { env, timeout: 30_000 });
-		if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { ok: false, message: "Could not query the existing pull request." };
-		let number: number | undefined;
-		try {
-			const rows = JSON.parse(open.stdout) as unknown;
-			if (!Array.isArray(rows)) return { ok: false, message: "Could not parse pull request status." };
-			if (rows.length > 1) return { ok: false, message: "More than one open pull request matches this branch." };
-			if (rows.length === 1) {
-				const row = rows[0] as Record<string, unknown>;
-				const repository = row.headRepository as { nameWithOwner?: unknown } | null;
-				const repositoryOwner = row.headRepositoryOwner as { login?: unknown } | null;
-				const headRepository = repository?.nameWithOwner, headOwner = repositoryOwner?.login;
-				if (!row || typeof row !== "object" || !Number.isSafeInteger(row.number) || row.headRefName !== branch || row.baseRefName !== target.defaultBranch || row.isCrossRepository !== false || typeof headRepository !== "string" || typeof headOwner !== "string" || headRepository.toLowerCase() !== target.repository || headOwner.toLowerCase() !== owner.toLowerCase()) return { ok: false, message: "Existing pull request does not match the pinned branch and base." };
-				number = row.number as number;
-			}
-		} catch { return { ok: false, message: "Could not parse pull request status." }; }
-		const args = number ? ["pr", "edit", String(number), `--repo=${target.repository}`, `--title=${title}`, `--body=${body}`] : ["pr", "create", `--repo=${target.repository}`, `--base=${target.defaultBranch}`, `--head=${branch}`, `--title=${title}`, `--body=${body}`];
-		if (!(await runner("gh", args, { env, timeout: 45_000 })).ok) return { ok: false, message: "Pull request create/update failed." };
-		return { ok: true, message: number ? "Updated the open pull request." : "Created an open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
+		const env = trustedEnv(process.env), existing = await findOpenPullRequest(target, branch, runner, env);
+		if (existing.kind === "error") return { ok: false, message: existing.message };
+		const update = async (number: number): Promise<boolean> => (await runner("gh", ["api", "--method=PATCH", `repos/${target.repository}/pulls/${number}`, `--raw-field=title=${title}`, `--raw-field=body=${body}`, "--silent"], { env, timeout: 45_000 })).ok;
+		if (existing.kind === "one") {
+			if (!(await update(existing.number))) return { ok: false, message: "Pull request create/update failed." };
+			return { ok: true, message: "Updated the open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
+		}
+		const created = await runner("gh", ["api", "--method=POST", `repos/${target.repository}/pulls`, `--raw-field=title=${title}`, `--raw-field=body=${body}`, `--raw-field=head=${branch}`, `--raw-field=base=${target.defaultBranch}`, "--jq=.html_url"], { env, timeout: 45_000 });
+		const url = created.ok ? createdPullRequestUrl(target.repository, created.stdout) : undefined;
+		if (url) return { ok: true, message: `Created an open pull request: ${url}`, repository: target.repository, branch, defaultBranch: target.defaultBranch };
+		// A POST can have succeeded remotely despite a local failure. Query once and
+		// update only a freshly revalidated exact match; never repeat the POST.
+		const raced = await findOpenPullRequest(target, branch, runner, env);
+		if (raced.kind === "one" && await update(raced.number)) return { ok: true, message: "Updated the open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
+		return { ok: false, message: "Pull request create/update failed." };
 	} finally { try { rmSync(tempParent, { recursive: true, force: true }); } catch {} }
 }
 async function brokerStatus(target: PinnedPullRequestTarget, policy: PullRequestsConfig, runner: BrokerRunner): Promise<BrokerResult> {
