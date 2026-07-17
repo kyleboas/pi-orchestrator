@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 
@@ -154,6 +154,7 @@ function saveStats(ledger: StatsLedger, path: string): void {
 	try { mkdirSync(dirname(path), { recursive: true }); const temp = `${path}.tmp`; writeFileSync(temp, `${JSON.stringify(ledger, null, "\t")}\n`); renameSync(temp, path); } catch { /* advisory only */ }
 }
 
+function timestampedBackupPath(path: string, suffix = ""): string { return `${path}.backup-${new Date().toISOString().replace(/[:.]/g, "-")}${suffix}`; }
 /** Normalize a live ledger only after making a timestamped sibling backup. */
 export function cleanStatsLedger(path = defaultStatsPath(), catalogNames: readonly string[] = []): string | undefined {
 	try {
@@ -162,10 +163,62 @@ export function cleanStatsLedger(path = defaultStatsPath(), catalogNames: readon
 		const ledger = loadStats(path, catalogNames);
 		const normalized = `${JSON.stringify(ledger, null, "\t")}\n`;
 		if (original === normalized) return undefined;
-		const backup = `${path}.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+		const backup = timestampedBackupPath(path);
 		copyFileSync(path, backup);
 		saveStats(ledger, path);
 		return backup;
+	} catch { return undefined; }
+}
+
+function readJsonRecord(path: string): Record<string, unknown> | undefined {
+	try { const raw: unknown = JSON.parse(readFileSync(path, "utf8")); return isRecord(raw) ? raw : undefined; } catch { return undefined; }
+}
+function recentIdentity(run: RecentRun): string {
+	// v3 run IDs are globally stable. v2 had no IDs, so use its complete
+	// non-text observation shape; this avoids duplicate historic runs if a
+	// stale v2 writer retained a subset of the backup's recent trail.
+	if (!run.runId.startsWith("legacy-")) return `id:${run.runId}`;
+	return `v2:${run.worker}\u0000${run.timestamp}\u0000${run.backend ?? ""}\u0000${run.model ?? ""}\u0000${run.status}\u0000${run.durationMs}\u0000${run.tokens}\u0000${run.costUsd ?? ""}`;
+}
+function mergeRecentRuns(richer: RecentRun[], current: RecentRun[]): RecentRun[] {
+	const merged = new Map<string, RecentRun>();
+	for (const run of richer) merged.set(recentIdentity(run), run);
+	// Current observations win ties because they may reflect a later v2 write.
+	for (const run of current) merged.set(recentIdentity(run), run);
+	return [...merged.values()].sort((left, right) => left.timestamp.localeCompare(right.timestamp) || recentIdentity(left).localeCompare(recentIdentity(right))).slice(-MAX_RECENT_RUNS);
+}
+
+export type StaleV2Recovery = { sourceBackup: string; safetyBackup: string; recoveredRuns: number };
+/**
+ * One-time startup repair for the exact stale-writer failure mode: a still
+ * loaded v2 extension overwrote a normalized v3 ledger after cleanup. It only
+ * runs while the live file explicitly says v2 and a sibling backup has more
+ * recoverable recent runs. Current aggregates always win; the richer backup
+ * contributes only missing workers and the historical recent-run trail.
+ */
+export function recoverStaleV2StatsLedger(path = defaultStatsPath(), catalogNames: readonly string[] = []): StaleV2Recovery | undefined {
+	try {
+		const liveRaw = readJsonRecord(path);
+		if (!liveRaw || liveRaw.version !== 2) return undefined;
+		const live = loadStats(path, catalogNames);
+		const prefix = `${path.split("/").pop()}.backup-`;
+		const candidates = readdirSync(dirname(path))
+			.map((name) => resolve(dirname(path), name))
+			.filter((candidate) => candidate.split("/").pop()?.startsWith(prefix))
+			.map((candidate) => ({ path: candidate, ledger: loadStats(candidate, catalogNames) }))
+			.filter((candidate) => candidate.ledger.recentRuns.length > live.recentRuns.length)
+			.sort((left, right) => right.ledger.recentRuns.length - left.ledger.recentRuns.length || right.path.localeCompare(left.path));
+		const richer = candidates[0];
+		if (!richer) return undefined;
+		const recentRuns = mergeRecentRuns(richer.ledger.recentRuns, live.recentRuns);
+		if (recentRuns.length <= live.recentRuns.length) return undefined;
+		const safetyBackup = timestampedBackupPath(path, ".pre-v2-recovery");
+		copyFileSync(path, safetyBackup);
+		// Do not add old aggregates: live totals are the only totals known to
+		// include post-backup attempts. Backup workers fill only absent names.
+		const workers = { ...richer.ledger.workers, ...live.workers };
+		saveStats({ version: 3, workers, recentRuns }, path);
+		return { sourceBackup: richer.path, safetyBackup, recoveredRuns: recentRuns.length };
 	} catch { return undefined; }
 }
 
