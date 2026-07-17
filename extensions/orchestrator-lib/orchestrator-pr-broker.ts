@@ -94,9 +94,12 @@ function metadata(workspace: string): GitMetadata | undefined {
 		else if (entryStat.isFile()) { const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(entry, "utf8")); if (!match) return undefined; gitDir = realpathSync(resolve(dirname(entry), match[1]!)); }
 		else return undefined;
 		if (!statSync(gitDir).isDirectory()) return undefined;
-		const dirs = [gitDir]; const common = join(gitDir, "commondir");
-		try { const path = realpathSync(resolve(gitDir, readFileSync(common, "utf8").trim())); if (path !== gitDir) dirs.push(path); } catch {}
-		const configs = dirs.map((dir) => { const path = join(dir, "config"), stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("unsafe config"); return { path, device: stat.dev, inode: stat.ino, hash: createHash("sha256").update(readFileSync(path)).digest("hex") }; });
+		let commonDir = gitDir; const common = join(gitDir, "commondir");
+		try { commonDir = realpathSync(resolve(gitDir, readFileSync(common, "utf8").trim())); } catch {}
+		const state = (path: string, required: boolean) => { try { const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("unsafe config"); const contents = readFileSync(path); if (/^\s*\[include(?:If)?\b/im.test(contents.toString("utf8"))) throw new Error("included config is not permitted"); return { path, device: stat.dev, inode: stat.ino, hash: createHash("sha256").update(contents).digest("hex") }; } catch { if (required) throw new Error("missing config"); return { path, device: -1, inode: -1, hash: "absent" }; } };
+		// Normal repos pin config once. Linked worktrees pin common config and
+		// the presence/content state of their optional config.worktree.
+		const configs = commonDir === gitDir ? [state(join(commonDir, "config"), true)] : [state(join(commonDir, "config"), true), state(join(gitDir, "config.worktree"), false)];
 		return { entryDevice: entryStat.dev, entryInode: entryStat.ino, gitDir, configs };
 	} catch { return undefined; }
 }
@@ -116,7 +119,7 @@ async function resolveDefaultBranch(repository: string, local: string | undefine
 
 /** Pin workspace identity, exact origin and default branch before worker code. Branch is intentionally deferred. */
 export function pinPullRequestTargetSync(cwd: string, policy: PullRequestsConfig): PinnedPullRequestTarget | undefined {
-	const file = identity(cwd); if (!file) return undefined;
+	const file = identity(cwd); if (!file || !file.git) return undefined;
 	const get = (...args: string[]): string | undefined => { try { const result = spawnSync("git", gitArgs(...args), { cwd: file.workspace, env: { ...trustedEnv(process.env), ...GIT_ENV }, stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, encoding: "utf8", maxBuffer: PR_RESPONSE_LIMIT }); const value = result.status === 0 ? (result.stdout ?? "").trim() : ""; return value && value.length <= 512 && !/[\0\r\n]/.test(value) ? value : undefined; } catch { return undefined; } };
 	if (get("rev-parse", "--is-inside-work-tree") !== "true" || get("rev-parse", "--show-toplevel") !== file.workspace) return undefined;
 	const remote = get("remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
@@ -125,7 +128,7 @@ export function pinPullRequestTargetSync(cwd: string, policy: PullRequestsConfig
 	return defaultBranch ? { ...file, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }
 export async function pinPullRequestTarget(cwd: string, policy: PullRequestsConfig, runner: BrokerRunner = defaultRunner): Promise<PinnedPullRequestTarget | undefined> {
-	const file = identity(cwd); if (!file || (await line(runner, file.workspace, "rev-parse", "--is-inside-work-tree")) !== "true" || (await line(runner, file.workspace, "rev-parse", "--show-toplevel")) !== file.workspace) return undefined;
+	const file = identity(cwd); if (!file || !file.git || (await line(runner, file.workspace, "rev-parse", "--is-inside-work-tree")) !== "true" || (await line(runner, file.workspace, "rev-parse", "--show-toplevel")) !== file.workspace) return undefined;
 	const remote = await line(runner, file.workspace, "remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
 	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
 	const ref = await line(runner, file.workspace, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"), defaultBranch = await resolveDefaultBranch(parsed.repository, localDefault(ref), runner);
@@ -143,8 +146,11 @@ export type PullRequestBroker = { directory: string; target: PinnedPullRequestTa
 function validPublish(request: Record<string, unknown>): request is { generation: string; action: "publish"; title: string; body: string } { return Object.keys(request).every((key) => key === "generation" || key === "action" || key === "title" || key === "body") && request.action === "publish" && typeof request.generation === "string" && typeof request.title === "string" && request.title.length > 0 && request.title.length <= PR_TITLE_LIMIT && !/[\0\r\n]/.test(request.title) && typeof request.body === "string" && request.body.length <= PR_BODY_LIMIT && !/\0/.test(request.body); }
 
 export async function publishPullRequest(target: PinnedPullRequestTarget, policy: PullRequestsConfig, title: string, body: string, runner: BrokerRunner): Promise<BrokerResult> {
+	// Do this before any checkout Git command: .git/config and worktree links
+	// are worker-controlled paths after delegation.
+	if (!target.git || !sameMetadata(target.git, metadata(target.workspace))) return { ok: false, message: "Repository metadata no longer matches the delegated target." };
 	const repinned = await pinPullRequestTarget(target.workspace, policy, runner);
-	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || (target.git !== undefined && !sameMetadata(target.git, metadata(target.workspace))) || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
+	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || !repinned.git || !sameMetadata(target.git, repinned.git) || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
 	const branch = await currentAllowedBranch(target, policy, runner);
 	if (!branch || (target.branch && target.branch !== branch)) return { ok: false, message: target.branch ? "The pinned branch changed." : "Switch to an allowed non-default branch before publishing." };
 	const dirty = await git(runner, target.workspace, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none");
