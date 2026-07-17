@@ -17,6 +17,13 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	name: string;
 	profile: WorkerProfile;
 	task: string;
+	/** Stable delegated-task lineage; each steer shares this root. */
+	rootTaskId: string;
+	/** Unique ledger ID for the current attempt/run. */
+	runId: string;
+	retryOf?: string;
+	category: import("./orchestrator-stats.ts").TaskCategory;
+	complexity: import("./orchestrator-stats.ts").TaskComplexity;
 	cwd: string;
 	process: ChildProcessWithoutNullStreams;
 	startedAt: Date;
