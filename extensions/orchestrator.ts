@@ -451,10 +451,12 @@ function handleClaudeLine(worker: Worker, line: string, config?: OrchestratorCon
 /** A sandbox-policy rejection: the worker process was never spawned. */
 class WorkerLaunchRejected extends Error {}
 
-function brokerSafeWorkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function brokerSafeWorkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const safe: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(env)) {
-		if (/(TOKEN|KEY|SECRET|AUTH|PASSWORD|PASSWD|COOKIE|CREDENTIAL|ACCOUNT)/i.test(key) || ["SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "GH_CONFIG_DIR", "GITHUB_CONFIG_DIR"].includes(key)) continue;
+		// Preserve existing model-provider auth exactly; remove only GitHub/SSH
+		// credentials that are irrelevant to a worker using the host-side broker.
+		if (["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "GIT_ASKPASS", "GH_CONFIG_DIR", "GITHUB_CONFIG_DIR"].includes(key)) continue;
 		safe[key] = value;
 	}
 	return safe;
@@ -508,8 +510,9 @@ function spawnWorkerChild(
 		if (target) {
 			try {
 				prBroker = startPullRequestBroker(target, config.pullRequests);
-				// An eligible broker worker gets no legacy auth/config/account mounts.
-				const brokerLaunch = resolveWorkerLaunch(config.sandbox, { ...request, fileMountsReadOnlyTry: [], fileMountsReadOnly: [], readWritePaths: [], prBrokerDirectory: prBroker.directory }, workerEnv);
+				// Add only /pr. Existing narrow Pi/Claude provider-auth/config mounts
+				// are required for model access and remain exactly as configured.
+				const brokerLaunch = resolveWorkerLaunch(config.sandbox, { ...request, prBrokerDirectory: prBroker.directory }, workerEnv);
 				if (brokerLaunch.ok) launch = brokerLaunch;
 				else { void prBroker.cleanup(); prBroker = undefined; }
 			} catch {

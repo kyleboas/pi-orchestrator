@@ -25,6 +25,7 @@ import {
 	type WorkerLaunchRequest,
 } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
 import { loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
+import { brokerSafeWorkerEnv } from "../extensions/orchestrator.ts";
 
 function configFile(text: string): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-orchestrator-sandbox-"));
@@ -247,6 +248,19 @@ test("PR broker mount is narrow and has no credential path or environment value"
 	assert.ok(args.includes("/pr"));
 	assert.ok(!args.join(" ").includes(".ssh"));
 	assert.ok(!args.join(" ").includes("SECRET_TOKEN"));
+});
+
+test("eligible Pi and Claude broker mounts retain provider auth while excluding GitHub auth", () => {
+	const pi = request({ prBrokerDirectory: "/run/pio-pr", fileMountsReadOnlyTry: [{ source: "/host/pi/auth.json", dest: "/worker/pi/auth.json" }] });
+	const claude = request({ prBrokerDirectory: "/run/pio-pr", readWritePaths: ["/host/claude-account"] });
+	const piArgs = buildBwrapArgs(sandbox({ mode: "required", env: "allowlist" }), pi, "/usr/bin/pi-real", []);
+	const claudeArgs = buildBwrapArgs(sandbox({ mode: "required", env: "allowlist" }), claude, "/usr/bin/claude-real", []);
+	assert.ok(piArgs.includes("/host/pi/auth.json"), "Pi provider auth mount is retained");
+	assert.ok(claudeArgs.includes("/host/claude-account"), "Claude provider account mount is retained");
+	assert.ok(piArgs.includes("/run/pio-pr") && claudeArgs.includes("/run/pio-pr"));
+	const safe = brokerSafeWorkerEnv({ GH_TOKEN: "gh", GITHUB_TOKEN: "github", SSH_AUTH_SOCK: "/ssh", GH_CONFIG_DIR: "/gh", ANTHROPIC_API_KEY: "provider" });
+	assert.equal(safe.GH_TOKEN, undefined); assert.equal(safe.GITHUB_TOKEN, undefined); assert.equal(safe.SSH_AUTH_SOCK, undefined); assert.equal(safe.GH_CONFIG_DIR, undefined);
+	assert.equal(safe.ANTHROPIC_API_KEY, "provider", "model provider auth remains available");
 });
 
 test("mode off preserves legacy direct launch with inherited environment", () => {
