@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GATEWAY_PLACEHOLDER, SANDBOX_GATEWAY_BASE_URL, buildHostRelayBwrapArgs, claudeGatewayEnv, startGatewayRelay, validateGatewayTokenFile, writeGatewayPiModels } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
+import { GATEWAY_PI_PROVIDER, GATEWAY_PLACEHOLDER, SANDBOX_GATEWAY_BASE_URL, buildHostRelayBwrapArgs, claudeGatewayEnv, gatewayPiModel, startGatewayRelay, validateGatewayTokenFile, writeGatewayPiModels } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
 import { buildBwrapArgs, DEFAULT_SANDBOX_CONFIG, parseSandboxConfig, piWorkerSandboxPlan, resolveWorkerLaunch } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
 
 function requestUds(socketPath: string, body: string, path = "/v1/messages", method = "POST"): Promise<{ status: number; body: string }> {
@@ -19,6 +19,8 @@ function requestUds(socketPath: string, body: string, path = "/v1/messages", met
 test("gateway config accepts only an HTTP loopback origin and safe absolute token path", () => {
   const good = parseSandboxConfig({ mode: "required", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/home/user/.config/agent/gateway.token" } });
   assert.equal(good?.gateway?.upstreamUrl, "http://127.0.0.1:4000");
+  assert.equal(good?.gateway?.model, "coding-main");
+  assert.equal(parseSandboxConfig({ mode: "required", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", model: "custom-model-v2" } })?.gateway?.model, "custom-model-v2");
   assert.equal(parseSandboxConfig({ mode: "off", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x" } }), undefined, "off+gateway is rejected before any relay can start");
   const preferred = parseSandboxConfig({ mode: "preferred", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x" } })!;
   const failed = resolveWorkerLaunch(preferred, { command: "pi", args: [], cwd: "/work", homeDir: "/tmp/home", envOverrides: {} }, {}, () => ({ ok: false, reason: "probe failed" }));
@@ -31,6 +33,8 @@ test("gateway config accepts only an HTTP loopback origin and safe absolute toke
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000/path", tokenFile: "/x" } },
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "relative" } },
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", token: "never" } },
+    { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", model: "../escape" } },
+    { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", model: "bad model" } },
   ]) assert.equal(parseSandboxConfig(bad), undefined);
 });
 
@@ -54,7 +58,7 @@ test("host relay mount plan is minimal and token validation rejects links and lo
 test("gateway bwrap plan has exactly two bootstrap caps, argv-only bootstrap, UDS bind, and complete drop", () => {
   const home = "/home/user/.cache/pi-orchestrator/worker-homes/w";
   const plan = piWorkerSandboxPlan(home, "/home/user", true);
-  const args = buildBwrapArgs({ ...DEFAULT_SANDBOX_CONFIG, mode: "required", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/token" } }, {
+  const args = buildBwrapArgs({ ...DEFAULT_SANDBOX_CONFIG, mode: "required", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/token", model: "coding-main" } }, {
     command: "pi", args: ["--mode", "rpc"], cwd: "/work", envOverrides: {}, homeDir: home, ...plan,
     gateway: { relayDirectory: "/run/user/1000/pi-gw/w", nodePath: "/node/bin/node", nodeRoot: "/node", bootstrapPath: "/trusted/bootstrap.sh", entrypointPath: "/trusted/entrypoint.mjs" },
   }, "/node/bin/pi", ["/node"]);
@@ -69,8 +73,8 @@ test("gateway bwrap plan has exactly two bootstrap caps, argv-only bootstrap, UD
   assert.ok(!bootstrap.includes(" -c "));
   assert.equal(plan.fileMountsReadOnly.some((m) => m.source.includes("auth.json") || m.source.includes("gateway.token")), false);
   assert.equal(plan.fileMountsReadOnly.some((m) => m.source.endsWith("models.json")), false, "host model configuration is not mounted in gateway mode");
-  assert.ok(plan.fileMountsReadOnly.some((m) => m.source.endsWith(".gateway-placeholder")));
-  assert.match(GATEWAY_PLACEHOLDER, /^[^.]+\.[^.]+\.[^.]+$/);
+  assert.deepEqual(plan.fileMountsReadOnly, [], "gateway Pi mounts no host auth, model, or placeholder files");
+  assert.equal(GATEWAY_PLACEHOLDER, "PI_ORCHESTRATOR_GATEWAY_PLACEHOLDER");
 });
 
 test("gateway client environments contain only loopback routing and non-secret placeholders", () => {
@@ -87,13 +91,19 @@ test("gateway client environments contain only loopback routing and non-secret p
 test("gateway Pi model override contains only a loopback provider and non-secret placeholder", () => {
   const root = mkdtempSync(join(tmpdir(), "pio-gw-models-"));
   try {
-    const file = writeGatewayPiModels(root, "openai-codex");
+    const file = writeGatewayPiModels(root, "coding-main");
     const parsed = JSON.parse(readFileSync(file, "utf8"));
-    assert.deepEqual(parsed, { providers: { "openai-codex": { baseUrl: SANDBOX_GATEWAY_BASE_URL, apiKey: GATEWAY_PLACEHOLDER } } });
+    assert.deepEqual(parsed, { providers: { [GATEWAY_PI_PROVIDER]: {
+      baseUrl: `${SANDBOX_GATEWAY_BASE_URL}/v1`,
+      apiKey: GATEWAY_PLACEHOLDER,
+      api: "openai-completions",
+      models: [{ id: "coding-main", name: "Gateway coding-main", reasoning: true, input: ["text", "image"], contextWindow: 128_000, maxTokens: 32_768 }],
+    } } });
+    assert.equal(gatewayPiModel("coding-main"), `${GATEWAY_PI_PROVIDER}/coding-main`);
     assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.equal(statSync(join(root, "pi-agent")).mode & 0o777, 0o700);
     assert.throws(() => writeGatewayPiModels(root, "../escape"), /invalid/);
-    assert.throws(() => writeGatewayPiModels(root, "openai-codex"), /EEXIST/, "an existing model override is never silently replaced");
+    assert.throws(() => writeGatewayPiModels(root, "coding-main"), /EEXIST/, "an existing model override is never silently replaced");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -106,13 +116,13 @@ test("host relay streams bodies and responses, rewrites worker auth, sanitizes f
   const address = upstream.address(); assert.ok(address && typeof address === "object");
   const relay = startGatewayRelay("test", { upstreamUrl: `http://127.0.0.1:${address.port}`, tokenFile }, join(root, "r"));
   try {
-    for (const [path, method] of [["/admin/keys", "POST"], ["/v1/users", "GET"], ["/v1/messages", "DELETE"], ["http://127.0.0.1/v1/messages", "POST"], ["/v1/messages%2fadmin", "POST"]]) {
+    for (const [path, method] of [["/admin/keys", "POST"], ["/v1/users", "GET"], ["/v1/messages", "DELETE"], ["/codex/responses", "POST"], ["http://127.0.0.1/v1/messages", "POST"], ["/v1/messages%2fadmin", "POST"]]) {
       const denied = await requestUds(relay.socketPath, "denied", path!, method!); assert.equal(denied.status, 404);
     }
     assert.equal(upstreamRequests, 0, "denied requests never reach the credential-bearing upstream");
-    const response = await requestUds(relay.socketPath, "streamed-body", "/codex/responses?stream=true");
+    const response = await requestUds(relay.socketPath, "streamed-body", "/v1/responses?stream=true");
     assert.equal(response.status, 200); assert.equal(response.body, "data: one\n\ndata: two\n\n"); assert.equal(observedBody, "streamed-body");
-    assert.equal(observedPath, "/v1/responses?stream=true", "the Codex transport is normalized to the gateway Responses endpoint");
+    assert.equal(observedPath, "/v1/responses?stream=true");
     assert.equal(upstreamRequests, 1); assert.equal(observed.authorization, "Bearer real-test-token"); assert.equal(observed["proxy-authorization"], undefined); assert.equal(observed["x-api-key"], undefined);
     upstream.close(); await new Promise((r) => setTimeout(r, 20));
     const failed = await requestUds(relay.socketPath, "x"); assert.equal(failed.status, 502); assert.equal(failed.body, "gateway unavailable\n");
