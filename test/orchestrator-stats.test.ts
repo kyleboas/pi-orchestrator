@@ -10,6 +10,7 @@ import {
 	classifyTask,
 	cleanStatsLedger,
 	loadStats,
+	recoverStaleV2StatsLedger,
 	recordWorkerOutcome,
 	recordWorkerSteer,
 	rollingWorkerMetrics,
@@ -46,6 +47,24 @@ test("safe cleanup takes a sibling backup before removing phantom fields", () =>
 	assert.ok(backup && existsSync(backup));
 	assert.deepEqual(Object.keys(loadStats(path).workers), ["Luna"]);
 	assert.match(readFileSync(backup!, "utf8"), /"tasks"/, "backup is written before cleanup");
+});
+
+test("startup recovery merges a richer v2 backup with newer v2 attempts without taking stale aggregates", () => {
+	const path = tempStatsPath(); const backup = `${path}.backup-2026-07-17T01-30-26-946Z`;
+	const oldRun = (worker: string, timestamp: string, durationMs: number) => ({ worker, task: "redacted by normalization", timestamp, failed: false, durationMs, tokens: durationMs, backend: "pi-rpc", model: "p/model" });
+	writeFileSync(backup, JSON.stringify({ version: 2, workers: { Luna: { tasks: 5, failures: 1, steers: 2, totalDurationMs: 500, totalTokens: 500 }, tasks: 99 }, recentRuns: [oldRun("Luna", "2026-07-10T00:00:00.000Z", 10), oldRun("Luna", "2026-07-11T00:00:00.000Z", 11), oldRun("Luna", "2026-07-12T00:00:00.000Z", 12)] }));
+	writeFileSync(path, JSON.stringify({ version: 2, workers: { Luna: { tasks: 6, failures: 1, steers: 3, totalDurationMs: 600, totalTokens: 600 }, Terra: { tasks: 1, failures: 0, steers: 0, totalDurationMs: 20, totalTokens: 20 } }, recentRuns: [oldRun("Luna", "2026-07-12T00:00:00.000Z", 12), oldRun("Terra", "2026-07-17T01:34:00.000Z", 20)] }));
+	const recovery = recoverStaleV2StatsLedger(path, ["Luna", "Terra"]);
+	assert.ok(recovery && existsSync(recovery.safetyBackup));
+	assert.equal(recovery!.sourceBackup, backup);
+	assert.equal(recovery!.recoveredRuns, 4, "duplicate retained v2 observations union once");
+	const ledger = loadStats(path, ["Luna", "Terra"]);
+	assert.equal(ledger.version, 3);
+	assert.equal(ledger.workers.Luna!.tasks, 6, "live aggregate includes newer work and wins");
+	assert.equal(ledger.workers.Terra!.tasks, 1);
+	assert.equal(ledger.workers.tasks, undefined, "phantom aggregate field never becomes a worker");
+	assert.equal(ledger.recentRuns.length, 4);
+	assert.equal(recoverStaleV2StatsLedger(path, ["Luna", "Terra"]), undefined, "v3 recovery is one-time");
 });
 
 test("stable run IDs make status resolution exact-once without changing attempt totals", () => {

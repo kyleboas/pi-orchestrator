@@ -85,6 +85,7 @@ import {
 	classifyTask,
 	cleanStatsLedger,
 	loadStats,
+	recoverStaleV2StatsLedger,
 	recordWorkerOutcome,
 	recordWorkerSteer,
 	statsSummary,
@@ -582,7 +583,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const catalog = config.workers;
 	const catalogNames = catalogText(catalog);
 	const delegateWorkerSchema = createWorkerSchema(catalog);
-	// One safe, backed-up normalization pass removes pre-v3 phantom aggregate keys.
+	// First recover the narrowly scoped stale-v2 overwrite mode, then normalize
+	// any remaining legacy shape. Both paths snapshot before writing.
+	recoverStaleV2StatsLedger(undefined, workerNames(catalog));
 	cleanStatsLedger(undefined, workerNames(catalog));
 
 	// Workers are unref'd so a settled -p host can exit; make sure that exit
