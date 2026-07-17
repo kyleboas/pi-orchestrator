@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -16,6 +16,13 @@ export type SandboxConfig = {
 	envAllow: string[];
 	/** Extra host paths mounted read-only inside the sandbox; missing paths fail the launch rather than being skipped. */
 	readOnlyPaths: string[];
+	/**
+	 * Directories whose contents may be selected as worker workspaces when the
+	 * sandbox is enabled. Only the selected per-task cwd is ever mounted
+	 * read-write, never a whole root. Empty means no workspace is permitted:
+	 * sandboxed delegation fails closed until roots are configured.
+	 */
+	workspaceRoots: string[];
 	/** bwrap executable name or path; never a shell snippet. */
 	command: string;
 	/** Present when a sandbox block was supplied but malformed: delegation must fail closed, never fall back to off. */
@@ -28,6 +35,7 @@ export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
 	env: "inherit",
 	envAllow: [],
 	readOnlyPaths: [],
+	workspaceRoots: [],
 	command: "bwrap",
 };
 
@@ -109,6 +117,15 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 			readOnlyPaths.push(expanded);
 		}
 	}
+	const workspaceRoots: string[] = [];
+	if (raw.workspaceRoots !== undefined) {
+		if (!Array.isArray(raw.workspaceRoots) || raw.workspaceRoots.length > 32) return undefined;
+		for (const path of raw.workspaceRoots) {
+			const expanded = safePath(path);
+			if (!expanded) return undefined;
+			workspaceRoots.push(expanded);
+		}
+	}
 	const command = raw.command === undefined ? "bwrap" : raw.command;
 	if (!nonempty(command) || /[\r\n\0]/.test(command as string)) return undefined;
 	return {
@@ -117,6 +134,7 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 		env: env as SandboxEnvPolicy,
 		envAllow,
 		readOnlyPaths,
+		workspaceRoots,
 		command: (command as string).trim(),
 	};
 }
@@ -296,6 +314,61 @@ export function piWorkerSandboxPlan(homeDir: string, home: string = homedir()): 
 	};
 }
 
+export type WorkspaceFs = {
+	realpathSync: (path: string) => string;
+	statSync: (path: string) => { isDirectory(): boolean };
+};
+
+export type WorkspaceResolution = { ok: true; cwd: string } | { ok: false; error: string };
+
+/**
+ * Select and validate the workspace cwd for one delegation. In mode "off"
+ * legacy behavior is preserved (the session cwd, untouched, when no explicit
+ * cwd is given). Under sandboxed modes the candidate is canonicalized
+ * (realpath, so symlinks cannot escape), must be an existing directory, must
+ * not be the host home or one of its ancestors, and must be equal to or
+ * inside an explicitly configured workspaceRoots entry. Only the selected
+ * cwd is ever mounted read-write — never a whole configured root.
+ */
+export function resolveWorkerWorkspace(
+	config: SandboxConfig,
+	requestedCwd: string | undefined,
+	sessionCwd: string,
+	fs: WorkspaceFs = { realpathSync, statSync },
+	hostHome: string = homedir(),
+): WorkspaceResolution {
+	const requested = requestedCwd?.trim() ? expandHome(requestedCwd.trim()) : undefined;
+	if (config.mode === "off" && requested === undefined) return { ok: true, cwd: sessionCwd };
+	const candidate = requested ?? sessionCwd;
+	if (!isAbsolute(candidate)) return { ok: false, error: "The workspace cwd must be an absolute directory path." };
+	let canonical: string;
+	try {
+		canonical = fs.realpathSync(candidate);
+		if (!fs.statSync(canonical).isDirectory()) return { ok: false, error: "The workspace cwd is not a directory." };
+	} catch {
+		return { ok: false, error: "The workspace cwd does not exist or is not accessible." };
+	}
+	if (config.mode === "off") return { ok: true, cwd: canonical };
+	if (canonical === hostHome || isPathInside(canonical, hostHome)) {
+		return { ok: false, error: "The workspace cwd would mount the host home directory; pass a repository cwd inside a configured sandbox.workspaceRoots entry." };
+	}
+	const roots: string[] = [];
+	for (const root of config.workspaceRoots) {
+		try {
+			roots.push(fs.realpathSync(root));
+		} catch {
+			// A configured root that does not exist simply cannot match.
+		}
+	}
+	if (!roots.length) {
+		return { ok: false, error: "No sandbox.workspaceRoots are configured; add the repository root(s) to the sandbox config and pass a cwd inside one of them." };
+	}
+	if (!roots.some((root) => canonical === root || isPathInside(root, canonical))) {
+		return { ok: false, error: "The workspace cwd is outside every configured sandbox.workspaceRoots entry; pass a repository cwd inside one of them." };
+	}
+	return { ok: true, cwd: canonical };
+}
+
 export type LaunchSpec = {
 	command: string;
 	args: string[];
@@ -398,6 +471,19 @@ export function resolveWorkerLaunch(
 		...(warning ? { warning } : {}),
 	});
 	if (config.mode === "off") return direct();
+
+	// Hard fail-closed overlap guard, even in preferred mode: a workspace bind
+	// that equals or contains the host home or the worker home would shadow the
+	// isolated HOME/token submounts (the cwd bind comes later in the plan) and
+	// expose the entire host home read-write. Never spawn, never fall back.
+	const hostHome = hostEnv.HOME ?? homedir();
+	const overlaps = (a: string, b: string) => a === b || isPathInside(a, b) || isPathInside(b, a);
+	if (overlaps(request.cwd, request.homeDir)) {
+		return { ok: false, error: "The workspace cwd overlaps the isolated worker home; pass a repository cwd inside a configured sandbox.workspaceRoots entry." };
+	}
+	if (request.cwd === hostHome || isPathInside(request.cwd, hostHome)) {
+		return { ok: false, error: "The workspace cwd would mount the host home directory read-write; pass a repository cwd inside a configured sandbox.workspaceRoots entry." };
+	}
 
 	const fail = (reason: string): WorkerLaunchResult =>
 		config.mode === "required"

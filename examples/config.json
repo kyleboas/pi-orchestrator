@@ -13,7 +13,8 @@
     "network": "host",
     "env": "allowlist",
     "envAllow": [],
-    "readOnlyPaths": []
+    "readOnlyPaths": [],
+    "workspaceRoots": ["~/code"]
   },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,

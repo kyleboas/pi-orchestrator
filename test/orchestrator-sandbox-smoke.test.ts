@@ -108,3 +108,53 @@ test("real bwrap: gateway token resolves at $HOME/.config/agent/gateway.token, n
 	}
 	resetSandboxProbeCacheForTesting();
 });
+
+test("real bwrap: a selected repo is writable while an ancestor home sentinel stays invisible", { skip: !enabled }, () => {
+	resetSandboxProbeCacheForTesting();
+	assert.ok(probeBwrap("bwrap").ok, "bwrap must be functional for this smoke test");
+
+	// Layout mirrors the live incident: a home-like ancestor holding a secret
+	// sentinel, a code root under it, and a selected repo inside that root.
+	// Only the repo may be mounted; the ancestor must stay invisible even
+	// though the repo bind comes after the isolated-home/token submounts.
+	const fakeHostHome = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-anchome-"));
+	const sentinel = join(fakeHostHome, "SECRET-SENTINEL.txt");
+	writeFileSync(sentinel, "must-not-be-visible\n");
+	const repo = join(fakeHostHome, "code", "myrepo");
+	mkdirSync(repo, { recursive: true });
+	const tokenSource = join(fakeHostHome, ".config", "agent", "gateway.token");
+	mkdirSync(dirname(tokenSource), { recursive: true });
+	writeFileSync(tokenSource, "fake-smoke-token\n");
+	const home = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-home-"));
+	try {
+		const launch = resolveWorkerLaunch(
+			{ ...DEFAULT_SANDBOX_CONFIG, mode: "required", env: "allowlist", workspaceRoots: [join(fakeHostHome, "code")] },
+			{
+				command: "sh",
+				args: ["-c", [
+					`pwd`,
+					`echo repo-write > written.txt && cat written.txt`,
+					`test ! -e '${sentinel}' && echo sentinel-invisible`,
+					`cat "$HOME/.config/agent/gateway.token"`,
+				].join("; ")],
+				cwd: repo,
+				envOverrides: {},
+				homeDir: home,
+				...piWorkerSandboxPlan(home, fakeHostHome),
+			},
+		);
+		assert.ok(launch.ok && launch.sandboxed, launch.ok ? "" : launch.error);
+		const run = spawnSync(launch.spec.command, launch.spec.args, { env: launch.spec.env, encoding: "utf8", timeout: 30_000 });
+		assert.equal(run.status, 0, run.stderr);
+		const lines = run.stdout.trim().split("\n");
+		assert.equal(lines[0], repo, "worker starts in the selected repo");
+		assert.equal(lines[1], "repo-write", "the selected repo is writable");
+		assert.equal(lines[2], "sentinel-invisible", "the ancestor home sentinel is not exposed");
+		assert.equal(lines[3], "fake-smoke-token", "the isolated-home token survives the workspace bind order");
+		assert.equal(readFileSync(join(repo, "written.txt"), "utf8"), "repo-write\n", "the write landed on the host repo");
+	} finally {
+		rmSync(fakeHostHome, { recursive: true, force: true });
+		rmSync(home, { recursive: true, force: true });
+	}
+	resetSandboxProbeCacheForTesting();
+});

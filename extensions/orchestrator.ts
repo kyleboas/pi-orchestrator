@@ -32,6 +32,7 @@ import {
 	createWorkerHomeDir,
 	piWorkerSandboxPlan,
 	resolveWorkerLaunch,
+	resolveWorkerWorkspace,
 	workerHomeDirPath,
 	type WorkerLaunchRequest,
 } from "./orchestrator-lib/orchestrator-sandbox.ts";
@@ -1097,11 +1098,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Independent workstreams may be delegated to different workers in one turn; they run in parallel. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Independent workstreams may be delegated to different workers in one turn; they run in parallel. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.${config.sandbox.mode !== "off" ? ` Sandboxed workers require a workspace: pass cwd as the exact repository directory, which must be inside a configured sandbox workspace root${config.sandbox.workspaceRoots.length ? ` (${config.sandbox.workspaceRoots.join(", ")})` : " (none are currently configured, so delegation will be rejected until one is added)"}. cwd is REQUIRED whenever this session's own cwd is outside those roots (e.g. a coordinator started in the home directory).` : ""}`,
 		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
 			task: Type.String({ description: "Implementation brief built from YOUR OWN investigation: state the root cause or design you already determined, the exact files and changes to make, edge cases, and the validation to run. Never ask the worker to 'diagnose', 'investigate', or 'find' something you already read — hand it your conclusions and acceptance criteria." }),
+			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. With the sandbox enabled it must be equal to or inside a configured sandbox workspace root; only this directory is mounted read-write. Required when the coordinator session cwd is outside the configured roots." })),
 			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
 			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
@@ -1115,9 +1117,14 @@ export default function orchestrator(pi: ExtensionAPI) {
 			const fallback = classifyTask(params.task);
 			const suppliedCategory: unknown = params.category;
 			const suppliedComplexity: unknown = params.complexity;
+			// Fail closed before any spawn: a cwd that is (or contains) the host
+			// home or falls outside the configured workspace roots must never be
+			// mounted; the coordinator is told exactly what to pass instead.
+			const workspace = resolveWorkerWorkspace(config.sandbox, typeof params.cwd === "string" ? params.cwd : undefined, ctx.cwd);
+			if (!workspace.ok) return content(`Delegation rejected: ${workspace.error}`);
 			let worker: Worker;
 			try {
-				worker = launchWorker(name, catalog[name]!, params.task, ctx.cwd, config, {
+				worker = launchWorker(name, catalog[name]!, params.task, workspace.cwd, config, {
 					rootTaskId,
 					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
 					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
