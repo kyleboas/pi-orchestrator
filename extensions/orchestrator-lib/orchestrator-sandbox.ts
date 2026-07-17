@@ -349,8 +349,18 @@ export function buildBwrapArgs(config: SandboxConfig, request: WorkerLaunchReque
 	for (const path of [...new Set(request.readOnlyTryPaths ?? [])]) args.push("--ro-bind-try", path, path);
 	args.push("--bind", request.homeDir, request.homeDir);
 	// File mounts land after the home bind: destinations inside the worker home
-	// must overlay it, not be shadowed by it.
-	for (const mount of request.fileMountsReadOnlyTry ?? []) args.push("--ro-bind-try", mount.source, mount.dest);
+	// must overlay it, not be shadowed by it. Each destination parent is created
+	// explicitly with --dir (inside the namespace only — the host filesystem is
+	// never touched) instead of relying on undocumented bind parent creation.
+	const fileMountParents = new Set<string>();
+	for (const mount of request.fileMountsReadOnlyTry ?? []) {
+		const parent = dirname(mount.dest);
+		if (!fileMountParents.has(parent)) {
+			fileMountParents.add(parent);
+			args.push("--dir", parent);
+		}
+		args.push("--ro-bind-try", mount.source, mount.dest);
+	}
 	args.push("--bind", request.cwd, request.cwd);
 	for (const path of [...new Set(request.readWritePaths ?? [])]) args.push("--bind", path, path);
 	args.push("--chdir", request.cwd);

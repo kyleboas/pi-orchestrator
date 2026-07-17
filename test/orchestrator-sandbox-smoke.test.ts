@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,10 +25,23 @@ test("real bwrap probe and sandboxed launch", { skip: !enabled }, () => {
 
 	const cwd = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-cwd-"));
 	const home = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-home-"));
+	// A file mounted at a nested destination whose parent does not exist inside
+	// the namespace: the argument plan must create the parent explicitly.
+	const sourceDir = mkdtempSync(join(tmpdir(), "pi-orchestrator-smoke-src-"));
+	const sourceFile = join(sourceDir, "auth.json");
+	writeFileSync(sourceFile, "smoke-secret\n");
+	const nestedDest = join(home, "pi-agent", "auth.json");
 	try {
 		const launch = resolveWorkerLaunch(
 			{ ...DEFAULT_SANDBOX_CONFIG, mode: "required", env: "allowlist" },
-			{ command: "sh", args: ["-c", "echo sandbox-ok; test ! -e /root; echo $HOME; pwd"], cwd, envOverrides: {}, homeDir: home },
+			{
+				command: "sh",
+				args: ["-c", `echo sandbox-ok; test ! -e /root; echo $HOME; pwd; cat '${nestedDest}'; if echo overwrite > '${nestedDest}' 2>/dev/null; then echo writable; else echo read-only; fi`],
+				cwd,
+				envOverrides: {},
+				homeDir: home,
+				fileMountsReadOnlyTry: [{ source: sourceFile, dest: nestedDest }],
+			},
 		);
 		assert.ok(launch.ok && launch.sandboxed);
 		const run = spawnSync(launch.spec.command, launch.spec.args, { env: launch.spec.env, encoding: "utf8", timeout: 30_000 });
@@ -37,9 +50,13 @@ test("real bwrap probe and sandboxed launch", { skip: !enabled }, () => {
 		assert.equal(lines[0], "sandbox-ok");
 		assert.equal(lines[1], home, "HOME is the isolated home");
 		assert.equal(lines[2], cwd, "cwd is the workspace");
+		assert.equal(lines[3], "smoke-secret", "nested file mount is readable despite a missing parent");
+		assert.equal(lines[4], "read-only", "nested file mount must reject writes");
+		assert.equal(readFileSync(sourceFile, "utf8"), "smoke-secret\n", "source file remains unchanged");
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 		rmSync(home, { recursive: true, force: true });
+		rmSync(sourceDir, { recursive: true, force: true });
 	}
 	resetSandboxProbeCacheForTesting();
 });

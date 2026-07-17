@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import {
 	DEFAULT_SANDBOX_CONFIG,
@@ -368,8 +368,9 @@ test("pi worker plan exposes only allowlisted files, never host .pi or broad con
 	);
 	assert.ok(launch.ok && launch.sandboxed);
 	const args = launch.spec.args;
-	// Negative argv assertions: private host state must not be mountable.
-	const mountTargets = args.filter((arg, index) => index > 0 && /bind/.test(args[index - 1] ?? "") || /bind/.test(args[index - 2] ?? ""));
+	// Negative argv assertions: private host state must never be a bind source
+	// or destination. (--dir targets are namespace-only creation, not mounts.)
+	const mountTargets = args.filter((_, index) => /--(?:ro-)?bind(?:-try)?$/.test(args[index - 1] ?? "") || /--(?:ro-)?bind(?:-try)?$/.test(args[index - 2] ?? ""));
 	for (const forbidden of [
 		"/home/user/.pi",
 		"/home/user/.pi/agent",
@@ -379,7 +380,7 @@ test("pi worker plan exposes only allowlisted files, never host .pi or broad con
 		"/home/user/.config/agent",
 		"/home/user/.config/pi",
 	]) {
-		assert.ok(!args.includes(forbidden), `must not mount ${forbidden}`);
+		assert.ok(!mountTargets.includes(forbidden), `must not mount ${forbidden}`);
 	}
 	assert.ok(mountTargets.includes("/home/user/.config/agent/gateway.token"), "only the exact token file is mounted");
 	assert.ok(args.includes(join(homeDir, "pi-agent", "auth.json")));
@@ -389,6 +390,27 @@ test("pi worker plan exposes only allowlisted files, never host .pi or broad con
 	assert.equal(launch.spec.env.PI_CODING_AGENT_DIR, join(homeDir, "pi-agent"));
 	// File mounts overlay the writable home, so they must come after its bind.
 	assert.ok(args.indexOf(join(homeDir, "pi-agent", "auth.json")) > args.indexOf(homeDir));
+});
+
+test("file mount destination parents are created explicitly, deduplicated, and ordered before their binds", () => {
+	const homeDir = "/home/user/.cache/pi-orchestrator/worker-homes/w1";
+	const plan = piWorkerSandboxPlan(homeDir, "/home/user");
+	const args = buildBwrapArgs(sandbox({ mode: "required" }), request({ homeDir, ...plan }), "/usr/bin/pi-real", []);
+	const isolatedDir = join(homeDir, "pi-agent");
+	// Two files share the isolated dir: exactly one --dir for it, plus one for
+	// the token's parent (namespace-only; the host ~/.config is never touched).
+	const dirTargets = args.flatMap((arg, index) => (arg === "--dir" ? [args[index + 1]!] : []));
+	assert.deepEqual(dirTargets, [isolatedDir, "/home/user/.config/agent"]);
+	// Ordering: home bind, then each destination's --dir strictly before its file bind.
+	const homeBind = args.indexOf(homeDir);
+	for (const mount of plan.fileMountsReadOnlyTry) {
+		// lastIndexOf: for same-path mounts (gateway.token) the dest slot is the
+		// later of the two identical source/dest argv entries.
+		const dirIndex = args.indexOf(dirname(mount.dest));
+		const bindIndex = args.lastIndexOf(mount.dest);
+		assert.ok(homeBind < dirIndex && dirIndex < bindIndex, `--dir for ${mount.dest} must sit between the home bind and the file bind`);
+		assert.equal(args[bindIndex - 2], "--ro-bind-try");
+	}
 });
 
 test("sandbox-only env overrides never leak into unsandboxed launches", () => {
