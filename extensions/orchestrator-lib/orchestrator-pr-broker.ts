@@ -2,14 +2,14 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import net from "node:net";
 
 /** The deliberately small opt-in authority delegated to a sandboxed worker. */
 export type PullRequestsConfig = { repositories: string[]; branchPrefixes: string[] };
 /** `branch` is deliberately absent until the first successful publish. */
 type GitMetadata = { entryDevice: number; entryInode: number; gitDir: string; configs: Array<{ path: string; device: number; inode: number; hash: string }> };
-export type PinnedPullRequestTarget = { workspace: string; repository: string; remoteUrl: string; defaultBranch: string; generation: string; device: number; inode: number; git?: GitMetadata; branch?: string };
+export type PinnedPullRequestTarget = { workspace: string; repository: string; remoteUrl: string; defaultBranch: string; generation: string; device: number; inode: number; git: GitMetadata; branch?: string };
 export type BrokerResult = { ok: boolean; message: string; repository?: string; branch?: string; defaultBranch?: string };
 export const PR_REQUEST_LIMIT = 16_384;
 export const PR_RESPONSE_LIMIT = 8_192;
@@ -89,17 +89,13 @@ function metadata(workspace: string): GitMetadata | undefined {
 	try {
 		const entry = join(workspace, ".git"), entryStat = lstatSync(entry);
 		if (entryStat.isSymbolicLink()) return undefined;
-		let gitDir: string;
-		if (entryStat.isDirectory()) gitDir = realpathSync(entry);
-		else if (entryStat.isFile()) { const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(entry, "utf8")); if (!match) return undefined; gitDir = realpathSync(resolve(dirname(entry), match[1]!)); }
-		else return undefined;
+		// A linked worktree's .git file points outside the mounted workspace. It is
+		// unusable in the worker sandbox, so broker eligibility fails closed.
+		if (!entryStat.isDirectory()) return undefined;
+		const gitDir = realpathSync(entry);
 		if (!statSync(gitDir).isDirectory()) return undefined;
-		let commonDir = gitDir; const common = join(gitDir, "commondir");
-		try { commonDir = realpathSync(resolve(gitDir, readFileSync(common, "utf8").trim())); } catch {}
 		const state = (path: string, required: boolean) => { try { const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("unsafe config"); const contents = readFileSync(path); if (/^\s*\[include(?:If)?\b/im.test(contents.toString("utf8"))) throw new Error("included config is not permitted"); return { path, device: stat.dev, inode: stat.ino, hash: createHash("sha256").update(contents).digest("hex") }; } catch { if (required) throw new Error("missing config"); return { path, device: -1, inode: -1, hash: "absent" }; } };
-		// Normal repos pin config once. Linked worktrees pin common config and
-		// the presence/content state of their optional config.worktree.
-		const configs = commonDir === gitDir ? [state(join(commonDir, "config"), true)] : [state(join(commonDir, "config"), true), state(join(gitDir, "config.worktree"), false)];
+		const configs = [state(join(gitDir, "config"), true)];
 		return { entryDevice: entryStat.dev, entryInode: entryStat.ino, gitDir, configs };
 	} catch { return undefined; }
 }
@@ -127,14 +123,14 @@ export function pinPullRequestTargetSync(cwd: string, policy: PullRequestsConfig
 	const remote = get("remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
 	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
 	const defaultBranch = syncDefaultBranch(parsed.repository, localDefault(get("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")));
-	return defaultBranch ? { ...file, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
+	return defaultBranch ? { ...file, git: file.git, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }
 export async function pinPullRequestTarget(cwd: string, policy: PullRequestsConfig, runner: BrokerRunner = defaultRunner): Promise<PinnedPullRequestTarget | undefined> {
 	const file = identity(cwd); if (!file || !file.git || (await line(runner, file.workspace, "rev-parse", "--is-inside-work-tree")) !== "true" || (await line(runner, file.workspace, "rev-parse", "--show-toplevel")) !== file.workspace) return undefined;
 	const remote = await line(runner, file.workspace, "remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
 	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
 	const ref = await line(runner, file.workspace, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"), defaultBranch = await resolveDefaultBranch(parsed.repository, localDefault(ref), runner);
-	return defaultBranch ? { ...file, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
+	return defaultBranch ? { ...file, git: file.git, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }
 async function currentAllowedBranch(target: PinnedPullRequestTarget, policy: PullRequestsConfig, runner: BrokerRunner): Promise<string | undefined> { const branch = await line(runner, target.workspace, "symbolic-ref", "--quiet", "--short", "HEAD"); return branch && branchAllowed(branch, policy, target.defaultBranch) ? branch : undefined; }
 
@@ -148,11 +144,11 @@ export type PullRequestBroker = { directory: string; target: PinnedPullRequestTa
 function validPublish(request: Record<string, unknown>): request is { generation: string; action: "publish"; title: string; body: string } { return Object.keys(request).every((key) => key === "generation" || key === "action" || key === "title" || key === "body") && request.action === "publish" && typeof request.generation === "string" && typeof request.title === "string" && request.title.length > 0 && request.title.length <= PR_TITLE_LIMIT && !/[\0\r\n]/.test(request.title) && typeof request.body === "string" && request.body.length <= PR_BODY_LIMIT && !/\0/.test(request.body); }
 
 export async function publishPullRequest(target: PinnedPullRequestTarget, policy: PullRequestsConfig, title: string, body: string, runner: BrokerRunner): Promise<BrokerResult> {
-	// Do this before any checkout Git command: .git/config and worktree links
-	// are worker-controlled paths after delegation.
-	if (!target.git || !sameMetadata(target.git, metadata(target.workspace))) return { ok: false, message: "Repository metadata no longer matches the delegated target." };
+	// Do this before any checkout Git command: .git and its config are
+	// worker-controlled paths after delegation.
+	if (!sameMetadata(target.git, metadata(target.workspace))) return { ok: false, message: "Repository metadata no longer matches the delegated target." };
 	const repinned = await pinPullRequestTarget(target.workspace, policy, runner);
-	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || !repinned.git || !sameMetadata(target.git, repinned.git) || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
+	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || !sameMetadata(target.git, repinned.git) || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
 	const branch = await currentAllowedBranch(target, policy, runner);
 	if (!branch || (target.branch && target.branch !== branch)) return { ok: false, message: target.branch ? "The pinned branch changed." : "Switch to an allowed non-default branch before publishing." };
 	const dirty = await git(runner, target.workspace, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none");

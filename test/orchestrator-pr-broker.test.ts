@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
@@ -19,7 +20,31 @@ import {
 
 const policy = { repositories: ["owner/repository"], branchPrefixes: ["feat/", "fix/"] };
 
-function gitWorkspace(prefix: string): string { const workspace = mkdtempSync(join(tmpdir(), prefix)); mkdirSync(join(workspace, ".git")); writeFileSync(join(workspace, ".git", "config"), "[core]\nrepositoryformatversion = 0\n"); return workspace; }
+function gitCommand(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env): string {
+	const result = spawnSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+	return result.stdout.trim();
+}
+
+/** A genuine repository with no network access: origin and origin/HEAD are local refs. */
+function gitWorkspace(prefix: string): string {
+	const workspace = mkdtempSync(join(tmpdir(), prefix));
+	gitCommand(workspace, ["init", "--initial-branch=main"]);
+	gitCommand(workspace, ["config", "user.name", "PR Broker Test"]);
+	gitCommand(workspace, ["config", "user.email", "broker@example.invalid"]);
+	writeFileSync(join(workspace, "tracked.txt"), "initial\n");
+	gitCommand(workspace, ["add", "tracked.txt"]);
+	gitCommand(workspace, ["commit", "-m", "initial"]);
+	gitCommand(workspace, ["remote", "add", "origin", "git@github.com:owner/repository.git"]);
+	gitCommand(workspace, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+	gitCommand(workspace, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+	return workspace;
+}
+
+function actualRunner(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
+	const result = spawnSync(command, args, { cwd: options.cwd, env: options.env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	return Promise.resolve({ ok: result.status === 0, stdout: result.stdout ?? "" });
+}
 
 function request(path: string, value: unknown): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
@@ -45,7 +70,11 @@ test("only canonical GitHub origins and safe non-default prefix branches qualify
 });
 
 test("broker socket is generation-bound, mode-restricted, and exposes no arbitrary operation", async () => {
-	const target: PinnedPullRequestTarget = { workspace: "/trusted/repo", repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", branch: "feat/broker", defaultBranch: "main", generation: "one", device: 1, inode: 2 };
+	const workspace = gitWorkspace("pio-pr-socket-");
+	gitCommand(workspace, ["switch", "-c", "feat/broker"]);
+	const pinned = await pinPullRequestTarget(workspace, policy);
+	assert.ok(pinned?.git);
+	const target: PinnedPullRequestTarget = { ...pinned, branch: "feat/broker", generation: "one" };
 	const broker = startPullRequestBroker(target, policy);
 	try {
 		await broker.ready;
@@ -55,7 +84,7 @@ test("broker socket is generation-bound, mode-restricted, and exposes no arbitra
 		assert.equal((await request(`${broker.directory}/broker.sock`, { generation: "old", action: "status" })).ok, false);
 		assert.equal((await request(`${broker.directory}/broker.sock`, { generation: "one", action: "merge" })).ok, false);
 		assert.equal((await request(`${broker.directory}/broker.sock`, { generation: "one", action: "publish", title: "x", body: "", remote: "evil" })).ok, false);
-	} finally { await broker.cleanup(); }
+	} finally { await broker.cleanup(); rmSync(workspace, { recursive: true, force: true }); }
 });
 
 test("publish uses only fixed git/gh argv and canonical remote with credential-free worker-facing output", async () => {
@@ -222,15 +251,113 @@ test("cleanup during a publish is idempotent and waits for the active handler", 
 	} finally { release?.(); await broker.cleanup(); rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("real metadata pin rejects .git/config replacement before a broker Git command", async () => {
-	const workspace = gitWorkspace("pio-pr-metadata-"); let calls = 0;
-	const runner = async (_command: string, args: string[]) => { calls++; const joined = args.join(" "); if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" }; if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace }; if (joined.includes("remote get-url origin")) return { ok: true, stdout: "git@github.com:owner/repository.git" }; if (joined.includes("refs/remotes/origin/HEAD")) return { ok: true, stdout: "origin/main" }; return { ok: false, stdout: "" }; };
-	try { const target = await pinPullRequestTarget(workspace, policy, runner); assert.ok(target); writeFileSync(join(workspace, ".git", "config"), "[core]\nrepositoryformatversion = 1\n"); calls = 0; assert.equal((await publishPullRequest(target!, policy, "t", "b", runner)).ok, false); assert.equal(calls, 0); } finally { rmSync(workspace, { recursive: true, force: true }); }
+test("a real repository pins and ordinary commits and refs do not change metadata", async () => {
+	const workspace = gitWorkspace("pio-pr-real-pin-");
+	try {
+		const target = await pinPullRequestTarget(workspace, policy);
+		assert.ok(target?.git);
+		const metadata = target.git;
+		gitCommand(workspace, ["switch", "-c", "feat/ordinary"]);
+		appendFileSync(join(workspace, "tracked.txt"), "next\n");
+		gitCommand(workspace, ["add", "tracked.txt"]);
+		gitCommand(workspace, ["commit", "-m", "ordinary change"]);
+		gitCommand(workspace, ["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+		assert.deepEqual(gitMetadataForTesting(workspace), metadata);
+		const repinned = await pinPullRequestTarget(workspace, policy);
+		assert.ok(repinned?.git);
+		assert.deepEqual(repinned.git, metadata);
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
-test("local include config is rejected at pin time", async () => {
-	const workspace = gitWorkspace("pio-pr-include-"); writeFileSync(join(workspace, ".git", "config"), "[include]\npath = /tmp/evil\n");
-	try { assert.equal(await pinPullRequestTarget(workspace, policy, async () => ({ ok: true, stdout: "true" })), undefined); } finally { rmSync(workspace, { recursive: true, force: true }); }
+test("real linked worktrees fail closed because the sandbox cannot mount their gitdir", async () => {
+	const workspace = gitWorkspace("pio-pr-worktree-main-");
+	const parent = mkdtempSync(join(tmpdir(), "pio-pr-worktree-linked-"));
+	const linked = join(parent, "checkout");
+	try {
+		gitCommand(workspace, ["worktree", "add", "-b", "feat/linked", linked]);
+		assert.equal(statSync(join(linked, ".git")).isFile(), true);
+		assert.equal(gitMetadataForTesting(linked), undefined);
+		assert.equal(await pinPullRequestTarget(linked, policy), undefined);
+	} finally { rmSync(parent, { recursive: true, force: true }); rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("replacement or symlink conversion of .git is rejected before broker commands", async () => {
+	for (const symlink of [false, true]) {
+		const workspace = gitWorkspace("pio-pr-git-entry-"); let calls = 0;
+		try {
+			const target = await pinPullRequestTarget(workspace, policy); assert.ok(target);
+			const saved = join(workspace, ".git-saved"); renameSync(join(workspace, ".git"), saved);
+			if (symlink) symlinkSync(saved, join(workspace, ".git"), "dir");
+			else { mkdirSync(join(workspace, ".git")); writeFileSync(join(workspace, ".git", "config"), readFileSync(join(saved, "config"))); }
+			const workspaceIdentity = statSync(workspace); assert.equal(workspaceIdentity.ino, target.inode);
+			const result = await publishPullRequest(target, policy, "t", "b", async () => { calls++; return { ok: false, stdout: "" }; });
+			assert.equal(result.ok, false); assert.equal(calls, 0);
+		} finally { rmSync(workspace, { recursive: true, force: true }); }
+	}
+});
+
+test("in-place config changes are rejected before broker commands", async () => {
+	const workspace = gitWorkspace("pio-pr-config-change-"); let calls = 0;
+	try {
+		const target = await pinPullRequestTarget(workspace, policy); assert.ok(target);
+		const config = join(workspace, ".git", "config"), inode = statSync(config).ino;
+		appendFileSync(config, "\n[core]\n\tbare = false\n");
+		assert.equal(statSync(config).ino, inode, "the test mutates the pinned config inode in place");
+		assert.equal((await publishPullRequest(target, policy, "t", "b", async () => { calls++; return { ok: false, stdout: "" }; })).ok, false);
+		assert.equal(calls, 0);
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("local include and includeIf config are rejected at pin time", async () => {
+	for (const section of ["[include]\npath = /tmp/evil\n", "[includeIf \"gitdir:/tmp/**\"]\npath = /tmp/evil\n"]) {
+		const workspace = gitWorkspace("pio-pr-include-");
+		try { appendFileSync(join(workspace, ".git", "config"), section); assert.equal(await pinPullRequestTarget(workspace, policy), undefined); }
+		finally { rmSync(workspace, { recursive: true, force: true }); }
+	}
+});
+
+test("explicit real status finds untracked files despite status.showUntrackedFiles=no", async () => {
+	const workspace = gitWorkspace("pio-pr-untracked-"); const mutations: string[] = [];
+	try {
+		gitCommand(workspace, ["config", "status.showUntrackedFiles", "no"]);
+		gitCommand(workspace, ["switch", "-c", "feat/untracked"]);
+		const target = await pinPullRequestTarget(workspace, policy); assert.ok(target);
+		writeFileSync(join(workspace, "untracked.txt"), "must be detected\n");
+		const runner = async (command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) => {
+			if (command === "gh" || args.includes("clone") || args.includes("push")) { mutations.push(`${command}:${args.join(" ")}`); return { ok: false, stdout: "" }; }
+			return actualRunner(command, args, options);
+		};
+		const result = await publishPullRequest(target, policy, "t", "b", runner);
+		assert.equal(result.ok, false); assert.match(result.message, /tracked and untracked/); assert.deepEqual(mutations, []);
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("hostile local Git config cannot execute commands or influence trusted clone", async () => {
+	const workspace = gitWorkspace("pio-pr-hostile-");
+	const markerRoot = mkdtempSync(join(tmpdir(), "pio-pr-marker-")), marker = join(markerRoot, "executed"), command = join(markerRoot, "marker-command");
+	const hooks = join(markerRoot, "hooks"); mkdirSync(hooks);
+	const script = `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed')\n`;
+	writeFileSync(command, script, { mode: 0o700 }); writeFileSync(join(hooks, "post-checkout"), script, { mode: 0o700 });
+	const calls: Array<{ command: string; args: string[]; cwd?: string; env?: NodeJS.ProcessEnv }> = [];
+	try {
+		gitCommand(workspace, ["switch", "-c", "feat/hostile"]);
+		gitCommand(workspace, ["config", "url.file:///definitely-not-a-remote.insteadOf", "marker:"]);
+		gitCommand(workspace, ["config", "core.sshCommand", command]);
+		gitCommand(workspace, ["config", "core.hooksPath", hooks]);
+		gitCommand(workspace, ["config", "core.fsmonitor", command]);
+		const target = await pinPullRequestTarget(workspace, policy); assert.ok(target);
+		const runner = async (cmd: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) => {
+			calls.push({ command: cmd, args, cwd: options.cwd, env: options.env });
+			if (cmd === "gh" || args.includes("fetch") || args.includes("ls-remote") || args.includes("push")) return { ok: false, stdout: "" };
+			return actualRunner(cmd, args, options);
+		};
+		assert.equal((await publishPullRequest(target, policy, "t", "b", runner)).ok, false);
+		const clone = calls.find((call) => call.command === "git" && call.args.includes("clone"));
+		assert.ok(clone && clone.cwd !== workspace && clone.env?.GIT_ALLOW_PROTOCOL === "file" && clone.env.GIT_PROTOCOL_FROM_USER === "0");
+		assert.ok(clone.args.includes("protocol.file.allow=always") && clone.args.includes("protocol.ssh.allow=never") && clone.args.includes("protocol.https.allow=never"));
+		assert.equal(existsSync(marker), false);
+		assert.equal(calls.some((call) => call.args.includes("push") || call.command === "gh"), false);
+	} finally { rmSync(markerRoot, { recursive: true, force: true }); rmSync(workspace, { recursive: true, force: true }); }
 });
 
 test("broker request bound is finite", () => {
