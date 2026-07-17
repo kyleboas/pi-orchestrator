@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { GATEWAY_PI_PROVIDER, GATEWAY_PLACEHOLDER, SANDBOX_GATEWAY_BASE_URL, buildHostRelayBwrapArgs, claudeGatewayEnv, gatewayPiModel, startGatewayRelay, validateGatewayTokenFile, writeGatewayPiModels } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
+import { GATEWAY_PI_PROVIDER, GATEWAY_PLACEHOLDER, SANDBOX_GATEWAY_BASE_URL, buildHostRelayBwrapArgs, claudeGatewayEnv, effectiveWorkerModel, gatewayPiModel, startGatewayRelay, validateGatewayTokenFile, writeGatewayPiModels } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
 import { buildBwrapArgs, DEFAULT_SANDBOX_CONFIG, parseSandboxConfig, piWorkerSandboxPlan, resolveWorkerLaunch } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
 
 function requestUds(socketPath: string, body: string, path = "/v1/messages", method = "POST"): Promise<{ status: number; body: string }> {
@@ -36,6 +36,14 @@ test("gateway config accepts only an HTTP loopback origin and safe absolute toke
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", model: "../escape" } },
     { network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/x", model: "bad model" } },
   ]) assert.equal(parseSandboxConfig(bad), undefined);
+});
+
+test("gateway model selection never forwards worker provider IDs or Claude-expanded aliases", () => {
+  const gateway = { model: "coding-main" };
+  assert.equal(effectiveWorkerModel("openai-codex/gpt-5.6-luna", gateway), "coding-main");
+  assert.equal(effectiveWorkerModel("claude-haiku-4-5-20251001", gateway), "coding-main");
+  assert.equal(effectiveWorkerModel("claude-sonnet-5", gateway), "coding-main");
+  assert.equal(effectiveWorkerModel("openai-codex/gpt-5.6-luna"), "openai-codex/gpt-5.6-luna");
 });
 
 test("host relay mount plan is minimal and token validation rejects links and loose permissions", () => {

@@ -37,7 +37,7 @@ import {
 	workerHomeDirPath,
 	type WorkerLaunchRequest,
 } from "./orchestrator-lib/orchestrator-sandbox.ts";
-import { claudeGatewayEnv, gatewayPiModel, startGatewayRelay, writeGatewayPiModels } from "./orchestrator-lib/orchestrator-gateway.ts";
+import { claudeGatewayEnv, effectiveWorkerModel, gatewayPiModel, startGatewayRelay, writeGatewayPiModels } from "./orchestrator-lib/orchestrator-gateway.ts";
 import {
 	earliestAccountReset,
 	isUsageLimitText,
@@ -520,7 +520,7 @@ function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig
 	return spawnWorkerChild(
 		workerKey,
 		config.commands.claude,
-		[...claudeCodeArgs(gateway ? config.sandbox.gateway!.model : model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
+		[...claudeCodeArgs(effectiveWorkerModel(model, config.sandbox.gateway)), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
 		gateway
 			? claudeGatewayEnv(resolve(workerHomeDirPath(workerKey), ".claude-gateway"))
@@ -628,7 +628,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	const account = profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const gateway = config.sandbox.network === "gateway";
 	const spawned = profile.backend === "pi-rpc"
-		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(gateway ? { ...profile, model: gatewayPiModel(config.sandbox.gateway!.model) } : profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, {
+		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(gateway ? { ...profile, model: gatewayPiModel(effectiveWorkerModel(profile.model, config.sandbox.gateway)) } : profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, {
 			...piWorkerSandboxPlan(workerHomeDirPath(id), homedir(), gateway),
 			...(gateway ? { gatewayPiModel: config.sandbox.gateway!.model } : {}),
 		})
