@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { Type } from "typebox";
 import {
 	AssistantMessageComponent,
@@ -25,6 +27,12 @@ import {
 	parseClaudeStreamLine,
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
+import {
+	cleanupWorkerHomeDir,
+	createWorkerHomeDir,
+	resolveWorkerLaunch,
+	workerHomeDirPath,
+} from "./orchestrator-lib/orchestrator-sandbox.ts";
 import {
 	earliestAccountReset,
 	isUsageLimitText,
@@ -434,18 +442,73 @@ function handleClaudeLine(worker: Worker, line: string, config?: OrchestratorCon
 	}
 }
 
-function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig, accountDir?: string, resumeSessionId?: string) {
+/** A sandbox-policy rejection: the worker process was never spawned. */
+class WorkerLaunchRejected extends Error {}
+
+type SpawnedWorkerChild = {
+	child: Worker["process"];
+	sandboxed: boolean;
+	warning?: string;
+};
+
+/**
+ * Single spawn path for every worker process (initial Pi RPC, initial Claude,
+ * and Claude failover respawns) so sandbox policy cannot be bypassed by one
+ * call site. Throws WorkerLaunchRejected when the policy fails closed.
+ */
+function spawnWorkerChild(
+	workerKey: string,
+	command: string,
+	args: string[],
+	cwd: string,
+	envOverrides: Record<string, string>,
+	config: OrchestratorConfig,
+	hostEnv: NodeJS.ProcessEnv,
+	paths: { readOnlyTryPaths?: string[]; readWritePaths?: string[] } = {},
+): SpawnedWorkerChild {
+	const homeDir = workerHomeDirPath(workerKey);
+	const launch = resolveWorkerLaunch(config.sandbox, { command, args, cwd, envOverrides, homeDir, ...paths }, hostEnv);
+	if (!launch.ok) throw new WorkerLaunchRejected(launch.error);
+	if (launch.sandboxed) createWorkerHomeDir(homeDir);
+	const child = spawn(launch.spec.command, launch.spec.args, {
+		cwd,
+		env: launch.spec.env,
+		stdio: ["pipe", "pipe", "pipe"] as const,
+	});
+	if (launch.sandboxed) {
+		const clean = () => cleanupWorkerHomeDir(homeDir);
+		child.once("exit", clean);
+		child.once("error", clean);
+	}
+	return { child, sandboxed: launch.sandboxed, ...(launch.warning ? { warning: launch.warning } : {}) };
+}
+
+/** Host config dirs a sandboxed Pi worker needs read-only to authenticate and resolve models. */
+function piWorkerReadOnlyTryPaths(): string[] {
+	return [resolve(homedir(), ".pi"), resolve(homedir(), ".config/pi"), resolve(homedir(), ".config/agent")];
+}
+
+function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig, workerKey: string, accountDir?: string, resumeSessionId?: string): SpawnedWorkerChild {
 	// An inherited CLAUDE_CONFIG_DIR (e.g. pi launched from a shell that set
 	// one) must not pin every worker to a single account: account choice
 	// belongs to the orchestrator's rotation, or to the launcher's own.
-	const env: NodeJS.ProcessEnv = { ...process.env, PI_ORCHESTRATOR_WORKER: "1" };
-	delete env.CLAUDE_CONFIG_DIR;
-	if (accountDir) env.CLAUDE_CONFIG_DIR = accountDir;
-	return spawn(config.commands.claude, [...claudeCodeArgs(model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])], {
+	const hostEnv: NodeJS.ProcessEnv = { ...process.env };
+	delete hostEnv.CLAUDE_CONFIG_DIR;
+	// A sandboxed worker's isolated HOME has no ~/.claude, so the selected
+	// account directory (or the host default) is mounted and pinned explicitly.
+	// That directory's credentials remain visible to that worker until a
+	// gateway-based auth relay replaces direct provider credentials.
+	const effectiveAccountDir = accountDir ?? (config.sandbox.mode !== "off" ? resolve(homedir(), ".claude") : undefined);
+	return spawnWorkerChild(
+		workerKey,
+		config.commands.claude,
+		[...claudeCodeArgs(model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
-		env,
-		stdio: ["pipe", "pipe", "pipe"] as const,
-	});
+		{ PI_ORCHESTRATOR_WORKER: "1", ...(effectiveAccountDir ? { CLAUDE_CONFIG_DIR: effectiveAccountDir } : {}) },
+		config,
+		hostEnv,
+		effectiveAccountDir ? { readWritePaths: [effectiveAccountDir] } : {},
+	);
 }
 
 /** Attach stream handlers to a (possibly replacement) child; stale children's late events are ignored. */
@@ -505,7 +568,18 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	} catch {
 		// The limited process may already be gone.
 	}
-	const child = spawnClaudeChild(worker.profile.model, worker.cwd, config, pick.configDir, worker.claudeSessionId);
+	let spawned: SpawnedWorkerChild;
+	try {
+		spawned = spawnClaudeChild(worker.profile.model, worker.cwd, config, worker.id, pick.configDir, worker.claudeSessionId);
+	} catch (error) {
+		if (error instanceof WorkerLaunchRejected) {
+			failWorker(worker, `Account failover was rejected: ${error.message}`, "unavailable");
+			return true; // Handled: the worker is already failed, no double-report.
+		}
+		throw error;
+	}
+	const child = spawned.child;
+	if (spawned.warning) recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
 	worker.process = child;
 	worker.buffer = "";
 	worker.pendingTurns = 0;
@@ -529,13 +603,10 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
-	const child = profile.backend === "pi-rpc"
-		? spawn(config.commands.pi, piRpcWorkerArgs(profile), {
-			cwd,
-			env: { ...process.env, PI_ORCHESTRATOR_WORKER: "1" },
-			stdio: ["pipe", "pipe", "pipe"],
-		})
-		: spawnClaudeChild(profile.model, cwd, config, account?.configDir);
+	const spawned = profile.backend === "pi-rpc"
+		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, { readOnlyTryPaths: piWorkerReadOnlyTryPaths() })
+		: spawnClaudeChild(profile.model, cwd, config, id, account?.configDir);
+	const child = spawned.child;
 	const worker: Worker = {
 		id,
 		name,
@@ -560,6 +631,10 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 	wireWorkerChild(worker, child, config);
+	if (spawned.warning) {
+		worker.sandboxWarning = spawned.warning;
+		recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
+	}
 	if (profile.backend === "claude-code" && config.claudeAccounts && !account) {
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
@@ -1032,13 +1107,22 @@ export default function orchestrator(pi: ExtensionAPI) {
 			const fallback = classifyTask(params.task);
 			const suppliedCategory: unknown = params.category;
 			const suppliedComplexity: unknown = params.complexity;
-			const worker = launchWorker(name, catalog[name]!, params.task, ctx.cwd, config, {
-				rootTaskId,
-				...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
-				category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
-				complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
-			});
-			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
+			let worker: Worker;
+			try {
+				worker = launchWorker(name, catalog[name]!, params.task, ctx.cwd, config, {
+					rootTaskId,
+					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
+					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
+					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
+				});
+			} catch (error) {
+				// Fail closed and visibly: a required-sandbox rejection never spawns
+				// an unsandboxed worker and never silently degrades.
+				if (error instanceof WorkerLaunchRejected) return content(`Delegation rejected: ${error.message}`);
+				throw error;
+			}
+			const sandboxNote = worker.sandboxWarning ? ` WARNING: ${worker.sandboxWarning}` : "";
+			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.${sandboxNote}`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
 		},
 	});
 
