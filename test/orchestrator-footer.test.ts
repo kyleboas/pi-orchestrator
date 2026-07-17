@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
 import { renderBaseFooter } from "../extensions/orchestrator-lib/orchestrator-footer.ts";
 
+const fixtureHome = homedir();
 const ctx = {
-	cwd: "/home/kyle",
+	cwd: fixtureHome,
 	model: { id: "gpt-5.6-sol", provider: "openai-codex", reasoning: true, contextWindow: 272_000 },
 	sessionManager: {
-		getCwd: () => "/home/kyle",
+		getCwd: () => fixtureHome,
 		getSessionName: () => undefined,
 		getEntries: () => [{
 			type: "message",

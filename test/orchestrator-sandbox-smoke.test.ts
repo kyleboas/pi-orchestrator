@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -9,8 +9,10 @@ import {
 	piWorkerSandboxPlan,
 	probeBwrap,
 	resetSandboxProbeCacheForTesting,
+	resolveWorkerCommand,
 	resolveWorkerLaunch,
 } from "../extensions/orchestrator-lib/orchestrator-sandbox.ts";
+import { GATEWAY_PLACEHOLDER, startGatewayRelay } from "../extensions/orchestrator-lib/orchestrator-gateway.ts";
 
 /**
  * Opt-in smoke test against a real bubblewrap install:
@@ -18,6 +20,12 @@ import {
  * Regular `npm test` skips it so CI and hosts without bwrap stay green.
  */
 const enabled = process.env.PI_ORCHESTRATOR_BWRAP_SMOKE === "1";
+const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+function waitForFile(path: string): void {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) { try { readFileSync(path); return; } catch {} Atomics.wait(waitBuffer, 0, 0, 10); }
+	throw new Error("smoke helper readiness timed out");
+}
 
 test("real bwrap probe and sandboxed launch", { skip: !enabled }, () => {
 	resetSandboxProbeCacheForTesting();
@@ -157,4 +165,54 @@ test("real bwrap: a selected repo is writable while an ancestor home sentinel st
 		rmSync(home, { recursive: true, force: true });
 	}
 	resetSandboxProbeCacheForTesting();
+});
+
+
+test("real bwrap: gateway-only loopback has zero caps, streaming relay, blocked egress, immutable UDS, and no secrets", { skip: !enabled }, async () => {
+	resetSandboxProbeCacheForTesting();
+	assert.ok(probeBwrap("bwrap").ok, "bwrap must be functional");
+	const root = mkdtempSync(join(tmpdir(), "pio-gateway-smoke-"));
+	const cwd = join(root, "work"); const home = join(root, "home"); const runtime = join(root, "runtime");
+	mkdirSync(cwd); mkdirSync(home); mkdirSync(runtime);
+	const tokenFile = join(root, "token"); writeFileSync(tokenFile, "fake-only-smoke-token\n", { mode: 0o600 }); chmodSync(tokenFile, 0o600);
+	const sentinel = join(root, "SECRET-HOST-FILE"); writeFileSync(sentinel, "invisible\n");
+	const ready = join(root, "upstream-ready");
+	const port = 20_000 + Math.floor(Math.random() * 20_000);
+	const upstreamScript = join(root, "upstream.mjs");
+	writeFileSync(upstreamScript, `import http from "node:http";import{writeFileSync}from"node:fs";const s=http.createServer((q,r)=>{if(q.headers.authorization!=="Bearer fake-only-smoke-token"){r.writeHead(401);r.end();return}let b="";q.on("data",c=>b+=c);q.on("end",()=>{r.writeHead(200,{"content-type":"text/event-stream"});r.write("data: "+b+"\\n\\n");setTimeout(()=>r.end("data: done\\n\\n"),10)})});s.listen(${port},"127.0.0.1",()=>writeFileSync(${JSON.stringify(ready)},"ready"));`);
+	const upstream = spawn(process.execPath, [upstreamScript], { stdio: "ignore" });
+	let relay: ReturnType<typeof startGatewayRelay> | undefined;
+	try {
+		// Kernel-level proof for this host: root in the same user/net namespace
+		// shape reaches a read-only-mounted UDS as Kyle's host uid via SO_PEERCRED.
+		const peerDir = join(root, "peer"); mkdirSync(peerDir, { mode: 0o700 });
+		const peerSocket = join(peerDir, "s"); const peerResult = join(root, "peer-result"); const peerReady = join(root, "peer-ready");
+		const peerServer = join(root, "peer.py");
+		writeFileSync(peerServer, `import socket,struct\ns=socket.socket(socket.AF_UNIX);s.bind(${JSON.stringify(peerSocket)});s.listen(1);open(${JSON.stringify(peerReady)},'w').write('1');c,_=s.accept();p=c.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12);open(${JSON.stringify(peerResult)},'w').write(str(struct.unpack('3i',p)[1]));c.close();s.close()\n`);
+		const peer = spawn("/usr/bin/python3", [peerServer], { stdio: "ignore" }); waitForFile(peerReady);
+		assert.deepEqual(readdirSync(peerDir), ["s"]);
+		const peerRun = spawnSync("bwrap", ["--die-with-parent", "--unshare-user", "--uid", "0", "--gid", "0", "--unshare-net", "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64", "--ro-bind", peerDir, "/peer", "--proc", "/proc", "--dev", "/dev", "/usr/bin/python3", "-c", "import socket;s=socket.socket(socket.AF_UNIX);s.connect('/peer/s');s.close()"]);
+		assert.equal(peerRun.status, 0); waitForFile(peerResult); assert.equal(Number(readFileSync(peerResult, "utf8")), process.getuid?.()); peer.kill();
+		waitForFile(ready);
+		relay = startGatewayRelay("smoke", { upstreamUrl: `http://127.0.0.1:${port}`, tokenFile }, runtime);
+		const workerScript = join(cwd, "worker.mjs");
+		writeFileSync(workerScript, `import http from"node:http";import{readFileSync,writeFileSync}from"node:fs";const caps=Object.fromEntries(readFileSync("/proc/self/status","utf8").split("\\n").filter(x=>x.startsWith("Cap")).map(x=>x.split(":").map(y=>y.trim())));const request=(host,port,timeout=500)=>new Promise(ok=>{const q=http.request({host,port,path:"/v1/messages",method:"POST",timeout},r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>ok({ok:true,b}))});q.on("timeout",()=>q.destroy());q.on("error",()=>ok({ok:false}));q.end("stream")});const good=await request("127.0.0.1",4000);const external=await request("192.0.2.1",80);const other=await request("127.0.0.1",4001);let immutable=false;try{writeFileSync("/g/x","x")}catch{immutable=true}let secret=false;try{readFileSync(${JSON.stringify(sentinel)}) ;secret=true}catch{}console.log(JSON.stringify({caps,good,external,other,immutable,secret,placeholder:process.env.ANTHROPIC_AUTH_TOKEN}));`);
+		const node = resolveWorkerCommand(process.execPath)!;
+		const config = { ...DEFAULT_SANDBOX_CONFIG, mode: "required", network: "gateway", env: "allowlist", gateway: { upstreamUrl: `http://127.0.0.1:${port}`, tokenFile } } as const;
+		const launch = resolveWorkerLaunch(config, {
+			command: process.execPath, args: [workerScript], cwd, homeDir: home,
+			envOverrides: { ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER },
+			gateway: { relayDirectory: relay.directory, nodePath: process.execPath, nodeRoot: node.readOnlyRoots[0]!, bootstrapPath: relay.bootstrapPath, entrypointPath: relay.entrypointPath },
+		}, process.env);
+		assert.ok(launch.ok && launch.sandboxed, launch.ok ? "" : launch.error);
+		const run = spawnSync(launch.spec.command, launch.spec.args, { env: launch.spec.env, encoding: "utf8", timeout: 30_000 });
+		assert.equal(run.status, 0, run.stderr);
+		const result = JSON.parse(run.stdout.trim());
+		assert.deepEqual(Object.values(result.caps), ["0000000000000000", "0000000000000000", "0000000000000000", "0000000000000000", "0000000000000000"]);
+		assert.deepEqual(result.good, { ok: true, b: "data: stream\n\ndata: done\n\n" });
+		assert.equal(result.external.ok, false); assert.equal(result.other.ok, false);
+		assert.equal(result.immutable, true); assert.equal(result.secret, false); assert.equal(result.placeholder, GATEWAY_PLACEHOLDER);
+	} finally {
+		if (relay) await relay.cleanup(); upstream.kill(); rmSync(root, { recursive: true, force: true }); resetSandboxProbeCacheForTesting();
+	}
 });

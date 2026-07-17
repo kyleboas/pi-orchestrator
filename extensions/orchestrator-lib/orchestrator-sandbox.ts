@@ -4,13 +4,16 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type SandboxMode = "off" | "preferred" | "required";
-export type SandboxNetwork = "host" | "none";
+export type SandboxNetwork = "host" | "none" | "gateway";
+export type GatewayConfig = { upstreamUrl: string; tokenFile: string };
 export type SandboxEnvPolicy = "inherit" | "allowlist";
 
 export type SandboxConfig = {
 	mode: SandboxMode;
-	/** "host" shares host networking (required for a 127.0.0.1 gateway); "none" must actually unshare the network namespace. */
+	/** host preserves legacy networking; none has no network; gateway exposes only a trusted loopback relay. */
 	network: SandboxNetwork;
+	/** Public gateway routing config. The token value is never configuration. */
+	gateway?: GatewayConfig;
 	env: SandboxEnvPolicy;
 	/** Additional environment variable NAMES (never values) passed through under the allowlist policy. */
 	envAllow: string[];
@@ -48,8 +51,9 @@ export const INVALID_SANDBOX_CONFIG: SandboxConfig = {
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MODES = new Set<SandboxMode>(["off", "preferred", "required"]);
-const NETWORKS = new Set<SandboxNetwork>(["host", "none"]);
+const NETWORKS = new Set<SandboxNetwork>(["host", "none", "gateway"]);
 const ENV_POLICIES = new Set<SandboxEnvPolicy>(["inherit", "allowlist"]);
+const CREDENTIAL_ENV_NAME = /(TOKEN|KEY|SECRET|AUTH|PASSWORD|PASSWD|COOKIE|CREDENTIAL|ACCOUNT)/i;
 
 /**
  * Conservative environment names that carry no credentials by convention.
@@ -96,6 +100,24 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 	if (!MODES.has(mode as SandboxMode)) return undefined;
 	const network = raw.network === undefined ? "host" : raw.network;
 	if (!NETWORKS.has(network as SandboxNetwork)) return undefined;
+	let gateway: GatewayConfig | undefined;
+	if (raw.gateway !== undefined) {
+		if (!raw.gateway || typeof raw.gateway !== "object" || Array.isArray(raw.gateway)) return undefined;
+		const value = raw.gateway as Record<string, unknown>;
+		if (Object.keys(value).some((key) => key !== "upstreamUrl" && key !== "tokenFile")) return undefined;
+		if (!nonempty(value.tokenFile) || value.tokenFile.split("/").includes("..")) return undefined;
+		const tokenFile = safePath(value.tokenFile);
+		if (!tokenFile || tokenFile === "/" || tokenFile.endsWith("/") || tokenFile.split("/").includes("..")) return undefined;
+		if (!nonempty(value.upstreamUrl) || /[\r\n\0]/.test(value.upstreamUrl)) return undefined;
+		let url: URL;
+		try { url = new URL(value.upstreamUrl); } catch { return undefined; }
+		if (url.protocol !== "http:" || url.username || url.password || !["127.0.0.1", "[::1]"].includes(url.hostname) || (url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) return undefined;
+		gateway = { upstreamUrl: url.href.replace(/\/$/, ""), tokenFile };
+	}
+	if ((network === "gateway") !== !!gateway) return undefined;
+	// Gateway is a containment mode, never a modifier for a legacy direct spawn.
+	// Rejecting this combination also guarantees no relay is created for mode:off.
+	if (network === "gateway" && mode === "off") return undefined;
 	// An explicitly enabled sandbox defaults to the credential-safe allowlist;
 	// only mode "off" (legacy direct spawn) defaults to full inheritance.
 	const env = raw.env === undefined ? (mode === "off" ? "inherit" : "allowlist") : raw.env;
@@ -131,6 +153,7 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 	return {
 		mode: mode as SandboxMode,
 		network: network as SandboxNetwork,
+		...(gateway ? { gateway } : {}),
 		env: env as SandboxEnvPolicy,
 		envAllow,
 		readOnlyPaths,
@@ -276,8 +299,12 @@ export type WorkerLaunchRequest = {
 	homeDir: string;
 	/** Host paths bound read-only if they exist; absence is tolerated. */
 	readOnlyTryPaths?: string[];
-	/** Individual files bound read-only if they exist (narrow credential/config allowlists, never whole directories). */
+	/** Individual files bound read-only if they exist (legacy narrow credential/config allowlists). */
 	fileMountsReadOnlyTry?: SandboxFileMount[];
+	/** Required individual read-only files; gateway mode uses these and fails on absence. */
+	fileMountsReadOnly?: SandboxFileMount[];
+	/** Trusted relay/bootstrap resources, present only for gateway launches. */
+	gateway?: { relayDirectory: string; nodePath: string; nodeRoot: string; bootstrapPath: string; entrypointPath: string };
 	/** Host paths bound read-write (workspace extras such as a Claude account directory); must exist. */
 	readWritePaths?: string[];
 };
@@ -296,20 +323,28 @@ export const PI_WORKER_CONFIG_FILES: readonly string[] = ["auth.json", "models.j
  * the sandbox, so a host-absolute destination would be invisible to them.
  * The surrounding host ~/.config/agent directory is never mounted.
  */
-export function piWorkerSandboxPlan(homeDir: string, home: string = homedir()): {
+export function piWorkerSandboxPlan(homeDir: string, home?: string, gateway?: false): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry: SandboxFileMount[] };
+export function piWorkerSandboxPlan(homeDir: string, home: string | undefined, gateway: true): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnly: SandboxFileMount[] };
+export function piWorkerSandboxPlan(homeDir: string, home: string | undefined, gateway: boolean): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry?: SandboxFileMount[]; fileMountsReadOnly?: SandboxFileMount[] };
+export function piWorkerSandboxPlan(homeDir: string, home: string = homedir(), gateway = false): {
 	sandboxEnvOverrides: Record<string, string>;
-	fileMountsReadOnlyTry: SandboxFileMount[];
+	fileMountsReadOnlyTry?: SandboxFileMount[];
+	fileMountsReadOnly?: SandboxFileMount[];
 } {
 	const sourceDir = join(home, ".pi", "agent");
 	const isolatedDir = join(homeDir, "pi-agent");
+	if (gateway) return {
+		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
+		fileMountsReadOnly: [
+			{ source: join(sourceDir, "models.json"), dest: join(isolatedDir, "models.json") },
+			{ source: join(homeDir, ".gateway-placeholder"), dest: join(homeDir, ".config", "agent", "gateway.token") },
+		],
+	};
 	return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
 		fileMountsReadOnlyTry: [
 			...PI_WORKER_CONFIG_FILES.map((name) => ({ source: join(sourceDir, name), dest: join(isolatedDir, name) })),
-			{
-				source: join(home, ".config", "agent", "gateway.token"),
-				dest: join(homeDir, ".config", "agent", "gateway.token"),
-			},
+			{ source: join(home, ".config", "agent", "gateway.token"), dest: join(homeDir, ".config", "agent", "gateway.token") },
 		],
 	};
 }
@@ -386,9 +421,12 @@ function buildEnv(
 	pathDirs: string[],
 ): NodeJS.ProcessEnv {
 	let env: NodeJS.ProcessEnv;
-	if (config.env === "allowlist") {
+	if (config.env === "allowlist" || config.network === "gateway") {
 		env = {};
 		for (const name of [...SAFE_ENV_NAMES, ...config.envAllow]) {
+			// Gateway workers never inherit reusable credentials, even if an old
+			// allowlist or env:"inherit" configuration named one.
+			if (config.network === "gateway" && CREDENTIAL_ENV_NAME.test(name)) continue;
 			if (hostEnv[name] !== undefined) env[name] = hostEnv[name];
 		}
 	} else {
@@ -418,11 +456,15 @@ export function buildBwrapArgs(config: SandboxConfig, request: WorkerLaunchReque
 		"--unshare-cgroup-try",
 	];
 	if (config.network === "none") args.push("--unshare-net");
+	if (config.network === "gateway") args.push(
+		"--unshare-user", "--uid", "0", "--gid", "0",
+		"--unshare-net", "--cap-add", "CAP_NET_ADMIN", "--cap-add", "CAP_SETPCAP",
+	);
 	args.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
 	for (const path of SYSTEM_RO_TRY) args.push("--ro-bind-try", path, path);
 	// Explicitly configured read-only paths are strict binds: a typo should
 	// fail the launch loudly, not silently vanish from the sandbox.
-	const strictRo = [...new Set([...readOnlyRoots, ...config.readOnlyPaths])];
+	const strictRo = [...new Set([...readOnlyRoots, ...config.readOnlyPaths, ...(request.gateway ? [request.gateway.nodeRoot] : [])])];
 	for (const path of strictRo) args.push("--ro-bind", path, path);
 	for (const path of [...new Set(request.readOnlyTryPaths ?? [])]) args.push("--ro-bind-try", path, path);
 	args.push("--bind", request.homeDir, request.homeDir);
@@ -431,18 +473,23 @@ export function buildBwrapArgs(config: SandboxConfig, request: WorkerLaunchReque
 	// explicitly with --dir (inside the namespace only — the host filesystem is
 	// never touched) instead of relying on undocumented bind parent creation.
 	const fileMountParents = new Set<string>();
-	for (const mount of request.fileMountsReadOnlyTry ?? []) {
+	for (const [mount, flag] of [
+		...(request.fileMountsReadOnlyTry ?? []).map((item) => [item, "--ro-bind-try"] as const),
+		...(request.fileMountsReadOnly ?? []).map((item) => [item, "--ro-bind"] as const),
+	]) {
 		const parent = dirname(mount.dest);
-		if (!fileMountParents.has(parent)) {
-			fileMountParents.add(parent);
-			args.push("--dir", parent);
-		}
-		args.push("--ro-bind-try", mount.source, mount.dest);
+		if (!fileMountParents.has(parent)) { fileMountParents.add(parent); args.push("--dir", parent); }
+		args.push(flag, mount.source, mount.dest);
+	}
+	if (request.gateway) {
+		args.push("--ro-bind", request.gateway.relayDirectory, "/g");
+		args.push("--dir", "/orchestrator", "--ro-bind", request.gateway.bootstrapPath, "/orchestrator/bootstrap.sh", "--ro-bind", request.gateway.entrypointPath, "/orchestrator/entrypoint.mjs");
 	}
 	args.push("--bind", request.cwd, request.cwd);
 	for (const path of [...new Set(request.readWritePaths ?? [])]) args.push("--bind", path, path);
 	args.push("--chdir", request.cwd);
-	args.push(execPath, ...request.args);
+	if (request.gateway) args.push("/bin/sh", "/orchestrator/bootstrap.sh", "--", request.gateway.nodePath, "/orchestrator/entrypoint.mjs", "/g/r", execPath, ...request.args);
+	else args.push(execPath, ...request.args);
 	return args;
 }
 
@@ -486,13 +533,14 @@ export function resolveWorkerLaunch(
 	}
 
 	const fail = (reason: string): WorkerLaunchResult =>
-		config.mode === "required"
+		config.mode === "required" || config.network === "gateway"
 			? { ok: false, error: `Sandbox is required but unavailable: ${reason}.` }
 			: direct(`Sandbox unavailable (${reason}); worker launched WITHOUT sandbox containment.`);
 
 	const result = probe(config.command);
 	if (!result.ok) return fail(result.reason);
-	if (config.network === "none" && !result.unshareNet) return fail("network isolation (--unshare-net) failed the functional probe");
+	if ((config.network === "none" || config.network === "gateway") && !result.unshareNet) return fail("network isolation (--unshare-net) failed the functional probe");
+	if (config.network === "gateway" && !request.gateway) return fail("gateway relay resources were not prepared");
 	const resolved = commandFs
 		? resolveWorkerCommand(request.command, hostEnv, commandFs)
 		: resolveWorkerCommand(request.command, hostEnv);
@@ -535,7 +583,7 @@ export function createWorkerHomeDir(dir: string): string {
 }
 
 /** Path-component containment; a bare prefix check would match sibling dirs like "pi-orchestrator-evil". */
-function isPathInside(base: string, path: string): boolean {
+export function isPathInside(base: string, path: string): boolean {
 	const rel = relative(base, path);
 	return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }

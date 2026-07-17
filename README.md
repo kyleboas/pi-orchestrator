@@ -97,7 +97,11 @@ An optional `sandbox` config block runs every delegated worker process (Pi RPC, 
 {
   "sandbox": {
     "mode": "required",
-    "network": "host",
+    "network": "gateway",
+    "gateway": {
+      "upstreamUrl": "http://127.0.0.1:4000",
+      "tokenFile": "~/.config/agent/gateway.token"
+    },
     "env": "allowlist",
     "envAllow": [],
     "readOnlyPaths": [],
@@ -117,7 +121,7 @@ Modes:
 
 - `off` (default): legacy direct spawn.
 - `preferred`: sandbox when a cached functional probe passes; otherwise the worker launches unsandboxed with a prominent warning in the delegate result and worker transcript.
-- `required`: fail closed. A missing binary, failed namespace probe, unresolvable worker executable, or unenforceable `network: "none"` rejects the delegation; nothing ever silently falls back. A malformed `sandbox` block also disables delegation rather than quietly becoming `off`.
+- `required`: fail closed. A missing binary, failed namespace probe, unresolvable worker executable, or unenforceable isolated network rejects the delegation; nothing ever silently falls back. A malformed `sandbox` block also disables delegation rather than quietly becoming `off`. `network: "gateway"` always fails closed, including with `mode: "preferred"`; it can never fall back to a credential-bearing host launch.
 
 Sandboxed workers additionally require a **workspace policy**. `workspaceRoots` lists the directories whose contents may be selected as per-task workspaces; `orchestrator_delegate` accepts an optional `cwd` naming the exact repository directory, which is canonicalized (symlinks cannot escape) and must be equal to or inside a configured root — only that selected directory is mounted read-write, never a whole root. When `cwd` is omitted, the coordinator's session cwd is used only if it passes the same checks; otherwise the delegation is rejected with instructions to pass a repo cwd. The host home directory (or any ancestor of it, or anything overlapping the worker's isolated home) is always refused as a workspace, in every sandbox mode, because binding it would expose the entire home read-write and shadow the isolated HOME/token mounts. With no `workspaceRoots` configured, sandboxed delegation fails closed. Never list your home directory itself as a workspace root.
 
@@ -125,14 +129,18 @@ What a sandboxed worker gets: the selected workspace directory read-write; a pri
 
 `env: "allowlist"` is the default whenever the sandbox is enabled (`preferred` or `required`): it passes only conservative non-credential names (PATH, HOME, TERM, locale, and similar) plus explicit `envAllow` additions — provider/gateway variables must be named explicitly. `env: "inherit"` keeps the full environment and must be opted into; `mode: "off"` keeps legacy full inheritance. Environment values are passed via the process environment, never in bwrap argv, so they cannot leak into process listings.
 
-Pi workers do not see the host `~/.pi` directory. Each sandboxed Pi worker gets an isolated agent directory inside its private HOME (`PI_CODING_AGENT_DIR`), into which only `auth.json` and `models.json` are bound read-only as individual files; sessions, chat data, logs, secret stores, prompts, and other private state under `~/.pi` are never mounted. Similarly only the exact host `~/.config/agent/gateway.token` file is mounted (read-only) for gateway-routed provider configs, never the surrounding directory — and its destination is `.config/agent/gateway.token` inside the worker's isolated HOME, because consumers resolve that path against `$HOME`. A host-absolute destination would be invisible to them.
+Pi workers do not see the host `~/.pi` directory. In legacy `host`/`none` sandbox modes, each Pi worker receives only the individual `auth.json`, `models.json`, and gateway-token mounts described by the previous release; this preserves compatibility. In `gateway` mode it receives **only** `models.json` and a per-worker read-only file containing the constant `PI_ORCHESTRATOR_GATEWAY_PLACEHOLDER` at the token path resolved by the models configuration. Real Pi auth, the real gateway token, broad Pi state, Claude config/account directories, inherited reusable credentials, and account rotation are not mounted or used. Claude receives the local base URL and the same placeholder in an isolated config environment. If either client cannot operate that way, launch fails rather than weakening the policy.
 
-`network: "host"` (default) shares host networking because a host-local model gateway on `127.0.0.1` requires it. `network: "none"` unshares the network namespace entirely and is verified by the probe; workers that must reach any model API will not function under it today.
+`network: "host"` (default) preserves shared host networking. `network: "none"` is literal no-network. `network: "gateway"` also uses `--unshare-net`, but a trusted zero-capability Node entrypoint exposes only `127.0.0.1:4000` and byte-proxies it to a single Unix socket mounted at `/g/r`; other loopback ports and all external destinations remain unreachable. The socket is the sole entry in its mode-0700 host relay directory, is mode 0600, and that directory is mounted read-only. Node 24 and each worker executable are explicitly resolved and mounted.
+
+The gateway trust boundary is deliberate. Bubblewrap first creates a root-mapped user/network namespace with exactly bootstrap-only `CAP_NET_ADMIN` and `CAP_SETPCAP`. A fixed argv-invoked script raises loopback, then **execs** `/usr/bin/setpriv` with empty bounding, inheritable, and ambient sets plus `no_new_privs`; normal executable rules leave effective/permitted empty too. Thus all five capability masks are zero before the trusted Node entrypoint or worker runs, with no capability-bearing parent and no `sh -c` or interpolated command. The entrypoint listens, verifies readiness, then launches the exact Pi/Claude argv while preserving stdio, signals, status, and teardown.
+
+The coordinator-owned HTTP reverse relay reads `gateway.tokenFile` at runtime and never logs it. Before spawn the token path is canonicalized and must be a regular, non-symlink, owner-only file owned by the coordinator uid. The zero-cap host relay gets only exact runtime/system mounts, that token file, and its dedicated relay directory — never `/`, broad `/home`, or broad configuration state. It accepts origin-form `POST` requests only for `/v1/responses`, `/v1/chat/completions`, `/v1/messages`, and `/v1/messages/count_tokens` (queries are preserved), strips worker authorization, proxy authorization, API-key, connection-nominated, and hop-by-hop headers, injects gateway bearer authentication, and streams request bodies and SSE responses to the strictly configured loopback HTTP origin. Administration/key/team/user/config/spend paths and every other method/path are denied before authentication or forwarding. Header sizes and timeouts are bounded; upstream errors are sanitized. Absolute-form forward proxying, CONNECT, WebSocket upgrades, non-HTTP/non-loopback origins, URL credentials/paths, unsafe token paths, socket conflicts/length violations, and readiness failures are rejected before worker spawn. Relay processes are boundedly terminated, and sockets/generation directories and isolated homes are removed only after process exit.
 
 Exact non-guarantees — this is containment, not a full security boundary:
 
 - **Network egress is not restricted** under `network: "host"`: a worker can reach the host loopback and the internet, and prompts inherently send mounted repository content to the model provider.
-- **Active provider credentials remain visible to their worker.** A Claude worker mounts its selected account directory (or `~/.claude` when no accounts are configured) read-write, and a Pi worker can read the narrowly mounted `auth.json`, `models.json`, and `gateway.token` files. The mounts are minimal, but those live credentials are still readable by that worker until gateway-based auth isolation replaces them.
+- **Active provider credentials remain visible in legacy `host`/`none` sandbox modes.** Claude account and narrow Pi credential mounts are retained there for exact compatibility. Use `network: "gateway"` to isolate them.
 - **The coordinator itself is not sandboxed.** It runs host-side with its normal tools; whole-session containment needs a future external launcher, not this extension.
 - No resource limits (CPU/memory) are imposed yet, and macOS/Podman backends are not implemented.
 

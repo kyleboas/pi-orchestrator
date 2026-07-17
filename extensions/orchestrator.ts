@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { chmodSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Type } from "typebox";
@@ -31,11 +32,13 @@ import {
 	cleanupWorkerHomeDir,
 	createWorkerHomeDir,
 	piWorkerSandboxPlan,
+	resolveWorkerCommand,
 	resolveWorkerLaunch,
 	resolveWorkerWorkspace,
 	workerHomeDirPath,
 	type WorkerLaunchRequest,
 } from "./orchestrator-lib/orchestrator-sandbox.ts";
+import { GATEWAY_PLACEHOLDER, startGatewayRelay } from "./orchestrator-lib/orchestrator-gateway.ts";
 import {
 	earliestAccountReset,
 	isUsageLimitText,
@@ -467,26 +470,37 @@ function spawnWorkerChild(
 	envOverrides: Record<string, string>,
 	config: OrchestratorConfig,
 	hostEnv: NodeJS.ProcessEnv,
-	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "readWritePaths"> = {},
+	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "fileMountsReadOnly" | "readWritePaths"> = {},
 ): SpawnedWorkerChild {
 	const homeDir = workerHomeDirPath(workerKey);
-	const launch = resolveWorkerLaunch(config.sandbox, { command, args, cwd, envOverrides, homeDir, ...paths }, hostEnv);
-	if (!launch.ok) throw new WorkerLaunchRejected(launch.error);
+	let relay: ReturnType<typeof startGatewayRelay> | undefined;
+	if (config.sandbox.network === "gateway") {
+		if (!config.sandbox.gateway) throw new WorkerLaunchRejected("Gateway configuration is unavailable.");
+		createWorkerHomeDir(homeDir);
+		if (paths.fileMountsReadOnly?.some((mount) => mount.source.endsWith(".gateway-placeholder"))) {
+			const placeholder = `${GATEWAY_PLACEHOLDER}\n`;
+			writeFileSync(`${homeDir}/.gateway-placeholder`, placeholder, { mode: 0o400 });
+			chmodSync(`${homeDir}/.gateway-placeholder`, 0o400);
+		}
+		try { relay = startGatewayRelay(workerKey, config.sandbox.gateway, undefined, config.sandbox.command); }
+		catch { cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected("Gateway relay failed its readiness check."); }
+	}
+	const node = relay ? resolveWorkerCommand(relay.nodePath, process.env) : undefined;
+	const launch = resolveWorkerLaunch(config.sandbox, { command, args, cwd, envOverrides, homeDir, ...paths,
+		...(relay && node ? { gateway: { relayDirectory: relay.directory, nodePath: relay.nodePath, nodeRoot: node.readOnlyRoots[0]!, bootstrapPath: relay.bootstrapPath, entrypointPath: relay.entrypointPath } } : {}),
+	}, hostEnv);
+	if (!launch.ok) { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected(launch.error); }
 	if (launch.sandboxed) createWorkerHomeDir(homeDir);
 	let child: Worker["process"];
 	try {
-		child = spawn(launch.spec.command, launch.spec.args, {
-			cwd,
-			env: launch.spec.env,
-			stdio: ["pipe", "pipe", "pipe"] as const,
-		});
+		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const });
 	} catch (error) {
-		// A synchronous spawn failure must not strand the just-created home.
+		if (relay) void relay.cleanup().catch(() => {});
 		if (launch.sandboxed) cleanupWorkerHomeDir(homeDir);
 		throw error;
 	}
 	if (launch.sandboxed) {
-		const clean = () => cleanupWorkerHomeDir(homeDir);
+		const clean = () => { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); };
 		child.once("exit", clean);
 		child.once("error", clean);
 	}
@@ -505,15 +519,18 @@ function spawnClaudeChild(model: string, cwd: string, config: OrchestratorConfig
 	// keep exact legacy behavior. That directory's credentials remain visible
 	// to that worker until a gateway-based auth relay replaces them.
 	const sandboxAccountDir = accountDir ?? resolve(homedir(), ".claude");
+	const gateway = config.sandbox.network === "gateway";
 	return spawnWorkerChild(
 		workerKey,
 		config.commands.claude,
 		[...claudeCodeArgs(model), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
-		{ PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
+		gateway
+			? { PI_ORCHESTRATOR_WORKER: "1", CLAUDE_CONFIG_DIR: resolve(workerHomeDirPath(workerKey), ".claude-gateway"), ANTHROPIC_BASE_URL: "http://127.0.0.1:4000", ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER, ANTHROPIC_API_KEY: GATEWAY_PLACEHOLDER }
+			: { PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
 		config,
 		hostEnv,
-		{
+		gateway ? {} : {
 			...(accountDir ? {} : { sandboxEnvOverrides: { CLAUDE_CONFIG_DIR: sandboxAccountDir } }),
 			readWritePaths: [sandboxAccountDir],
 		},
@@ -566,7 +583,7 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
  */
 function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitText: string): boolean {
 	const accounts = config.claudeAccounts;
-	if (!accounts || worker.profile.backend !== "claude-code") return false;
+	if (!accounts || worker.profile.backend !== "claude-code" || config.sandbox.network === "gateway") return false;
 	if (worker.claudeAccount) {
 		markClaudeAccountLimited(accounts, worker.claudeAccount, parseUsageLimitReset(limitText));
 	}
@@ -611,9 +628,9 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 
 function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
-	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
+	const account = profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const spawned = profile.backend === "pi-rpc"
-		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, piWorkerSandboxPlan(workerHomeDirPath(id)))
+		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, piWorkerSandboxPlan(workerHomeDirPath(id), homedir(), config.sandbox.network === "gateway"))
 		: spawnClaudeChild(profile.model, cwd, config, id, account?.configDir);
 	const child = spawned.child;
 	const worker: Worker = {
@@ -644,7 +661,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		worker.sandboxWarning = spawned.warning;
 		recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
 	}
-	if (profile.backend === "claude-code" && config.claudeAccounts && !account) {
+	if (profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" && !account) {
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
 		child.kill();
