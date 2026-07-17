@@ -1,14 +1,15 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import net from "node:net";
 
 /** The deliberately small opt-in authority delegated to a sandboxed worker. */
 export type PullRequestsConfig = { repositories: string[]; branchPrefixes: string[] };
 /** `branch` is deliberately absent until the first successful publish. */
-export type PinnedPullRequestTarget = { workspace: string; repository: string; remoteUrl: string; defaultBranch: string; generation: string; device: number; inode: number; branch?: string };
+type GitMetadata = { entryDevice: number; entryInode: number; gitDir: string; configs: Array<{ path: string; device: number; inode: number; hash: string }> };
+export type PinnedPullRequestTarget = { workspace: string; repository: string; remoteUrl: string; defaultBranch: string; generation: string; device: number; inode: number; git?: GitMetadata; branch?: string };
 export type BrokerResult = { ok: boolean; message: string; repository?: string; branch?: string; defaultBranch?: string };
 export const PR_REQUEST_LIMIT = 16_384;
 export const PR_RESPONSE_LIMIT = 8_192;
@@ -84,7 +85,23 @@ const GIT_ENV = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_
 function gitArgs(...args: string[]): string[] { return ["--no-optional-locks", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", ...args]; }
 async function git(runner: BrokerRunner, cwd: string, ...args: string[]): Promise<CommandResult> { return runner("git", gitArgs(...args), { cwd, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 }); }
 async function line(runner: BrokerRunner, cwd: string, ...args: string[]): Promise<string | undefined> { const result = await git(runner, cwd, ...args); const value = result.stdout.trim(); return result.ok && value && value.length <= 512 && !/[\0\r\n]/.test(value) ? value : undefined; }
-function identity(cwd: string): { workspace: string; device: number; inode: number } | undefined { try { const workspace = realpathSync(cwd), stat = statSync(workspace); return stat.isDirectory() && !lstatSync(cwd).isSymbolicLink() ? { workspace, device: stat.dev, inode: stat.ino } : undefined; } catch { return undefined; } }
+function metadata(workspace: string): GitMetadata | undefined {
+	try {
+		const entry = join(workspace, ".git"), entryStat = lstatSync(entry);
+		if (entryStat.isSymbolicLink()) return undefined;
+		let gitDir: string;
+		if (entryStat.isDirectory()) gitDir = realpathSync(entry);
+		else if (entryStat.isFile()) { const match = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(entry, "utf8")); if (!match) return undefined; gitDir = realpathSync(resolve(dirname(entry), match[1]!)); }
+		else return undefined;
+		if (!statSync(gitDir).isDirectory()) return undefined;
+		const dirs = [gitDir]; const common = join(gitDir, "commondir");
+		try { const path = realpathSync(resolve(gitDir, readFileSync(common, "utf8").trim())); if (path !== gitDir) dirs.push(path); } catch {}
+		const configs = dirs.map((dir) => { const path = join(dir, "config"), stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("unsafe config"); return { path, device: stat.dev, inode: stat.ino, hash: createHash("sha256").update(readFileSync(path)).digest("hex") }; });
+		return { entryDevice: entryStat.dev, entryInode: entryStat.ino, gitDir, configs };
+	} catch { return undefined; }
+}
+function identity(cwd: string): { workspace: string; device: number; inode: number; git?: GitMetadata } | undefined { try { const workspace = realpathSync(cwd), stat = statSync(workspace), git = metadata(workspace); return stat.isDirectory() && !lstatSync(cwd).isSymbolicLink() ? { workspace, device: stat.dev, inode: stat.ino, ...(git ? { git } : {}) } : undefined; } catch { return undefined; } }
+function sameMetadata(left: GitMetadata, right: GitMetadata | undefined): boolean { return !!right && left.entryDevice === right.entryDevice && left.entryInode === right.entryInode && left.gitDir === right.gitDir && left.configs.length === right.configs.length && left.configs.every((config, index) => config.path === right.configs[index]?.path && config.device === right.configs[index]?.device && config.inode === right.configs[index]?.inode && config.hash === right.configs[index]?.hash); }
 function localDefault(ref: string | undefined): string | undefined { const branch = ref?.startsWith("origin/") ? ref.slice("origin/".length) : undefined; return branch && BRANCH.test(branch) ? branch : undefined; }
 function syncDefaultBranch(repository: string, local: string | undefined): string | undefined {
 	if (local) return local;
@@ -127,24 +144,28 @@ function validPublish(request: Record<string, unknown>): request is { generation
 
 export async function publishPullRequest(target: PinnedPullRequestTarget, policy: PullRequestsConfig, title: string, body: string, runner: BrokerRunner): Promise<BrokerResult> {
 	const repinned = await pinPullRequestTarget(target.workspace, policy, runner);
-	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
+	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || (target.git !== undefined && !sameMetadata(target.git, metadata(target.workspace))) || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
 	const branch = await currentAllowedBranch(target, policy, runner);
 	if (!branch || (target.branch && target.branch !== branch)) return { ok: false, message: target.branch ? "The pinned branch changed." : "Switch to an allowed non-default branch before publishing." };
-	const dirty = await git(runner, target.workspace, "status", "--porcelain=v1", "--untracked-files=all");
+	const dirty = await git(runner, target.workspace, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none");
 	if (!dirty.ok || dirty.stdout.trim()) return { ok: false, message: "Commit or remove all tracked and untracked changes before publishing." };
 	const head = await line(runner, target.workspace, "rev-parse", "--verify", "HEAD^{commit}");
 	if (!head || !/^[a-f0-9]{40,64}$/i.test(head)) return { ok: false, message: "A committed HEAD is required." };
-	const temp = mkdtempSync(join(tmpdir(), "pio-pr-bare-"));
+	const tempParent = mkdtempSync(join(tmpdir(), "pio-pr-trusted-")), temp = join(tempParent, "view.git");
 	try {
-		if (!(await runner("git", gitArgs("clone", "--bare", "--no-local", "--no-hardlinks", target.workspace, temp), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 })).ok) return { ok: false, message: "Could not prepare a trusted Git view." };
-		const fetched = await runner("git", gitArgs("-C", temp, "fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 });
-		if (!fetched.ok) { const remote = await runner("git", gitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 }); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }
-		else if (!(await runner("git", gitArgs("-C", temp, "merge-base", "--is-ancestor", `refs/remotes/pinned/${branch}`, head), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 })).ok) return { ok: false, message: "The branch is not a fast-forward update." };
+		// Clone is deliberately launched from a host-owned directory, never the
+		// checkout: local file transport is the only protocol permitted here.
+		const cloneEnv = { ...trustedEnv(process.env), ...GIT_ENV, GIT_ALLOW_PROTOCOL: "file", GIT_PROTOCOL_FROM_USER: "0" };
+		if (!(await runner("git", gitArgs("-c", "protocol.file.allow=always", "-c", "protocol.ssh.allow=never", "-c", "protocol.http.allow=never", "-c", "protocol.https.allow=never", "clone", "--bare", "--no-local", "--no-hardlinks", target.workspace, temp), { cwd: tempParent, env: cloneEnv, timeout: 30_000 })).ok) return { ok: false, message: "Could not prepare a trusted Git view." };
+		const trustedOptions = { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 };
+		const fetched = await runner("git", gitArgs("fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), trustedOptions);
+		if (!fetched.ok) { const remote = await runner("git", gitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), trustedOptions); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }
+		else if (!(await runner("git", gitArgs("merge-base", "--is-ancestor", `refs/remotes/pinned/${branch}`, head), trustedOptions)).ok) return { ok: false, message: "The branch is not a fast-forward update." };
 		// Recheck after all worker-controlled checkout reads, then pin before any
 		// network mutation. A failed push/gh operation still permits only this branch.
 		if ((await currentAllowedBranch(target, policy, runner)) !== branch) return { ok: false, message: "The branch changed during publishing." };
 		target.branch ??= branch;
-		if (!(await runner("git", gitArgs("-C", temp, "push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
+		if (!(await runner("git", gitArgs("push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
 		const env = trustedEnv(process.env), owner = target.repository.split("/")[0]!, open = await runner("gh", ["pr", "list", `--repo=${target.repository}`, `--head=${owner}:${branch}`, "--state=open", "--json=number,headRefName,baseRefName,isCrossRepository,headRepository,headRepositoryOwner", "--limit=2"], { env, timeout: 30_000 });
 		if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { ok: false, message: "Could not query the existing pull request." };
 		let number: number | undefined;
@@ -164,7 +185,7 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 		const args = number ? ["pr", "edit", String(number), `--repo=${target.repository}`, `--title=${title}`, `--body=${body}`] : ["pr", "create", `--repo=${target.repository}`, `--base=${target.defaultBranch}`, `--head=${branch}`, `--title=${title}`, `--body=${body}`];
 		if (!(await runner("gh", args, { env, timeout: 45_000 })).ok) return { ok: false, message: "Pull request create/update failed." };
 		return { ok: true, message: number ? "Updated the open pull request." : "Created an open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
-	} finally { try { rmSync(temp, { recursive: true, force: true }); } catch {} }
+	} finally { try { rmSync(tempParent, { recursive: true, force: true }); } catch {} }
 }
 async function brokerStatus(target: PinnedPullRequestTarget, policy: PullRequestsConfig, runner: BrokerRunner): Promise<BrokerResult> {
 	if (target.branch) {

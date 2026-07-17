@@ -59,10 +59,10 @@ test("publish uses only fixed git/gh argv and canonical remote with credential-f
 	const workspace = mkdtempSync(join(tmpdir(), "pio-pr-test-"));
 	const identity = statSync(workspace);
 	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "git@github.com:owner/repository.git", defaultBranch: "main", generation: "one", device: identity.dev, inode: identity.ino };
-	const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+	const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv; cwd?: string }> = [];
 	const old = process.env.GITHUB_TOKEN; process.env.GITHUB_TOKEN = "never-forward";
 	const runner = async (command: string, args: string[], options: { env?: NodeJS.ProcessEnv; cwd?: string; timeout?: number } = {}) => {
-		calls.push({ command, args, env: options.env });
+		calls.push({ command, args, env: options.env, cwd: options.cwd });
 		const joined = args.join(" ");
 		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
 		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
@@ -78,7 +78,9 @@ test("publish uses only fixed git/gh argv and canonical remote with credential-f
 		const result = await publishPullRequest(target, policy, "Safe title", "Safe body", runner);
 		assert.equal(result.ok, true);
 		assert.equal(target.branch, "feat/broker", "first successful publish pins the worker-created branch");
-		assert.ok(calls.some((call) => call.command === "git" && call.args.includes("push") && call.args.includes("git@github.com:owner/repository.git")));
+		const clone = calls.find((call) => call.command === "git" && call.args.includes("clone"));
+		assert.ok(clone && clone.cwd !== workspace && clone.env?.GIT_ALLOW_PROTOCOL === "file" && clone.args.includes("protocol.ssh.allow=never"));
+		assert.ok(calls.some((call) => call.command === "git" && call.args.includes("push") && call.args.includes("git@github.com:owner/repository.git") && call.cwd !== workspace));
 		assert.ok(calls.some((call) => call.command === "gh" && call.args.includes("create") && call.args.includes("--base=main")));
 		assert.ok(calls.every((call) => call.command === "git" || call.command === "gh"));
 		assert.ok(calls.every((call) => call.env?.GITHUB_TOKEN === undefined));
