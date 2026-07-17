@@ -6,6 +6,8 @@ Features: Pi RPC and Claude Code stream-json workers; exact-once result delivery
 
 ## Install
 
+> **Runtime trust warning:** Run this only in repositories you trust. Repository content and delegated instructions can cause workers to read or modify files, run commands, access inherited credentials, and make network requests. For untrusted code, use a container, VM, or other isolated environment with a sanitized, minimal environment. This orchestrator does not provide a sandbox or security boundary.
+
 ```sh
 pi install git:github.com/kyleboas/pi-orchestrator
 ```
@@ -117,7 +119,7 @@ pi remove @kyleboas/pi-orchestrator
 
 ## Privacy and security
 
-Worker stderr is never retained or reported, because it can contain local tool/auth details. Configuration errors are intentionally generic and never print config or environment contents. This package stores no credentials, recipient IDs, or tokens; Pi and Claude Code use their own normal authentication.
+Worker stderr is never retained or reported, because it can contain local tool/auth details. Configuration errors are intentionally generic and never print config or environment contents. The orchestrator does not persist credentials, recipient IDs, or tokens; however, workers can access inherited environment variables and authentication context during execution. Pi and Claude Code use their own normal authentication.
 
 ## Development
 
