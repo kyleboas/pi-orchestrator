@@ -64,11 +64,13 @@ A worker profile may additionally declare `"sandbox": "off"`, the explicit per-w
 ```json
 {
   "pullRequests": {
-    "repositories": ["owner/repository"],
+    "repositories": ["owner/repository", "owner/*"],
     "branchPrefixes": ["feat/", "fix/"]
   }
 }
 ```
+
+A repository entry is either an exact `owner/repository` or the explicit owner-wide `owner/*`, which allows every repository under that owner. Only those two full forms parse; any partial pattern (`*`, `*/name`, `owner/pre*`) rejects the whole block — authority is never broadened by a typo. The wildcard affects eligibility only: the pinned target is always the exact repository parsed from the workspace's canonical origin, and every subsequent check runs against that pin. Branch prefixes are real path prefixes ending in `/`; there is no wildcard prefix form.
 
 Both arrays are bounded, duplicate-free, and strictly validated; malformed broker configuration disables the broker with a generic warning. For an eligible **sandboxed** worker, the host pins the canonical repository `origin` and its default branch before worker code starts (using the local origin HEAD when available, otherwise trusted `gh repo view`). Linked Git worktrees are not eligible because their `.git` file points outside the mounted workspace; the broker fails closed rather than claiming sandbox support for them. It mounts only a per-worker `/pr` directory containing `/pr/pio-pr` and a mode-0600 Unix socket. Existing narrow model-provider authentication/config mounts remain available so the worker can reach its model, but the broker feature exposes no host HOME, GitHub `gh` configuration, SSH files/agent socket, `GH_TOKEN`/`GITHUB_TOKEN`, or GitHub credentials.
 
