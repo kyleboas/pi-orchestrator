@@ -6,7 +6,7 @@ import {
 	isEscapeKey,
 	isUpKey,
 	moveSelection,
-	renderWorkerPane,
+	renderSessionScreen,
 	wrapPlainText,
 } from "../extensions/orchestrator-lib/orchestrator-session-view.ts";
 import {
@@ -44,27 +44,22 @@ test("moveSelection enters from the editor, walks rows, and exits past the top",
 	assert.equal(moveSelection(ids, "gone", "up"), "c");
 });
 
-test("renderWorkerPane shows title, body tail, scrolls, and stays within the viewport", () => {
+test("renderSessionScreen shows title, body tail, scrolls, and stays full-size", () => {
 	const body = Array.from({ length: 30 }, (_value, index) => `line ${index}`);
-	const followed = renderWorkerPane("Terra · working · terra-1", body, 60, 8, 0, theme);
+	const followed = renderSessionScreen("Terra · working · terra-1", body, 60, 12, 0, theme);
 	assert.match(followed.lines[0]!, /Terra · working · terra-1/);
-	assert.equal(followed.lines.length, 12, "title + rule + 8 body rows + rule + hints");
+	assert.equal(followed.lines.length, 12);
 	for (const line of followed.lines) assert.equal(Array.from(line).length, 60);
-	assert.ok(followed.lines.some((line: string) => line.includes("line 29")));
-	assert.ok(followed.lines.at(-1)!.includes("↑/↓ scroll"), "hint row survives truncation at narrow widths");
-	const wide = renderWorkerPane("Terra · working · terra-1", body, 120, 8, 0, theme);
-	assert.ok(wide.lines.at(-1)!.includes("the input below messages the coordinator"));
+	assert.ok(followed.lines.some((line) => line.includes("line 29")));
 	assert.ok(followed.maxScrollUp > 0);
-	const scrolled = renderWorkerPane("Terra · working · terra-1", body, 60, 8, followed.maxScrollUp, theme);
-	assert.ok(scrolled.lines.some((line: string) => line.includes("line 0")));
-	assert.ok(!scrolled.lines.some((line: string) => line.includes("line 29")));
+	const scrolled = renderSessionScreen("Terra · working · terra-1", body, 60, 12, followed.maxScrollUp, theme);
+	assert.ok(scrolled.lines.some((line) => line.includes("line 0")));
+	assert.ok(!scrolled.lines.some((line) => line.includes("line 29")));
 });
 
-test("renderWorkerPane shrinks with a short body and handles an empty one", () => {
-	const short = renderWorkerPane("Terra · working · terra-1", ["only line"], 60, 8, 0, theme);
-	assert.equal(short.lines.length, 5, "no empty padding rows for a short transcript");
-	const view = renderWorkerPane("Terra · starting · terra-1", [], 60, 8, 0, theme);
-	assert.ok(view.lines.some((line: string) => line.includes("No output yet.")));
+test("renderSessionScreen handles an empty body", () => {
+	const view = renderSessionScreen("Terra · starting · terra-1", [], 60, 12, 0, theme);
+	assert.ok(view.lines.some((line) => line.includes("No output yet.")));
 });
 
 test("wrapPlainText wraps at word boundaries and splits overlong words", () => {
