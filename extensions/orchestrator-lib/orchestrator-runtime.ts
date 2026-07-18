@@ -58,7 +58,24 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	healthStreak?: number;
 	rpcNextId: number;
 	rpcPending: Map<string, PendingRpc>;
+	/** Run whose in-flight abort (interrupt steer) must swallow exactly its own agent_settled instead of settling and reporting a partial result. */
+	interruptedRun?: number;
 };
+
+/**
+ * Kill a worker's entire process tree. Sandboxed workers need only the direct
+ * child killed: bwrap's PID namespace plus --die-with-parent tears down the
+ * inner tree. Unsandboxed (host opt-out) workers are spawned detached as their
+ * own process group precisely so this group signal can reach grandchildren —
+ * a stuck deploy or railway invocation must not survive as an orphan. The
+ * group kill is a no-op (ESRCH) when the child was not a group leader.
+ */
+export function killWorkerProcessTree(child: Pick<OrchestratorWorker["process"], "pid" | "kill">): void {
+	if (typeof child.pid === "number" && child.pid > 0) {
+		try { process.kill(-child.pid, "SIGTERM"); } catch { /* not a group leader or already gone */ }
+	}
+	try { child.kill("SIGTERM"); } catch { /* already exited */ }
+}
 
 export type OrchestratorRuntime = {
 	workers: Map<string, OrchestratorWorker>;
@@ -199,7 +216,7 @@ export function ensureOrchestratorExitHook(
 	register("exit", () => {
 		const activeRuntime = getOrchestratorRuntime();
 		for (const worker of activeRuntime.workers.values()) {
-			if (worker.state === "starting" || worker.state === "working") worker.process.kill("SIGTERM");
+			if (worker.state === "starting" || worker.state === "working") killWorkerProcessTree(worker.process);
 		}
 	});
 	return true;
