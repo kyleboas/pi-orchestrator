@@ -1028,20 +1028,20 @@ export default function orchestrator(pi: ExtensionAPI) {
 		};
 		const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
 			if (viewerWorkerId !== undefined) {
-				// With an empty editor the pane owns scrolling — arrows included,
-				// because touch terminals (Termius on iOS) deliver swipes as arrow
-				// keys — plus esc to close. The moment there is editor text, every
-				// key except pgup/pgdn belongs to pi's own editor so messaging the
-				// coordinator stays native.
-				const editorEmpty = ctx.ui.getEditorText() === "";
-				const scrollStep = isPageUpKey(data) || isPageDownKey(data) ? 10 : editorEmpty && (isUpKey(data) || isDownKey(data)) ? 1 : 0;
-				if (scrollStep) {
-					const up = isPageUpKey(data) || isUpKey(data);
-					viewerScrollUp = up ? viewerScrollUp + scrollStep : Math.max(0, viewerScrollUp - scrollStep);
+				// The pane owns only pgup/pgdn (scroll) and esc-on-empty-editor
+				// (close); every other key — typing, enter, history — belongs to
+				// pi's own editor so messaging the coordinator stays native.
+				if (isPageUpKey(data)) {
+					viewerScrollUp += 10;
 					viewerRequestRender();
 					return { consume: true };
 				}
-				if (isEscapeKey(data) && editorEmpty) {
+				if (isPageDownKey(data)) {
+					viewerScrollUp = Math.max(0, viewerScrollUp - 10);
+					viewerRequestRender();
+					return { consume: true };
+				}
+				if (isEscapeKey(data) && ctx.ui.getEditorText() === "") {
 					closeWorkerView();
 					return { consume: true };
 				}

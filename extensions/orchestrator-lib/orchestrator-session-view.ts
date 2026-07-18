@@ -128,7 +128,7 @@ export function renderWorkerPane(
 		const chars = Array.from(text);
 		return padVisible(chars.length > fullWidth ? `${chars.slice(0, fullWidth - 1).join("")}…` : text, fullWidth);
 	};
-	const hints = `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to close · the input below messages the coordinator`;
+	const hints = `pgup/pgdn scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to close · the input below messages the coordinator`;
 	const lines = [
 		theme.fg("text", fit(` ${title}`)),
 		theme.fg("dim", "─".repeat(fullWidth)),
