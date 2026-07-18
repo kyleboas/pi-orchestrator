@@ -34,7 +34,7 @@ export function parsePullRequestsConfig(value: unknown): PullRequestsConfig | un
 	if (Object.keys(raw).some((key) => key !== "repositories" && key !== "branchPrefixes") || !Array.isArray(raw.repositories) || !Array.isArray(raw.branchPrefixes) || !raw.repositories.length || !raw.branchPrefixes.length || raw.repositories.length > 32 || raw.branchPrefixes.length > 32) return undefined;
 	const repositories: string[] = [], branchPrefixes: string[] = [], seenRepositories = new Set<string>(), seenPrefixes = new Set<string>();
 	for (const value of raw.repositories) { if (!text(value, 140)) return undefined; const repository = normalizedRepository(value); if (!repository || seenRepositories.has(repository)) return undefined; seenRepositories.add(repository); repositories.push(repository); }
-	for (const value of raw.branchPrefixes) { if (!text(value, 81)) return undefined; const prefix = value.trim(); if (!PREFIX.test(prefix) || seenPrefixes.has(prefix.toLowerCase())) return undefined; seenPrefixes.add(prefix.toLowerCase()); branchPrefixes.push(prefix); }
+	for (const value of raw.branchPrefixes) { if (!text(value, 81)) return undefined; const prefix = value.trim(); if ((prefix !== "*" && !PREFIX.test(prefix)) || seenPrefixes.has(prefix.toLowerCase())) return undefined; seenPrefixes.add(prefix.toLowerCase()); branchPrefixes.push(prefix); }
 	return { repositories, branchPrefixes };
 }
 
@@ -47,7 +47,7 @@ export function normalizeGitHubRemote(value: string): { repository: string; remo
 	const repository = normalizedRepository(`${match[1]}/${match[2]}`);
 	return repository ? { repository, remoteUrl: `https://github.com/${repository}.git` } : undefined;
 }
-export function branchAllowed(branch: string, config: PullRequestsConfig, defaultBranch?: string): boolean { return BRANCH.test(branch) && branch !== defaultBranch && config.branchPrefixes.some((prefix) => branch.startsWith(prefix)); }
+export function branchAllowed(branch: string, config: PullRequestsConfig, defaultBranch?: string): boolean { return BRANCH.test(branch) && branch !== defaultBranch && config.branchPrefixes.some((prefix) => prefix === "*" || branch.startsWith(prefix)); }
 
 function trustedEnv(host: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	// gh reads its host login from HOME. Deliberately retain no SSH or Git

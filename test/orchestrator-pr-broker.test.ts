@@ -76,12 +76,25 @@ test("PR policy is opt-in, bounded, normalized, and fails closed", () => {
 	for (const value of [undefined, {}, { repositories: ["owner/repository", "OWNER/repository"], branchPrefixes: ["feat/"] }, { repositories: ["owner/repository"], branchPrefixes: ["../"] }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], extra: true }]) assert.equal(parsePullRequestsConfig(value), undefined);
 });
 
+test("PR policy accepts only the explicit branch wildcard", () => {
+	assert.deepEqual(parsePullRequestsConfig({ repositories: ["Owner/Repository"], branchPrefixes: ["*"] }), { repositories: ["owner/repository"], branchPrefixes: ["*"] });
+	for (const wildcard of ["**", "*/", "feat/*", "*branch", "branch*"]) assert.equal(parsePullRequestsConfig({ repositories: ["owner/repository"], branchPrefixes: [wildcard] }), undefined);
+});
+
+test("wildcard policy allows valid nested and root branches but not the default or invalid branches", () => {
+	const wildcardPolicy = { repositories: ["owner/repository"], branchPrefixes: ["*"] };
+	assert.equal(branchAllowed("report-post/candidate-4781", wildcardPolicy, "main"), true);
+	assert.equal(branchAllowed("candidate-4781", wildcardPolicy, "main"), true);
+	for (const branch of ["main", "fix/../main", "feat//bad", "bad branch", "release.lock"]) assert.equal(branchAllowed(branch, wildcardPolicy, "main"), false);
+});
+
 test("only canonical GitHub origins and safe non-default prefix branches qualify", () => {
 	assert.deepEqual(normalizeGitHubRemote("git@github.com:Owner/Repository.git"), { repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git" });
 	assert.deepEqual(normalizeGitHubRemote("https://github.com/owner/repository"), { repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git" });
 	for (const remote of ["https://token@github.com/owner/repository", "https://github.com/owner/repository/extra", "git@gitlab.com:owner/repository.git"]) assert.equal(normalizeGitHubRemote(remote), undefined);
 	assert.equal(branchAllowed("feat/broker", policy, "main"), true);
-	for (const branch of ["main", "fix/../main", "other/work", "feat//bad"]) assert.equal(branchAllowed(branch, policy, "main"), false);
+	assert.equal(branchAllowed("fix/root", policy, "main"), true);
+	for (const branch of ["main", "fix/../main", "other/work", "feat//bad", "feat-root"]) assert.equal(branchAllowed(branch, policy, "main"), false);
 });
 
 test("broker socket is generation-bound, mode-restricted, and exposes no arbitrary operation", async () => {
