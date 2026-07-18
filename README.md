@@ -4,19 +4,6 @@ Persistent implementation-worker orchestration for [Pi](https://github.com/badlo
 
 Features: Pi RPC and Claude Code stream-json workers; exact-once result delivery; reload-safe process-global worker runtime; stop and steer controls; compact readable (non-dim) worker footer rows; replaceable catalog and executable configuration.
 
-- [Install](#install)
-- [Default catalog](#default-catalog)
-- [Outcome ledger and routing advice](#outcome-ledger-and-routing-advice)
-- [Configuration](#configuration)
-  - [Restricted pull-request broker](#restricted-pull-request-broker)
-- [Worker sandbox (Linux, bubblewrap)](#worker-sandbox-linux-bubblewrap)
-  - [Per-worker opt-out: designated host workers](#per-worker-opt-out-designated-host-workers)
-- [Worker session view](#worker-session-view)
-- [Claude account failover](#claude-account-failover)
-- [Maintenance](#maintenance)
-- [Privacy and security](#privacy-and-security)
-- [Development](#development)
-
 ## Install
 
 > **Runtime trust warning:** Run this only in repositories you trust. Repository content and delegated instructions can cause workers to read or modify files, run commands, access inherited credentials, and make network requests. The optional bubblewrap worker sandbox below limits filesystem and process access for worker processes, but it is not a complete security boundary: see its explicit non-guarantees. For untrusted code, still prefer a container, VM, or other isolated environment.
@@ -42,9 +29,7 @@ Every worker is an individual, explicit model profile. Pi workers **never inheri
 - `Haiku`: Claude Code, `haiku`
 - `Fable`: Claude Code, `fable`
 
-Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with Luna unless its already-inspected scope demonstrably requires Sol or Terra; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task. For example: “ask Opus to implement the migration and run its tests.” While a worker is live: “steer Opus with correction: also cover rollback behavior.”
-
-The Terra, Sol, and Fable aliases are opinionated defaults from this package's author and may not exist in another user's provider or Claude setup. Supply your own complete `workers` catalog when they are unavailable; a configured catalog replaces all eight defaults and may use arbitrary valid display names, Pi `provider/model` IDs, and Pi thinking levels.
+Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with Luna unless its already-inspected scope demonstrably requires Sol or Terra; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task.
 
 ## Outcome ledger and routing advice
 
@@ -52,15 +37,15 @@ Every attempt updates `~/.config/pi-orchestrator/stats.json` with a stable root-
 
 The coordinator receives concise lifetime context plus matching seven-day category/complexity evidence when at least three samples exist: status/acceptance signals and p50/p95 duration, with Pi provider-reported cost and Claude API-equivalent estimated/notional cost always labeled separately. Sparse evidence is explicitly advisory, never hard routing; existing tier rules and explicit user worker choice still win.
 
-### Delegate, steer, stop
-
 `orchestrator_delegate` accepts optional `category` (`code`, `tests`, `documentation`, `operations`, `research`, or `integration`) and `complexity` (`low`, `medium`, or `high`). Omitted values use deterministic task-text classification. A separately delegated retry can pass `retryOf` with a prior root task ID returned in tool details; an unresolved ID safely creates a new root. `orchestrator_steer` accepts `kind: correction|continuation`: correction marks the preceding completed attempt `rework`; continuation accepts it before starting the next attempt on the same root. Omitted steer kinds conservatively mean correction. It also accepts `interrupt: true` for a working Pi RPC worker that is actively heading the wrong way: the in-flight run is aborted through the Pi RPC `abort` command before the instructions are delivered, and the aborted run's partial output is discarded rather than reported as a result. Claude workers cannot be aborted mid-turn; an interrupt steer to one degrades to the normal queued follow-up and says so in the tool result.
 
 `orchestrator_stop` kills the worker's entire process tree. A sandboxed worker's tree dies with bwrap's PID namespace; an unsandboxed worker (the per-worker `"sandbox": "off"` opt-out) is spawned as its own process group so stop, failover, and coordinator-exit cleanup can signal grandchildren too — a stuck deploy or long-running command cannot survive as an orphan.
 
-### Ledger durability
-
 The ledger is advisory and backwards-compatible with aggregate-only v1/v2 data. On initialization, old malformed top-level aggregate keys are removed only after a timestamped sibling backup is made; reserved aggregate names can never become workers. If a still-loaded v2 extension has overwritten a v3 cleanup, the next startup narrowly detects a v2 live file plus a richer sibling backup, snapshots the v2 file, retains its current lifetime totals, and deterministically unions its newer attempts with the backup before writing v3. Corrupt or missing files load as empty, and ledger IO errors never disturb orchestration. Delete the file to reset it.
+
+For example: “ask Opus to implement the migration and run its tests.” While a worker is live: “steer Opus with correction: also cover rollback behavior.”
+
+The Terra, Sol, and Fable aliases are opinionated defaults from this package's author and may not exist in another user's provider or Claude setup. Supply your own complete `workers` catalog when they are unavailable; a configured catalog replaces all seven defaults and may use arbitrary valid display names, Pi `provider/model` IDs, and Pi thinking levels.
 
 ## Configuration
 
@@ -153,7 +138,7 @@ An optional `sandbox` config block runs every delegated worker process (Pi RPC, 
 }
 ```
 
-See [`examples/gateway-config.json`](examples/gateway-config.json) for a complete gateway-mode configuration. Ubuntu install and verification:
+Ubuntu install and verification:
 
 ```sh
 sudo apt install bubblewrap
@@ -226,16 +211,9 @@ A takeover interrupted with esc no longer sticks: the next user prompt while the
 
 ## Maintenance
 
-Packages are addressed by their install source. To update just this extension:
-
 ```sh
-pi update git:github.com/kyleboas/pi-orchestrator
-```
-
-It is also picked up by the normal bulk update commands — `pi update --extensions` (all installed packages) and `pi update --all` (pi itself plus packages). To uninstall:
-
-```sh
-pi remove git:github.com/kyleboas/pi-orchestrator
+pi update @kyleboas/pi-orchestrator
+pi remove @kyleboas/pi-orchestrator
 ```
 
 ## Privacy and security
