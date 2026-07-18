@@ -226,9 +226,16 @@ A takeover interrupted with esc no longer sticks: the next user prompt while the
 
 ## Maintenance
 
+Packages are addressed by their install source. To update just this extension:
+
 ```sh
-pi update @kyleboas/pi-orchestrator
-pi remove @kyleboas/pi-orchestrator
+pi update git:github.com/kyleboas/pi-orchestrator
+```
+
+It is also picked up by the normal bulk update commands — `pi update --extensions` (all installed packages) and `pi update --all` (pi itself plus packages). To uninstall:
+
+```sh
+pi remove git:github.com/kyleboas/pi-orchestrator
 ```
 
 ## Privacy and security
