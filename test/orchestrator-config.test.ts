@@ -132,3 +132,32 @@ test("worker descriptions are accepted, sanitized, and surfaced", () => {
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
 	assert.equal(config.workers.Builder!.description, "Line one line two end");
 });
+
+test("worker sandbox opt-out parses only the literal off and rejects the catalog otherwise", () => {
+	const accepted = configFile({ workers: {
+		Ops: { backend: "pi-rpc", model: "provider/ops-model", thinking: "medium", sandbox: "off", description: "Host operations." },
+		Host: { backend: "claude-code", model: "sonnet", sandbox: "off" },
+		Boxed: { backend: "claude-code", model: "haiku" },
+	} });
+	try {
+		const workers = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: accepted }).workers;
+		assert.equal(workers.Ops!.sandbox, "off");
+		assert.equal(workers.Host!.sandbox, "off");
+		assert.equal(workers.Boxed!.sandbox, undefined);
+		assert.match(workerDescription("Ops", workers.Ops!), /UNSANDBOXED HOST WORKER/);
+		assert.match(workerDescription("Ops", workers.Ops!), /Host operations\.$/);
+		assert.doesNotMatch(workerDescription("Boxed", workers.Boxed!), /UNSANDBOXED/);
+	} finally { remove(accepted); }
+	// A catalog that tries to express a containment override with any other
+	// value must never load with a different meaning: the file falls back to
+	// the default catalog (with a warning) rather than silently sandboxing or
+	// silently unsandboxing the worker.
+	for (const bad of [true, false, "on", "required", "OFF", " off", 1, null]) {
+		const file = configFile({ workers: { Ops: { backend: "claude-code", model: "sonnet", sandbox: bad } } });
+		try {
+			const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
+			assert.deepEqual(config.workers, DEFAULT_WORKERS, JSON.stringify(bad));
+			assert.match(config.warning ?? "", /invalid/);
+		} finally { remove(file); }
+	}
+});

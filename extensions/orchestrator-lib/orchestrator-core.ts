@@ -1,8 +1,10 @@
 export const ORCHESTRATOR_TOOL_NAMES = ["orchestrator_delegate", "orchestrator_steer", "orchestrator_workers", "orchestrator_stop", "orchestrator_takeover"] as const;
 export const RPC_WORKER_TOOL_NAMES = ["read", "bash", "edit", "write"] as const;
 export type PiThinkingLevel = "low" | "medium" | "high";
-export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel; description?: string };
-export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string; description?: string };
+/** Explicit per-worker containment opt-out; the only accepted value is "off". */
+export type WorkerSandboxOverride = "off";
+export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel; description?: string; sandbox?: WorkerSandboxOverride };
+export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string; description?: string; sandbox?: WorkerSandboxOverride };
 export type WorkerProfile = PiRpcWorkerProfile | ClaudeCodeWorkerProfile;
 export type WorkerCatalog = Record<string, WorkerProfile>;
 
@@ -12,7 +14,10 @@ export function workerDescription(name: string, profile: WorkerProfile): string 
 	const base = profile.backend === "pi-rpc"
 		? `${name}: Pi RPC implementation worker (${profile.model}, ${profile.thinking} thinking).`
 		: `${name}: persistent Claude Code implementation worker (${profile.model}).`;
-	return profile.description ? `${base} ${profile.description}` : base;
+	const host = profile.sandbox === "off"
+		? " UNSANDBOXED HOST WORKER: runs directly on the host with no sandbox containment; reserve it for tasks that genuinely need host processes, services, or paths outside the sandbox workspace roots."
+		: "";
+	return profile.description ? `${base}${host} ${profile.description}` : `${base}${host}`;
 }
 export function catalogText(catalog: WorkerCatalog): string { const names = workerNames(catalog); return names.length < 2 ? names[0] ?? "workers" : `${names.slice(0, -1).join(", ")}, or ${names.at(-1)}`; }
 export function workerRpcArgs(model: string, thinking: PiThinkingLevel): string[] {
