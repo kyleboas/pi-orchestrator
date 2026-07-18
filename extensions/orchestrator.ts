@@ -924,10 +924,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 			// would start a coordinator turn) until the view closes.
 			runtime.reportsHeld = true;
 			ctx.ui.setWorkingVisible(false);
+			let pendingCoordinatorMessage: string | undefined;
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
 						let scrollUp = 0;
+						let input = "";
 						let cachedKey = "";
 						let cachedBody: string[] = [];
 						// Live view: poll local state only, and only redraw when the
@@ -1002,7 +1004,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 								const height = Math.max(12, process.stdout.rows ?? 30);
 								const title = `${worker.name} · ${worker.state} · ${worker.id}`;
 								// Workers launched before this version predate the transcript field.
-								const view = renderSessionScreen(title, buildBody(worker, width), width, height, scrollUp, theme);
+								const view = renderSessionScreen(title, buildBody(worker, width), width, height, scrollUp, theme, input);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
 								return view.lines;
 							},
@@ -1011,10 +1013,33 @@ export default function orchestrator(pi: ExtensionAPI) {
 								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
 								else if (isPageUpKey(data)) scrollUp += 10;
 								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - 10);
-								else if (isEscapeKey(data) || data === "q") {
+								else if (isEnterKey(data)) {
+									// The message goes to the coordinator, not the worker: close
+									// the view first so the coordinator turn owns the screen.
+									const text = input.trim();
+									if (!text) return;
+									pendingCoordinatorMessage = text;
 									done(undefined);
 									return;
-								} else return;
+								} else if (isEscapeKey(data)) {
+									if (input) input = "";
+									else {
+										done(undefined);
+										return;
+									}
+								} else if (data === "\x7f" || data === "\b") {
+									if (!input) return;
+									input = Array.from(input).slice(0, -1).join("");
+								} else {
+									// Anything printable feeds the coordinator message line
+									// (so `q` types rather than closes); unrecognized escape
+									// sequences are ignored and paste markers stripped.
+									const pasted = data.replace(/\x1b\[20[01]~/g, "");
+									if (pasted.startsWith("\x1b")) return;
+									const printable = Array.from(pasted).filter((char) => char >= " " && char !== "\x7f").join("");
+									if (!printable) return;
+									input += printable;
+								}
 								tui.requestRender();
 							},
 							invalidate: () => {},
@@ -1032,6 +1057,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 					ctx.ui.setWorkingVisible(true);
 					flushDeferredWorkerReports();
 					redraw();
+					// A message typed in the worker view goes to the coordinator with
+					// the viewed worker as context, after the overlay has released the
+					// screen so the coordinator turn renders normally.
+					if (pendingCoordinatorMessage) {
+						const viewed = runtime.workers.get(workerId);
+						pi.sendUserMessage(`[About worker ${workerId}${viewed ? ` (${viewed.name}, ${viewed.state})` : ""}] ${pendingCoordinatorMessage}`, { deliverAs: "followUp" });
+					}
 				});
 		};
 		const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
