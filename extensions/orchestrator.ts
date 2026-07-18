@@ -119,11 +119,12 @@ import {
 	isPageUpKey,
 	isUpKey,
 	moveSelection,
-	renderSessionScreen,
+	renderWorkerPane,
 	wrapPlainText,
 } from "./orchestrator-lib/orchestrator-session-view.ts";
 
 const LEGACY_WORKER_WIDGET_ID = "orchestrator-workers";
+const WORKER_VIEW_WIDGET_ID = "orchestrator-worker-view";
 
 export function createWorkerSchema(catalog: WorkerCatalog) {
 	return Type.Union(workerNames(catalog).map((name) => Type.Literal(name, { description: workerDescription(name, catalog[name]!) })));
@@ -796,6 +797,10 @@ export default function orchestrator(pi: ExtensionAPI) {
 
 	let refreshWorkerWidget = () => {};
 	let stopWorkerWidgetTimer = () => {};
+	// Worker being viewed in the above-editor pane; module scope because the
+	// input hook (registered outside session_start) tags submitted messages
+	// with this worker's identity.
+	let viewerWorkerId: string | undefined;
 	let takeoverReason = "explicit user request";
 	const solToolMode = new SolToolMode();
 
@@ -828,13 +833,21 @@ export default function orchestrator(pi: ExtensionAPI) {
 		// Footer keyboard selection: down from an empty editor enters the worker
 		// rows, enter opens that worker's session view, esc/up-past-top returns.
 		let selectedWorkerId: string | undefined;
-		let viewerOpen = false;
+		let viewerScrollUp = 0;
+		let viewerRequestRender = () => {};
+		const closeWorkerView = () => {
+			if (viewerWorkerId === undefined) return;
+			viewerWorkerId = undefined;
+			viewerRequestRender = () => {};
+			ctx.ui.setWidget(WORKER_VIEW_WIDGET_ID, undefined);
+			redraw();
+		};
 		// Only live workers are shown and selectable; settled ones leave the
 		// list immediately but stay in memory (still steerable) until their
 		// report is delivered and the retention window passes.
 		const pruneExpiredWorkers = () => {
 			for (const worker of [...runtime.workers.values()]) {
-				if (worker.id !== selectedWorkerId && !viewerOpen && isExpiredWorker(worker)) runtime.workers.delete(worker.id);
+				if (worker.id !== selectedWorkerId && worker.id !== viewerWorkerId && isExpiredWorker(worker)) runtime.workers.delete(worker.id);
 			}
 		};
 		const selectableWorkerIds = () => {
@@ -879,7 +892,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 		const render = () => {
 			// A selected worker that settles leaves the list; drop the selection
 			// with it (but not while its session view is open).
-			if (selectedWorkerId !== undefined && !viewerOpen && !selectableWorkerIds().includes(selectedWorkerId)) {
+			if (selectedWorkerId !== undefined && viewerWorkerId === undefined && !selectableWorkerIds().includes(selectedWorkerId)) {
 				selectedWorkerId = undefined;
 			}
 			if (hasAnimatingWorker([...runtime.workers.values()]) || selectedWorkerId !== undefined) installFooter();
@@ -917,157 +930,123 @@ export default function orchestrator(pi: ExtensionAPI) {
 					})
 					.catch(() => {});
 			}
-			viewerOpen = true;
-			// Minimize writes under the overlay: pi's overlay lives in a
-			// line-indexed buffer, so any base-screen change rewrites the whole
-			// viewport. Hide the streaming loader and hold worker reports (which
-			// would start a coordinator turn) until the view closes.
-			runtime.reportsHeld = true;
-			ctx.ui.setWorkingVisible(false);
-			let pendingCoordinatorMessage: string | undefined;
-			void ctx.ui
-				.custom<void>(
-					(tui, theme, _keybindings, done) => {
-						let scrollUp = 0;
-						let input = "";
-						let cachedKey = "";
-						let cachedBody: string[] = [];
-						// Live view: poll local state only, and only redraw when the
-						// transcript actually changed; no I/O or model calls.
-						let lastSignature = "";
-						const tick = setInterval(() => {
-							const worker = runtime.workers.get(workerId);
-							const signature = worker ? `${worker.transcriptRevision ?? worker.transcript?.length ?? 0}:${worker.state}` : "gone";
-							if (signature !== lastSignature) {
-								lastSignature = signature;
-								tui.requestRender();
-							}
-						}, 500);
-						// Native pi look: transcript entries render through pi's own
-						// message components (markdown, theme colors, word wrap).
-						const renderToolEntry = (entry: TranscriptEntry, width: number): string[] => {
-							// Pi's own tool row: built-in tools (bash, read, edit, …) get
-							// their exact native rendering, unknown tools the generic shell.
-							const call = entry.tool!;
-							const component = new ToolExecutionComponent(
-								call.name,
-								call.callId ?? "transcript",
-								call.args ?? {},
-								{ showImages: false },
-								undefined,
-								tui,
-								runtime.workers.get(workerId)?.cwd ?? process.cwd(),
-							);
-							component.markExecutionStarted();
-							component.setArgsComplete();
-							if (call.result) component.updateResult(call.result, false);
-							return component.render(width);
-						};
-						const buildBody = (worker: Worker, width: number): string[] => {
-							const transcript = worker.transcript ?? [];
-							const key = `${worker.transcriptRevision ?? transcript.length}:${width}`;
-							if (key === cachedKey) return cachedBody;
-							const markdownTheme = getMarkdownTheme();
-							const lines: string[] = [];
-							for (const entry of transcript) {
-								try {
-									if (entry.role === "user") {
-										lines.push(...new UserMessageComponent(entry.text, markdownTheme).render(width));
-									} else if (entry.role === "assistant") {
-										const part = entry.thinking ? { type: "thinking", thinking: entry.text } : { type: "text", text: entry.text };
-										const message = { content: [part] };
-										lines.push(...new AssistantMessageComponent(message as never, false, markdownTheme).render(width));
-									} else if (entry.role === "tool" && entry.tool?.name) {
-										lines.push(...renderToolEntry(entry, width));
-									} else if (entry.role === "tool") {
-										// Legacy flattened entries (pre-structured transcripts):
-										// one truncated summary line, never a wall of wrapped text.
-										const summary = entry.text.split(/\r?\n/, 1)[0] ?? "";
-										const chars = Array.from(` ⚒ ${summary}`);
-										lines.push(theme.fg("toolTitle", chars.length > width ? `${chars.slice(0, Math.max(1, width - 1)).join("")}…` : chars.join("")));
-									} else {
-										lines.push(...wrapPlainText(entry.text, width - 2).map((line) => theme.fg("error", ` ${line}`)));
-									}
-								} catch {
-									lines.push(...wrapPlainText(entry.text, width - 2).map((line) => ` ${line}`));
-								}
-								lines.push("");
-							}
-							cachedKey = key;
-							cachedBody = lines;
-							return lines;
-						};
-						return {
-							render: (width: number) => {
-								const worker = runtime.workers.get(workerId);
-								if (!worker) return [theme.fg("dim", "Worker is gone.")];
-								const height = Math.max(12, process.stdout.rows ?? 30);
-								const title = `${worker.name} · ${worker.state} · ${worker.id}`;
-								// Workers launched before this version predate the transcript field.
-								const view = renderSessionScreen(title, buildBody(worker, width), width, height, scrollUp, theme, input);
-								scrollUp = Math.min(scrollUp, view.maxScrollUp);
-								return view.lines;
-							},
-							handleInput: (data: string) => {
-								if (isUpKey(data)) scrollUp += 1;
-								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
-								else if (isPageUpKey(data)) scrollUp += 10;
-								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - 10);
-								else if (isEnterKey(data)) {
-									// The message goes to the coordinator, not the worker: close
-									// the view first so the coordinator turn owns the screen.
-									const text = input.trim();
-									if (!text) return;
-									pendingCoordinatorMessage = text;
-									done(undefined);
-									return;
-								} else if (isEscapeKey(data)) {
-									if (input) input = "";
-									else {
-										done(undefined);
-										return;
-									}
-								} else if (data === "\x7f" || data === "\b") {
-									if (!input) return;
-									input = Array.from(input).slice(0, -1).join("");
+			viewerWorkerId = workerId;
+			viewerScrollUp = 0;
+			// The worker transcript renders as a widget ABOVE pi's own editor —
+			// never a full-terminal takeover. Pi's chat, input history, paste,
+			// and submit stay fully native; a submitted message reaches the
+			// coordinator tagged with this worker's identity via the input hook.
+			ctx.ui.setWidget(
+				WORKER_VIEW_WIDGET_ID,
+				(tui, theme) => {
+					let cachedKey = "";
+					let cachedBody: string[] = [];
+					// Live view: poll local state only, and only redraw when the
+					// transcript actually changed; no I/O or model calls.
+					let lastSignature = "";
+					const tick = setInterval(() => {
+						const worker = runtime.workers.get(workerId);
+						const signature = worker ? `${worker.transcriptRevision ?? worker.transcript?.length ?? 0}:${worker.state}` : "gone";
+						if (signature !== lastSignature) {
+							lastSignature = signature;
+							tui.requestRender();
+						}
+					}, 500);
+					viewerRequestRender = () => tui.requestRender();
+					// Native pi look: transcript entries render through pi's own
+					// message components (markdown, theme colors, word wrap).
+					const renderToolEntry = (entry: TranscriptEntry, width: number): string[] => {
+						// Pi's own tool row: built-in tools (bash, read, edit, …) get
+						// their exact native rendering, unknown tools the generic shell.
+						const call = entry.tool!;
+						const component = new ToolExecutionComponent(
+							call.name,
+							call.callId ?? "transcript",
+							call.args ?? {},
+							{ showImages: false },
+							undefined,
+							tui,
+							runtime.workers.get(workerId)?.cwd ?? process.cwd(),
+						);
+						component.markExecutionStarted();
+						component.setArgsComplete();
+						if (call.result) component.updateResult(call.result, false);
+						return component.render(width);
+					};
+					const buildBody = (worker: Worker, width: number): string[] => {
+						const transcript = worker.transcript ?? [];
+						const key = `${worker.transcriptRevision ?? transcript.length}:${width}`;
+						if (key === cachedKey) return cachedBody;
+						const markdownTheme = getMarkdownTheme();
+						const lines: string[] = [];
+						for (const entry of transcript) {
+							try {
+								if (entry.role === "user") {
+									lines.push(...new UserMessageComponent(entry.text, markdownTheme).render(width));
+								} else if (entry.role === "assistant") {
+									const part = entry.thinking ? { type: "thinking", thinking: entry.text } : { type: "text", text: entry.text };
+									const message = { content: [part] };
+									lines.push(...new AssistantMessageComponent(message as never, false, markdownTheme).render(width));
+								} else if (entry.role === "tool" && entry.tool?.name) {
+									lines.push(...renderToolEntry(entry, width));
+								} else if (entry.role === "tool") {
+									// Legacy flattened entries (pre-structured transcripts):
+									// one truncated summary line, never a wall of wrapped text.
+									const summary = entry.text.split(/\r?\n/, 1)[0] ?? "";
+									const chars = Array.from(` ⚒ ${summary}`);
+									lines.push(theme.fg("toolTitle", chars.length > width ? `${chars.slice(0, Math.max(1, width - 1)).join("")}…` : chars.join("")));
 								} else {
-									// Anything printable feeds the coordinator message line
-									// (so `q` types rather than closes); unrecognized escape
-									// sequences are ignored and paste markers stripped.
-									const pasted = data.replace(/\x1b\[20[01]~/g, "");
-									if (pasted.startsWith("\x1b")) return;
-									const printable = Array.from(pasted).filter((char) => char >= " " && char !== "\x7f").join("");
-									if (!printable) return;
-									input += printable;
+									lines.push(...wrapPlainText(entry.text, width - 2).map((line) => theme.fg("error", ` ${line}`)));
 								}
-								tui.requestRender();
-							},
-							invalidate: () => {},
-							dispose: () => clearInterval(tick),
-						};
-					},
-					// Full-terminal takeover: extensions cannot swap pi's core chat
-					// view, so the session view covers it edge to edge instead.
-					{ overlay: true, overlayOptions: { width: "100%", anchor: "top-left", row: 0, col: 0 } },
-				)
-				.catch(() => {})
-				.finally(() => {
-					viewerOpen = false;
-					runtime.reportsHeld = false;
-					ctx.ui.setWorkingVisible(true);
-					flushDeferredWorkerReports();
-					redraw();
-					// A message typed in the worker view goes to the coordinator with
-					// the viewed worker as context, after the overlay has released the
-					// screen so the coordinator turn renders normally.
-					if (pendingCoordinatorMessage) {
-						const viewed = runtime.workers.get(workerId);
-						pi.sendUserMessage(`[About worker ${workerId}${viewed ? ` (${viewed.name}, ${viewed.state})` : ""}] ${pendingCoordinatorMessage}`, { deliverAs: "followUp" });
-					}
-				});
+							} catch {
+								lines.push(...wrapPlainText(entry.text, width - 2).map((line) => ` ${line}`));
+							}
+							lines.push("");
+						}
+						cachedKey = key;
+						cachedBody = lines;
+						return lines;
+					};
+					return {
+						render: (width: number) => {
+							const worker = runtime.workers.get(workerId);
+							if (!worker) return [theme.fg("dim", "Worker is gone.")];
+							// Bounded pane: leave room for pi's chat tail and editor.
+							const viewportRows = Math.max(6, Math.min(24, (process.stdout.rows ?? 30) - 12));
+							const title = `${worker.name} · ${worker.state} · ${worker.id}`;
+							const view = renderWorkerPane(title, buildBody(worker, width), width, viewportRows, viewerScrollUp, theme);
+							viewerScrollUp = Math.min(viewerScrollUp, view.maxScrollUp);
+							return view.lines;
+						},
+						invalidate: () => {},
+						dispose: () => clearInterval(tick),
+					};
+				},
+				{ placement: "aboveEditor" },
+			);
+			redraw();
 		};
 		const unsubscribeInput = ctx.ui.onTerminalInput((data) => {
-			if (viewerOpen) return undefined;
+			if (viewerWorkerId !== undefined) {
+				// The pane owns only pgup/pgdn (scroll) and esc-on-empty-editor
+				// (close); every other key — typing, enter, history — belongs to
+				// pi's own editor so messaging the coordinator stays native.
+				if (isPageUpKey(data)) {
+					viewerScrollUp += 10;
+					viewerRequestRender();
+					return { consume: true };
+				}
+				if (isPageDownKey(data)) {
+					viewerScrollUp = Math.max(0, viewerScrollUp - 10);
+					viewerRequestRender();
+					return { consume: true };
+				}
+				if (isEscapeKey(data) && ctx.ui.getEditorText() === "") {
+					closeWorkerView();
+					return { consume: true };
+				}
+				return undefined;
+			}
 			if (selectedWorkerId === undefined) {
 				// Only an empty editor hands the down arrow over to the worker rows,
 				// so history navigation and multi-line editing keep their keys.
@@ -1101,10 +1080,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 		const disposeUi = () => {
 			unsubscribeInput();
 			selectedWorkerId = undefined;
+			viewerWorkerId = undefined;
 			runtime.reportsHeld = false;
 			stopTimer();
 			removeFooter();
 			ctx.ui.setWidget(LEGACY_WORKER_WIDGET_ID, undefined);
+			ctx.ui.setWidget(WORKER_VIEW_WIDGET_ID, undefined);
 		};
 		stopWorkerWidgetTimer = disposeUi;
 		refreshWorkerWidget = () => {
@@ -1134,14 +1115,20 @@ export default function orchestrator(pi: ExtensionAPI) {
 			const restoredTools = solToolMode.settle();
 			if (restoredTools) pi.setActiveTools(restoredTools);
 		}
+		// A message typed while a worker pane is open is about that worker: tag
+		// it so the coordinator has the context without the user retyping it.
+		const viewed = viewerWorkerId !== undefined && event.source === "interactive" ? getOrchestratorRuntime().workers.get(viewerWorkerId) : undefined;
+		const result: { action: "continue" } | { action: "transform"; text: string } = viewed
+			? { action: "transform", text: `[About worker ${viewed.id} (${viewed.name}, ${viewed.state})] ${event.text}` }
+			: { action: "continue" };
 		const takeoverTools = solToolMode.beginTakeover(
 			event.text,
 			pi.getActiveTools(),
 			pi.getAllTools().map((tool) => tool.name),
 		);
-		if (!takeoverTools) return { action: "continue" };
+		if (!takeoverTools) return result;
 		pi.setActiveTools(takeoverTools);
-		return { action: "continue" };
+		return result;
 	});
 
 	pi.on("before_agent_start", async (event) => {

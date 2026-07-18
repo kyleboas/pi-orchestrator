@@ -92,55 +92,49 @@ function padVisible(text: string, width: number): string {
 }
 
 /**
- * Render the worker session view as a full-screen takeover, like entering a
- * subagent in Claude Code. Pi extensions cannot replace the core chat view,
- * so this is a full-terminal overlay: every row must be padded to the full
- * width and the view must fill the full height, because the compositor
- * replaces exactly the cells a component emits — anything narrower or
- * shorter lets the chat behind it bleed through.
+ * Render the worker session pane shown as a widget above pi's own editor.
+ * Deliberately NOT a full-terminal takeover: pi's chat and input stay live
+ * below the pane, so typing, history, paste, and submit all behave natively
+ * and a submitted message reaches the coordinator (tagged with the viewed
+ * worker by the caller's input hook).
  *
  * `bodyLines` are prerendered (already themed/wrapped) transcript lines, so
  * callers can build them with pi's own message components for a native look.
- * `scrollUp` counts lines up from the bottom (0 = follow live output).
- * Returns the lines plus the maximum meaningful scrollUp so callers can
- * clamp.
+ * `scrollUp` counts lines up from the bottom (0 = follow live output). The
+ * pane shrinks below `viewportRows` when the transcript is short rather than
+ * padding empty rows. Returns the lines plus the maximum meaningful scrollUp
+ * so callers can clamp.
  */
-export function renderSessionScreen(
+export function renderWorkerPane(
 	title: string,
 	bodyLines: readonly string[],
 	width: number,
-	height: number,
+	viewportRows: number,
 	scrollUp: number,
 	theme: ViewerTheme,
-	input?: string,
 ): { lines: string[]; maxScrollUp: number } {
 	const fullWidth = Math.max(24, width);
 	const body = bodyLines.length ? bodyLines : ["No output yet."];
 
-	const inputRows = input === undefined ? 0 : 1;
-	const viewport = Math.max(3, height - 3 - inputRows);
+	const viewport = Math.max(3, viewportRows);
 	const maxScrollUp = Math.max(0, body.length - viewport);
 	const clamped = Math.min(Math.max(0, scrollUp), maxScrollUp);
 	const end = body.length - clamped;
 	const visible = body.slice(Math.max(0, end - viewport), end).map((line) => padVisible(line, fullWidth));
-	while (visible.length < viewport) visible.push(" ".repeat(fullWidth));
 
-	const hints = input === undefined
-		? `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to go back`
-		: `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · type + enter to message the coordinator · esc to go back`;
+	// Title and hints are plain text built here, so truncate before theming;
+	// prerendered body lines keep their own width handling.
+	const fit = (text: string): string => {
+		const chars = Array.from(text);
+		return padVisible(chars.length > fullWidth ? `${chars.slice(0, fullWidth - 1).join("")}…` : text, fullWidth);
+	};
+	const hints = `pgup/pgdn scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to close · the input below messages the coordinator`;
 	const lines = [
-		theme.fg("text", padVisible(` ${title}`, fullWidth)),
+		theme.fg("text", fit(` ${title}`)),
 		theme.fg("dim", "─".repeat(fullWidth)),
 		...visible,
-		// Coordinator message line: keep the cursor end visible when the typed
-		// text outgrows the row by trimming from the left, code-point safe.
-		...(input === undefined ? [] : (() => {
-			const room = Math.max(4, fullWidth - 5);
-			const chars = Array.from(input);
-			const shown = chars.length > room ? `…${chars.slice(chars.length - room + 1).join("")}` : input;
-			return [theme.fg("text", padVisible(` › ${shown}▌`, fullWidth))];
-		})()),
-		theme.fg("dim", padVisible(` ${hints}`, fullWidth)),
+		theme.fg("dim", "─".repeat(fullWidth)),
+		theme.fg("dim", fit(` ${hints}`)),
 	];
 	return { lines, maxScrollUp };
 }
