@@ -61,13 +61,25 @@ function description(value: unknown): { description?: string } {
 	const cleaned = value.replace(/\s+/g, " ").trim().slice(0, 300);
 	return cleaned ? { description: cleaned } : {};
 }
+/**
+ * Per-worker sandbox opt-out. Only the exact literal "off" opts a worker out
+ * of containment; any other present value rejects the profile (and with it the
+ * whole catalog) rather than being silently ignored — a config that tries to
+ * express a containment override must never load with a different meaning.
+ */
+function workerSandbox(value: unknown): { ok: true; sandbox?: { sandbox: "off" } } | { ok: false } {
+	if (value === undefined) return { ok: true };
+	return value === "off" ? { ok: true, sandbox: { sandbox: "off" } } : { ok: false };
+}
 function profile(value: unknown): WorkerProfile | undefined {
 	if (!object(value)) return undefined;
+	const sandbox = workerSandbox(value.sandbox);
+	if (!sandbox.ok) return undefined;
 	if (value.backend === "pi-rpc") {
 		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model)) return undefined;
-		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description) };
+		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description), ...sandbox.sandbox };
 	}
-	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim(), ...description(value.description) };
+	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim(), ...description(value.description), ...sandbox.sandbox };
 	return undefined;
 }
 function workers(value: unknown): Record<string, WorkerProfile> | undefined {

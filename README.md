@@ -55,6 +55,8 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
 
 `workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string.
 
+A worker profile may additionally declare `"sandbox": "off"`, the explicit per-worker opt-out described under [Worker sandbox](#worker-sandbox-linux-bubblewrap). Only the exact literal `"off"` is accepted; any other present value rejects the catalog (the config falls back to defaults with a warning) rather than loading with a different containment meaning.
+
 ### Restricted pull-request broker
 
 `pullRequests` is absent by default: no worker receives PR publishing authority. When explicitly configured, it is an exact, case-normalized GitHub allowlist and branch-prefix policy:
@@ -62,11 +64,13 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
 ```json
 {
   "pullRequests": {
-    "repositories": ["owner/repository"],
+    "repositories": ["owner/repository", "owner/*"],
     "branchPrefixes": ["feat/", "fix/"]
   }
 }
 ```
+
+A repository entry is either an exact `owner/repository` or the explicit owner-wide `owner/*`, which allows every repository under that owner. Only those two full forms parse; any partial pattern (`*`, `*/name`, `owner/pre*`) rejects the whole block — authority is never broadened by a typo. The wildcard affects eligibility only: the pinned target is always the exact repository parsed from the workspace's canonical origin, and every subsequent check runs against that pin. Branch prefixes are real path prefixes ending in `/`; there is no wildcard prefix form.
 
 Both arrays are bounded, duplicate-free, and strictly validated; malformed broker configuration disables the broker with a generic warning. For an eligible **sandboxed** worker, the host pins the canonical repository `origin` and its default branch before worker code starts (using the local origin HEAD when available, otherwise trusted `gh repo view`). Linked Git worktrees are not eligible because their `.git` file points outside the mounted workspace; the broker fails closed rather than claiming sandbox support for them. It mounts only a per-worker `/pr` directory containing `/pr/pio-pr` and a mode-0600 Unix socket. Existing narrow model-provider authentication/config mounts remain available so the worker can reach its model, but the broker feature exposes no host HOME, GitHub `gh` configuration, SSH files/agent socket, `GH_TOKEN`/`GITHUB_TOKEN`, or GitHub credentials.
 
@@ -145,6 +149,21 @@ Modes:
 - `preferred`: sandbox when a cached functional probe passes; otherwise the worker launches unsandboxed with a prominent warning in the delegate result and worker transcript.
 - `required`: fail closed. A missing binary, failed namespace probe, unresolvable worker executable, or unenforceable isolated network rejects the delegation; nothing ever silently falls back. A malformed `sandbox` block also disables delegation rather than quietly becoming `off`. `network: "gateway"` always fails closed, including with `mode: "preferred"`; it can never fall back to a credential-bearing host launch.
 
+### Per-worker opt-out: designated host workers
+
+A sandboxed catalog cannot touch the host: workers cannot see host PIDs, the user systemd bus, journals, or paths outside their workspace mount, so operational tasks (reaping stale processes, restarting services, deploying into `~/.config`) dead-end with "a host-capable session is required". Rather than turning the sandbox off globally, designate an explicit ops worker with `"sandbox": "off"` in its profile:
+
+```json
+"workers": {
+  "Ops": { "backend": "pi-rpc", "model": "provider/model", "thinking": "medium", "sandbox": "off",
+           "description": "Host operations: processes, services, deploys, anything outside the workspace roots." }
+}
+```
+
+Such a worker launches directly on the host with the same semantics as global `mode: "off"`: no bwrap, no workspace-root restriction (its `cwd` may be any accessible directory, including the coordinator's session cwd), and no PR broker (env stripping is skipped too — a host worker can read every credential file anyway, so stripping would only break its Git/SSH tooling without containing anything). The configured `env` policy still applies unchanged; add names like `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS` to `envAllow` if the ops worker must reach the user systemd bus under `env: "allowlist"`. The opt-out is loud, never silent: the worker's catalog description is prefixed with `UNSANDBOXED HOST WORKER`, and every delegate result notes the host launch.
+
+Two boundaries are never weakened by the override. An invalid `sandbox` block still disables delegation for every worker, opted out or not. And under `network: "gateway"` the opt-out is rejected at spawn with a clear error — a gateway configuration never permits a credential-bearing host launch, per-worker or otherwise.
+
 Sandboxed workers additionally require a **workspace policy**. `workspaceRoots` lists the directories whose contents may be selected as per-task workspaces; `orchestrator_delegate` accepts an optional `cwd` naming the exact repository directory, which is canonicalized (symlinks cannot escape) and must be equal to or inside a configured root — only that selected directory is mounted read-write, never a whole root. When `cwd` is omitted, the coordinator's session cwd is used only if it passes the same checks; otherwise the delegation is rejected with instructions to pass a repo cwd. The host home directory (or any ancestor of it, or anything overlapping the worker's isolated home) is always refused as a workspace, in every sandbox mode, because binding it would expose the entire home read-write and shadow the isolated HOME/token mounts. With no `workspaceRoots` configured, sandboxed delegation fails closed. Never list your home directory itself as a workspace root.
 
 What a sandboxed worker gets: the selected workspace directory read-write; a private per-worker HOME (removed on exit) and tmpfs `/tmp`; system runtimes, certificates, and the resolved worker executable's runtime root (nvm-style Node trees and standalone Claude installs are handled) read-only; minimal `/proc` and `/dev`; new PID/IPC/UTS namespaces with parent-death teardown, so killing the worker reliably kills its whole process tree. The rest of the home directory, `/root`, `/var`, and unrelated `/etc` are not mounted. `readOnlyPaths` adds strict read-only mounts (a missing path fails the launch loudly).
@@ -164,6 +183,7 @@ Exact non-guarantees — this is containment, not a full security boundary:
 - **Network egress is not restricted** under `network: "host"`: a worker can reach the host loopback and the internet, and prompts inherently send mounted repository content to the model provider.
 - **Active provider credentials remain visible in legacy `host`/`none` sandbox modes.** Claude account and narrow Pi credential mounts are retained there for exact compatibility. Use `network: "gateway"` to isolate them.
 - **The coordinator itself is not sandboxed.** It runs host-side with its normal tools; whole-session containment needs a future external launcher, not this extension.
+- **A worker with `"sandbox": "off"` is deliberately uncontained.** It runs with your full user authority on the host. Only configure one on a machine where you would run its tasks yourself, and keep its catalog description honest about that scope.
 - No resource limits (CPU/memory) are imposed yet, and macOS/Podman backends are not implemented.
 
 ## Worker session view

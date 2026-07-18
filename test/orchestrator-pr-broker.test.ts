@@ -10,6 +10,7 @@ import {
 	gitMetadataForTesting,
 	normalizeGitHubRemote,
 	parsePullRequestsConfig,
+	repositoryAllowed,
 	PR_MAX_REQUESTS,
 	PR_REQUEST_LIMIT,
 	PR_RESPONSE_LIMIT,
@@ -74,6 +75,24 @@ function request(path: string, value: unknown): Promise<Record<string, unknown>>
 test("PR policy is opt-in, bounded, normalized, and fails closed", () => {
 	assert.deepEqual(parsePullRequestsConfig({ repositories: ["Owner/Repository"], branchPrefixes: ["feat/"] }), { repositories: ["owner/repository"], branchPrefixes: ["feat/"] });
 	for (const value of [undefined, {}, { repositories: ["owner/repository", "OWNER/repository"], branchPrefixes: ["feat/"] }, { repositories: ["owner/repository"], branchPrefixes: ["../"] }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], extra: true }]) assert.equal(parsePullRequestsConfig(value), undefined);
+});
+
+test("owner wildcard entries parse only as the exact owner/* form and match only that owner", () => {
+	assert.deepEqual(parsePullRequestsConfig({ repositories: ["Owner/*"], branchPrefixes: ["feat/"] }), { repositories: ["owner/*"], branchPrefixes: ["feat/"] });
+	// Anything other than a full exact repository or a full owner wildcard
+	// rejects the block: authority is never broadened by a typo.
+	for (const bad of ["*", "*/repository", "owner/*x", "owner/x*", "owner/*/", "*/*", "owner /*"]) {
+		assert.equal(parsePullRequestsConfig({ repositories: [bad], branchPrefixes: ["feat/"] }), undefined, bad);
+	}
+	const wildcard = parsePullRequestsConfig({ repositories: ["owner/*", "other/exact"], branchPrefixes: ["feat/"] })!;
+	assert.equal(repositoryAllowed("owner/anything", wildcard), true);
+	assert.equal(repositoryAllowed("owner/another-repo", wildcard), true);
+	assert.equal(repositoryAllowed("other/exact", wildcard), true);
+	assert.equal(repositoryAllowed("other/unlisted", wildcard), false);
+	assert.equal(repositoryAllowed("third/anything", wildcard), false);
+	const exact = parsePullRequestsConfig({ repositories: ["owner/repository"], branchPrefixes: ["feat/"] })!;
+	assert.equal(repositoryAllowed("owner/repository", exact), true);
+	assert.equal(repositoryAllowed("owner/other", exact), false);
 });
 
 test("only canonical GitHub origins and safe non-default prefix branches qualify", () => {

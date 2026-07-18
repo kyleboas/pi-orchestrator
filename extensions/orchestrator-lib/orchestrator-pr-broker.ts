@@ -19,6 +19,8 @@ export const PR_BODY_LIMIT = 32_000;
 export const PR_MAX_CONNECTIONS = 8;
 export const PR_MAX_REQUESTS = 32;
 const REPOSITORY = /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/[a-z\d][a-z\d._-]{0,99}$/i;
+/** An owner-wide allowlist entry: exactly `owner/*`, nothing partial. */
+const OWNER_WILDCARD = /^[a-z\d](?:[a-z\d-]{0,37}[a-z\d])?\/\*$/i;
 const PREFIX = /^(?!.*(?:^|\/)\.?\.?\/(?:|$))(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9][A-Za-z0-9._/-]{0,79}\/$/;
 const BRANCH = /^(?!-)(?!.*(?:^|\/)\.?\.?\/(?:|$))(?!.*\.\.)(?!.*\/\/)(?!.*\.lock(?:\/|$))[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 
@@ -26,6 +28,12 @@ type CommandResult = { ok: boolean; stdout: string };
 export type BrokerRunner = (command: string, args: string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number; signal?: AbortSignal }) => Promise<CommandResult>;
 function text(value: unknown, max: number): value is string { return typeof value === "string" && value.length > 0 && value.length <= max && !/[\0\r\n]/.test(value); }
 function normalizedRepository(value: string): string | undefined { const repository = value.trim().toLowerCase(); return REPOSITORY.test(repository) ? repository : undefined; }
+/** An allowlist entry is an exact `owner/name` or the explicit owner-wide `owner/*`; anything else rejects the block. */
+function normalizedRepositoryEntry(value: string): string | undefined { const entry = value.trim().toLowerCase(); return REPOSITORY.test(entry) || OWNER_WILDCARD.test(entry) ? entry : undefined; }
+/** Eligibility only: the pinned target is always the exact repository parsed from the workspace origin. */
+export function repositoryAllowed(repository: string, policy: PullRequestsConfig): boolean {
+	return policy.repositories.includes(repository) || policy.repositories.includes(`${repository.split("/")[0]}/*`);
+}
 
 /** Strict parser: a present malformed block means no broker, never broadened authority. */
 export function parsePullRequestsConfig(value: unknown): PullRequestsConfig | undefined {
@@ -33,7 +41,7 @@ export function parsePullRequestsConfig(value: unknown): PullRequestsConfig | un
 	const raw = value as Record<string, unknown>;
 	if (Object.keys(raw).some((key) => key !== "repositories" && key !== "branchPrefixes") || !Array.isArray(raw.repositories) || !Array.isArray(raw.branchPrefixes) || !raw.repositories.length || !raw.branchPrefixes.length || raw.repositories.length > 32 || raw.branchPrefixes.length > 32) return undefined;
 	const repositories: string[] = [], branchPrefixes: string[] = [], seenRepositories = new Set<string>(), seenPrefixes = new Set<string>();
-	for (const value of raw.repositories) { if (!text(value, 140)) return undefined; const repository = normalizedRepository(value); if (!repository || seenRepositories.has(repository)) return undefined; seenRepositories.add(repository); repositories.push(repository); }
+	for (const value of raw.repositories) { if (!text(value, 140)) return undefined; const repository = normalizedRepositoryEntry(value); if (!repository || seenRepositories.has(repository)) return undefined; seenRepositories.add(repository); repositories.push(repository); }
 	for (const value of raw.branchPrefixes) { if (!text(value, 81)) return undefined; const prefix = value.trim(); if (!PREFIX.test(prefix) || seenPrefixes.has(prefix.toLowerCase())) return undefined; seenPrefixes.add(prefix.toLowerCase()); branchPrefixes.push(prefix); }
 	return { repositories, branchPrefixes };
 }
@@ -190,14 +198,14 @@ export function pinPullRequestTargetSync(cwd: string, policy: PullRequestsConfig
 	const get = (...args: string[]): string | undefined => { try { const result = spawnSync("git", gitArgs(...args), { cwd: file.workspace, env: { ...trustedEnv(process.env), ...GIT_ENV }, stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, encoding: "utf8", maxBuffer: PR_RESPONSE_LIMIT }); const value = result.status === 0 ? (result.stdout ?? "").trim() : ""; return value && value.length <= 512 && !/[\0\r\n]/.test(value) ? value : undefined; } catch { return undefined; } };
 	if (get("rev-parse", "--is-inside-work-tree") !== "true" || get("rev-parse", "--show-toplevel") !== file.workspace) return undefined;
 	const remote = get("remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
-	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
+	if (!parsed || !repositoryAllowed(parsed.repository, policy)) return undefined;
 	const defaultBranch = syncDefaultBranch(parsed.repository);
 	return defaultBranch ? { ...file, git: file.git, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }
 export async function pinPullRequestTarget(cwd: string, policy: PullRequestsConfig, runner: BrokerRunner = defaultRunner): Promise<PinnedPullRequestTarget | undefined> {
 	const file = identity(cwd); if (!file || !file.git || (await line(runner, file.workspace, "rev-parse", "--is-inside-work-tree")) !== "true" || (await line(runner, file.workspace, "rev-parse", "--show-toplevel")) !== file.workspace) return undefined;
 	const remote = await line(runner, file.workspace, "remote", "get-url", "origin"), parsed = remote && normalizeGitHubRemote(remote);
-	if (!parsed || !policy.repositories.includes(parsed.repository)) return undefined;
+	if (!parsed || !repositoryAllowed(parsed.repository, policy)) return undefined;
 	const defaultBranch = await resolveDefaultBranch(parsed.repository, runner);
 	return defaultBranch ? { ...file, git: file.git, repository: parsed.repository, remoteUrl: parsed.remoteUrl, defaultBranch, generation: randomUUID() } : undefined;
 }

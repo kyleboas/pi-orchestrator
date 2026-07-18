@@ -18,6 +18,7 @@ import {
 	resolveWorkerCommand,
 	resolveWorkerLaunch,
 	resolveWorkerWorkspace,
+	sandboxConfigForWorker,
 	workerHomeDirPath,
 	type WorkspaceFs,
 	type CommandFs,
@@ -570,4 +571,32 @@ test("worker home paths are stable, sanitized, and scoped to the orchestrator ca
 	const path = workerHomeDirPath("luna-1a2b3c4d");
 	assert.ok(path.startsWith(join(homedir(), ".cache", "pi-orchestrator")));
 	assert.equal(workerHomeDirPath("../../etc"), join(homedir(), ".cache", "pi-orchestrator", "worker-homes", "-etc"));
+});
+
+test("per-worker sandbox opt-out launches directly while preserving env policy and hard boundaries", () => {
+	const required = sandbox({ mode: "required", env: "allowlist", workspaceRoots: ["/work"] });
+	assert.equal(sandboxConfigForWorker(required, false), required, "no opt-out returns the config unchanged");
+	const effective = sandboxConfigForWorker(required, true);
+	assert.equal(effective.mode, "off");
+	assert.equal(effective.env, "allowlist", "the configured env policy is never weakened by the opt-out");
+	// Direct launch without probing; the allowlist still strips credentials.
+	const launch = resolveWorkerLaunch(effective, request(), fakeEnv, () => {
+		throw new Error("opt-out must not probe");
+	}, fakeFs);
+	assert.ok(launch.ok && !launch.sandboxed);
+	assert.equal(launch.spec.command, "pi");
+	assert.equal(launch.spec.env.SECRET_TOKEN, undefined);
+	assert.equal(launch.spec.env.TERM, "xterm-256color");
+	// Mode-off workspace rules apply: the session cwd, including the home
+	// directory, is a valid workspace for an explicit host worker.
+	const workspace = resolveWorkerWorkspace(effective, undefined, "/home/user");
+	assert.ok(workspace.ok && workspace.cwd === "/home/user");
+	// The override never weakens fail-closed boundaries: an invalid sandbox
+	// block and a gateway network both refuse to synthesize a host launch.
+	assert.equal(sandboxConfigForWorker(INVALID_SANDBOX_CONFIG, true), INVALID_SANDBOX_CONFIG);
+	const gateway = sandbox({ mode: "required", network: "gateway", gateway: { upstreamUrl: "http://127.0.0.1:4000", tokenFile: "/g/token", model: "coding-main" } });
+	assert.equal(sandboxConfigForWorker(gateway, true), gateway);
+	// A globally-off sandbox is already a direct launch; the config passes through.
+	const off = sandbox();
+	assert.equal(sandboxConfigForWorker(off, true), off);
 });

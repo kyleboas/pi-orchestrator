@@ -165,6 +165,21 @@ export function parseSandboxConfig(value: unknown): SandboxConfig | undefined {
 	};
 }
 
+/**
+ * Effective sandbox policy for one worker. An explicit per-worker
+ * `"sandbox": "off"` launches that worker directly on the host with the same
+ * semantics as global mode "off", while the configured env policy still
+ * applies unchanged. Two boundaries are never weakened by the override: an
+ * invalid sandbox block keeps delegation disabled for every worker, and
+ * network "gateway" configs must reject the override entirely at the spawn
+ * authority (a gateway setup never permits a credential-bearing host launch),
+ * so this helper refuses to synthesize the unrepresentable off+gateway shape.
+ */
+export function sandboxConfigForWorker(config: SandboxConfig, optOut: boolean): SandboxConfig {
+	if (!optOut || config.invalid || config.mode === "off" || config.network === "gateway") return config;
+	return { ...config, mode: "off" };
+}
+
 export type SandboxProbe = { ok: true; unshareNet: boolean } | { ok: false; reason: string };
 export type ProbeRunner = (bin: string, args: string[]) => boolean;
 
