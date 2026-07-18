@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execSync } from "node:child_process";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	bindOrchestratorApi,
+	killWorkerProcessTree,
 	bindOrchestratorSession,
 	createOrchestratorRuntimeForTesting,
 	deliverWorkerReport,
@@ -125,4 +127,26 @@ test("the process exit cleanup hook is registered once across generations", () =
 	assert.equal(ensureOrchestratorExitHook(runtime, register), true);
 	assert.equal(ensureOrchestratorExitHook(runtime, register), false);
 	assert.equal(registrations, 1);
+});
+
+test("killWorkerProcessTree kills a detached worker's whole process group", async () => {
+	const { spawn } = await import("node:child_process");
+	// A detached group leader with a grandchild; killing only the leader would
+	// orphan the grandchild sleep.
+	const leader = spawn("bash", ["-c", "sleep 300 & wait"], { detached: true, stdio: "ignore" });
+	assert.ok(typeof leader.pid === "number" && leader.pid > 0);
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	const children = execSync(`pgrep -g ${leader.pid} | wc -l`, { encoding: "utf8" }).trim();
+	assert.ok(Number(children) >= 2, `expected leader plus grandchild in group, saw ${children}`);
+	killWorkerProcessTree(leader);
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	const survivors = execSync(`pgrep -g ${leader.pid} | wc -l || true`, { encoding: "utf8" }).trim();
+	assert.equal(Number(survivors), 0, "the entire process group is gone");
+});
+
+test("killWorkerProcessTree tolerates fake and already-dead children", () => {
+	killWorkerProcessTree({ pid: undefined, kill: () => true } as never);
+	let killed = false;
+	killWorkerProcessTree({ pid: undefined, kill: () => { killed = true; return true; } } as never);
+	assert.equal(killed, true, "falls back to a direct kill without a pid");
 });

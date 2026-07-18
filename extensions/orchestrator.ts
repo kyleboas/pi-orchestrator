@@ -64,6 +64,7 @@ import {
 	deliverWorkerReport,
 	ensureOrchestratorExitHook,
 	getOrchestratorRuntime,
+	killWorkerProcessTree,
 	notifyOrchestratorStateChange,
 	releaseOrchestratorSession,
 	type OrchestratorWorker as Worker,
@@ -143,7 +144,7 @@ Worker tiers, cheapest first, with what each is for:
 ${workerNames(catalog).map((name) => `- ${workerDescription(name, catalog[name]!)}`).join("\n")}
 Default to Luna for unqualified new work, then use the cheapest tier that the inspected scope demonstrably requires; escalate only when the task's difficulty is known or a cheaper attempt has not completed it.${stats}
 
-Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Mark each steer kind: correction means the reported attempt needs rework; continuation means its result is accepted and work continues on the same root task. Do not use /end or request an end-of-task summary.
+Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Mark each steer kind: correction means the reported attempt needs rework; continuation means its result is accepted and work continues on the same root task. When a working Pi worker is actively doing the wrong thing (wrong file, wrong approach, unsafe action), steer with interrupt: true to abort its in-flight run before your correction lands rather than letting the wrong work finish. Do not use /end or request an end-of-task summary.
 
 Never steer a worker just to ask how it is doing: status-report steers interrupt the work and waste its context. Healthy passive checks are silently retained for your next real turn and need no acknowledgement. Only suspicious passive checks wake you; review their concrete signals and steer only to correct actual drift.
 
@@ -307,7 +308,7 @@ function reapIfHeadless(worker: Worker): void {
 	if (!runtime.headlessReap || worker.reportedRun !== worker.run) return;
 	if (worker.state !== "idle" && worker.state !== "failed") return;
 	stopWorker(worker);
-	worker.process.kill();
+	killWorkerProcessTree(worker.process);
 }
 
 function reportWorkerResult(worker: Worker): void {
@@ -429,6 +430,15 @@ function handleRpcLine(worker: Worker, line: string): void {
 			break;
 		}
 		case "agent_settled":
+			// An interrupt steer aborted this exact run: swallow its settlement so
+			// the partial result is neither reported nor allowed to settle the
+			// follow-up generation. Keyed by run number, so a stale flag from an
+			// abort that never settled cannot swallow a later legitimate result.
+			if (worker.interruptedRun === worker.run) {
+				worker.interruptedRun = undefined;
+				recordWorkerActivity(worker, { at: Date.now(), role: "system", text: "Run aborted by an interrupt steer; awaiting the correction." });
+				break;
+			}
 			void settleWorker(worker);
 			break;
 		case "error":
@@ -539,7 +549,9 @@ function spawnWorkerChild(
 	if (launch.sandboxed) createWorkerHomeDir(homeDir);
 	let child: Worker["process"];
 	try {
-		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const });
+		// Unsandboxed workers become their own process group so a stop can
+		// signal the whole tree; sandboxed trees already die with bwrap.
+		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const, detached: !launch.sandboxed });
 	} catch (error) {
 		if (relay) void relay.cleanup().catch(() => {});
 		if (prBroker) void prBroker.cleanup();
@@ -637,11 +649,8 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	}
 	const pick = pickClaudeAccount(accounts);
 	if (!pick) return false;
-	try {
-		worker.process.kill();
-	} catch {
-		// The limited process may already be gone.
-	}
+	// killWorkerProcessTree tolerates an already-gone limited process.
+	killWorkerProcessTree(worker.process);
 	let spawned: SpawnedWorkerChild;
 	try {
 		spawned = spawnClaudeChild(worker.profile, worker.cwd, config, worker.id, pick.configDir, worker.claudeSessionId);
@@ -716,7 +725,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	if (profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" && !account) {
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
-		child.kill();
+		killWorkerProcessTree(child);
 		return worker;
 	}
 
@@ -1222,11 +1231,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_steer",
 		label: "Steer worker",
-		description: `Send immediate follow-up instructions to a live configured worker (${catalogNames}). Set kind to correction when the preceding completed result needs rework, or continuation when it is accepted and work continues on the same root. Omitted kind conservatively means correction.`,
+		description: `Send immediate follow-up instructions to a live configured worker (${catalogNames}). Set kind to correction when the preceding completed result needs rework, or continuation when it is accepted and work continues on the same root. Omitted kind conservatively means correction. Set interrupt true only when the worker's in-flight run is actively heading the wrong way and must not continue: a Pi worker's current run is aborted before the instructions are delivered (its partial result is discarded); a Claude worker cannot be aborted mid-turn, so the instructions queue for its next turn boundary instead.`,
 		parameters: Type.Object({
 			workerId: Type.String({ description: "Worker ID returned by orchestrator_delegate." }),
 			instructions: Type.String({ description: "Concrete follow-up instructions for the worker." }),
 			kind: Type.Optional(Type.Union([Type.Literal("correction"), Type.Literal("continuation")])),
+			interrupt: Type.Optional(Type.Boolean({ description: "Abort the in-flight run before delivering the instructions (Pi workers only; discards the aborted run's partial result). Use only to stop active wrong-direction work, never for routine follow-ups." })),
 		}),
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
@@ -1235,6 +1245,28 @@ export default function orchestrator(pi: ExtensionAPI) {
 				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
 			}
 			const kind = params.kind === "continuation" ? "continuation" : "correction";
+			let interruptNote = "";
+			if (params.interrupt === true) {
+				if (worker.profile.backend === "pi-rpc" && worker.state === "working") {
+					// Flag before aborting: the aborted run's agent_settled must be
+					// swallowed (see handleRpcLine) rather than reported as a result.
+					worker.interruptedRun = worker.run;
+					const aborted = await Promise.race([
+						requestWorkerRpc(worker, { type: "abort" }).then(() => true, () => false),
+						new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 10_000)),
+					]);
+					// The settled event normally precedes the abort response on the
+					// pipe, but wait briefly for the flag to be consumed so a late
+					// settlement cannot land in the new generation below.
+					for (let i = 0; i < 20 && worker.interruptedRun === worker.run; i++) await new Promise((resolve) => setTimeout(resolve, 100));
+					worker.interruptedRun = undefined;
+					interruptNote = aborted
+						? " Its in-flight run was aborted first; the partial result was discarded."
+						: " The abort did not confirm in time; the instructions were delivered anyway.";
+				} else if (worker.profile.backend === "claude-code") {
+					interruptNote = " Claude workers cannot be aborted mid-turn; the instructions are queued for the next turn boundary.";
+				}
+			}
 			// Resolve a completed reported attempt before creating the next unique
 			// attempt ID. An active run has no completion to relabel yet.
 			if (worker.state === "idle" && worker.reportedRun === worker.run) {
@@ -1254,7 +1286,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			}
 			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
-			return content(`Sent ${kind} follow-up instructions to ${worker.id}.`);
+			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}`);
 		},
 	});
 
@@ -1284,7 +1316,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 				recordRunOutcome(worker, "cancelled");
 			}
 			stopWorker(worker);
-			worker.process.kill();
+			killWorkerProcessTree(worker.process);
 			refreshWorkerWidget();
 			return content(`Stopped ${worker.id}.`);
 		},
