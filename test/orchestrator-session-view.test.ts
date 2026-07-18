@@ -167,18 +167,3 @@ test("assistant thinking blocks are captured and flagged", () => {
 		["assistant", "Editing now.", false],
 	]);
 });
-
-test("renderSessionScreen renders the coordinator message line when input is given", () => {
-	const theme = { fg: (_c: string, text: string) => text };
-	const body = Array.from({ length: 20 }, (_v, i) => `line ${i}`);
-	const withInput = renderSessionScreen("Luna · working · luna-1", body, 60, 12, 0, theme, "stop this worker");
-	assert.ok(withInput.lines.some((line) => line.includes("› stop this worker▌")));
-	assert.ok(withInput.lines.at(-1)!.includes("enter to message the coordinator"));
-	const without = renderSessionScreen("Luna · working · luna-1", body, 60, 12, 0, theme);
-	assert.equal(without.lines.length, withInput.lines.length, "full-screen height is preserved");
-	assert.equal(withInput.maxScrollUp, without.maxScrollUp + 1, "input row shrinks the viewport by one");
-	// Long input keeps the cursor end visible by trimming from the left.
-	const long = renderSessionScreen("t", body, 30, 12, 0, theme, "x".repeat(100));
-	const inputLine = long.lines.find((line) => line.includes("▌"))!;
-	assert.ok(inputLine.includes("…"), "overflowing input is left-trimmed");
-});

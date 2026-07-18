@@ -112,34 +112,22 @@ export function renderSessionScreen(
 	height: number,
 	scrollUp: number,
 	theme: ViewerTheme,
-	input?: string,
 ): { lines: string[]; maxScrollUp: number } {
 	const fullWidth = Math.max(24, width);
 	const body = bodyLines.length ? bodyLines : ["No output yet."];
 
-	const inputRows = input === undefined ? 0 : 1;
-	const viewport = Math.max(3, height - 3 - inputRows);
+	const viewport = Math.max(3, height - 3);
 	const maxScrollUp = Math.max(0, body.length - viewport);
 	const clamped = Math.min(Math.max(0, scrollUp), maxScrollUp);
 	const end = body.length - clamped;
 	const visible = body.slice(Math.max(0, end - viewport), end).map((line) => padVisible(line, fullWidth));
 	while (visible.length < viewport) visible.push(" ".repeat(fullWidth));
 
-	const hints = input === undefined
-		? `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to go back`
-		: `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · type + enter to message the coordinator · esc to go back`;
+	const hints = `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to go back`;
 	const lines = [
 		theme.fg("text", padVisible(` ${title}`, fullWidth)),
 		theme.fg("dim", "─".repeat(fullWidth)),
 		...visible,
-		// Coordinator message line: keep the cursor end visible when the typed
-		// text outgrows the row by trimming from the left, code-point safe.
-		...(input === undefined ? [] : (() => {
-			const room = Math.max(4, fullWidth - 5);
-			const chars = Array.from(input);
-			const shown = chars.length > room ? `…${chars.slice(chars.length - room + 1).join("")}` : input;
-			return [theme.fg("text", padVisible(` › ${shown}▌`, fullWidth))];
-		})()),
 		theme.fg("dim", padVisible(` ${hints}`, fullWidth)),
 	];
 	return { lines, maxScrollUp };
