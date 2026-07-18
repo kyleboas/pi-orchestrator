@@ -51,7 +51,7 @@ test("renderWorkerPane shows title, body tail, scrolls, and stays within the vie
 	assert.equal(followed.lines.length, 12, "title + rule + 8 body rows + rule + hints");
 	for (const line of followed.lines) assert.equal(Array.from(line).length, 60);
 	assert.ok(followed.lines.some((line: string) => line.includes("line 29")));
-	assert.ok(followed.lines.at(-1)!.includes("pgup/pgdn scroll"), "hint row survives truncation at narrow widths");
+	assert.ok(followed.lines.at(-1)!.includes("↑/↓ scroll"), "hint row survives truncation at narrow widths");
 	const wide = renderWorkerPane("Terra · working · terra-1", body, 120, 8, 0, theme);
 	assert.ok(wide.lines.at(-1)!.includes("the input below messages the coordinator"));
 	assert.ok(followed.maxScrollUp > 0);
