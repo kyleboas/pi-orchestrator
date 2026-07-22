@@ -20,7 +20,8 @@
   "rolloverContextPercent": 38,
   "pullRequests": {
     "repositories": ["example-owner/example-repository"],
-    "branchPrefixes": ["feat/", "fix/"]
+    "branchPrefixes": ["feat/", "fix/"],
+    "baseBranches": ["staging"]
   },
   "workers": {
     "Builder": {

@@ -6,12 +6,12 @@ import { join } from "node:path";
 import net from "node:net";
 
 /** The deliberately small opt-in authority delegated to a sandboxed worker. */
-export type PullRequestsConfig = { repositories: string[]; branchPrefixes: string[] };
+export type PullRequestsConfig = { repositories: string[]; branchPrefixes: string[]; baseBranches?: string[] };
 /** `branch` is deliberately absent until the first successful publish. */
 type PinnedFileState = { path: string; device: number; inode: number; hash: string };
 type GitMetadata = { entryDevice: number; entryInode: number; gitDir: string; objectsDevice: number; objectsInode: number; objectInfoDevice: number; objectInfoInode: number; files: PinnedFileState[] };
 export type PinnedPullRequestTarget = { workspace: string; repository: string; remoteUrl: string; defaultBranch: string; generation: string; device: number; inode: number; git: GitMetadata; branch?: string };
-export type BrokerResult = { ok: boolean; message: string; repository?: string; branch?: string; defaultBranch?: string };
+export type BrokerResult = { ok: boolean; message: string; repository?: string; branch?: string; defaultBranch?: string; base?: string };
 export const PR_REQUEST_LIMIT = 16_384;
 export const PR_RESPONSE_LIMIT = 8_192;
 export const PR_TITLE_LIMIT = 256;
@@ -39,11 +39,12 @@ export function repositoryAllowed(repository: string, policy: PullRequestsConfig
 export function parsePullRequestsConfig(value: unknown): PullRequestsConfig | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const raw = value as Record<string, unknown>;
-	if (Object.keys(raw).some((key) => key !== "repositories" && key !== "branchPrefixes") || !Array.isArray(raw.repositories) || !Array.isArray(raw.branchPrefixes) || !raw.repositories.length || !raw.branchPrefixes.length || raw.repositories.length > 32 || raw.branchPrefixes.length > 32) return undefined;
-	const repositories: string[] = [], branchPrefixes: string[] = [], seenRepositories = new Set<string>(), seenPrefixes = new Set<string>();
+	if (Object.keys(raw).some((key) => key !== "repositories" && key !== "branchPrefixes" && key !== "baseBranches") || !Array.isArray(raw.repositories) || !Array.isArray(raw.branchPrefixes) || !raw.repositories.length || !raw.branchPrefixes.length || raw.repositories.length > 32 || raw.branchPrefixes.length > 32 || (raw.baseBranches !== undefined && (!Array.isArray(raw.baseBranches) || raw.baseBranches.length > 32))) return undefined;
+	const repositories: string[] = [], branchPrefixes: string[] = [], baseBranches: string[] = [], seenRepositories = new Set<string>(), seenPrefixes = new Set<string>(), seenBases = new Set<string>();
 	for (const value of raw.repositories) { if (!text(value, 140)) return undefined; const repository = normalizedRepositoryEntry(value); if (!repository || seenRepositories.has(repository)) return undefined; seenRepositories.add(repository); repositories.push(repository); }
 	for (const value of raw.branchPrefixes) { if (!text(value, 81)) return undefined; const prefix = value.trim(); if ((prefix !== "*" && !PREFIX.test(prefix)) || seenPrefixes.has(prefix.toLowerCase())) return undefined; seenPrefixes.add(prefix.toLowerCase()); branchPrefixes.push(prefix); }
-	return { repositories, branchPrefixes };
+	for (const value of raw.baseBranches ?? []) { if (!text(value, 200)) return undefined; const base = value.trim(); if (!BRANCH.test(base) || seenBases.has(base)) return undefined; seenBases.add(base); baseBranches.push(base); }
+	return { repositories, branchPrefixes, ...(raw.baseBranches === undefined ? {} : { baseBranches }) };
 }
 
 /** Accept only canonical GitHub HTTPS/SSH origin forms; never a user-selected remote. */
@@ -214,20 +215,23 @@ async function currentAllowedBranch(target: PinnedPullRequestTarget, policy: Pul
 function clientProgram(generation: string): string { return `#!/usr/bin/env node
 import net from "node:net";
 const [action, ...rest] = process.argv.slice(2);
-if (!['status','publish'].includes(action) || (action === 'status' && rest.length) || (action === 'publish' && rest.length !== 2) || rest.some(x => x.length > 32000)) process.exitCode = 2;
-else { let tries = 0; const run = () => { const socket = net.createConnection('/pr/broker.sock'); let out = ''; socket.setTimeout(90000); socket.on('connect', () => socket.write(JSON.stringify({ generation: ${JSON.stringify(generation)}, action, ...(action === 'publish' ? { title: rest[0], body: rest[1] } : {}) }) + '\\n')); socket.on('data', c => { out += c; if (out.length > 8192) socket.destroy(); }); socket.on('end', () => { try { const r = JSON.parse(out); process.stdout.write((r.message || 'Broker request failed') + '\\n'); process.exitCode = r.ok ? 0 : 1; } catch { process.exitCode = 1; } }); socket.on('error', () => { if (++tries < 20) setTimeout(run, 50); else process.exitCode = 1; }); }; run(); }
+let title, body, base;
+if (action === 'publish' && rest.length === 4 && rest[0] === '--base') [base, title, body] = rest.slice(1);
+else if (action === 'publish' && rest.length === 2) [title, body] = rest;
+if (!['status','publish'].includes(action) || (action === 'status' && rest.length) || (action === 'publish' && (!title || body === undefined || (base !== undefined && !base) || rest.some(x => x.length > 32000)))) process.exitCode = 2;
+else { let tries = 0; const run = () => { const socket = net.createConnection('/pr/broker.sock'); let out = ''; socket.setTimeout(90000); socket.on('connect', () => socket.write(JSON.stringify({ generation: ${JSON.stringify(generation)}, action, ...(action === 'publish' ? { title, body, ...(base === undefined ? {} : { base }) } : {}) }) + '\\n')); socket.on('data', c => { out += c; if (out.length > 8192) socket.destroy(); }); socket.on('end', () => { try { const r = JSON.parse(out); process.stdout.write((r.message || 'Broker request failed') + '\\n'); process.exitCode = r.ok ? 0 : 1; } catch { process.exitCode = 1; } }); socket.on('error', () => { if (++tries < 20) setTimeout(run, 50); else process.exitCode = 1; }); }; run(); }
 `; }
 export type PullRequestBroker = { directory: string; target: PinnedPullRequestTarget; ready: Promise<void>; cleanup: () => Promise<void> };
-function validPublish(request: Record<string, unknown>): request is { generation: string; action: "publish"; title: string; body: string } { return Object.keys(request).every((key) => key === "generation" || key === "action" || key === "title" || key === "body") && request.action === "publish" && typeof request.generation === "string" && typeof request.title === "string" && request.title.length > 0 && request.title.length <= PR_TITLE_LIMIT && !/[\0\r\n]/.test(request.title) && typeof request.body === "string" && request.body.length <= PR_BODY_LIMIT && !/\0/.test(request.body); }
-type OpenPullRequest = { kind: "none" } | { kind: "one"; number: number } | { kind: "error"; message: string };
+function validPublish(request: Record<string, unknown>): request is { generation: string; action: "publish"; title: string; body: string; base?: string } { return Object.keys(request).every((key) => key === "generation" || key === "action" || key === "title" || key === "body" || key === "base") && request.action === "publish" && typeof request.generation === "string" && typeof request.title === "string" && request.title.length > 0 && request.title.length <= PR_TITLE_LIMIT && !/[\0\r\n]/.test(request.title) && typeof request.body === "string" && request.body.length <= PR_BODY_LIMIT && !/\0/.test(request.body) && (request.base === undefined || typeof request.base === "string" && request.base.length > 0 && request.base.length <= 200 && !/[\0\r\n]/.test(request.base)); }
+type OpenPullRequest = { kind: "none" } | { kind: "one"; number: number } | { kind: "mismatch" } | { kind: "error"; message: string };
 
 // Project only the identity fields required below. Null/deleted head repositories
 // remain null-valued and are rejected by the same strict validation.
 const OPEN_PULL_REQUEST_JQ = "[.[] | {number: .number, headRefName: .head.ref, baseRefName: .base.ref, isCrossRepository: (.head.repo.full_name != .base.repo.full_name), headRepository: {nameWithOwner: .head.repo.full_name}, headRepositoryOwner: {login: .head.repo.owner.login}}]";
 /** gh 2.45 has incompatible PR-list JSON; REST is both stable and explicitly query-encoded. */
-async function findOpenPullRequest(target: PinnedPullRequestTarget, branch: string, runner: BrokerRunner, env: NodeJS.ProcessEnv): Promise<OpenPullRequest> {
+async function findOpenPullRequest(target: PinnedPullRequestTarget, branch: string, base: string, runner: BrokerRunner, env: NodeJS.ProcessEnv): Promise<OpenPullRequest> {
 	const owner = target.repository.split("/")[0]!;
-	const open = await runner("gh", ["api", "--method=GET", `repos/${target.repository}/pulls`, "--raw-field=state=open", `--raw-field=head=${owner}:${branch}`, `--raw-field=base=${target.defaultBranch}`, "--raw-field=per_page=2", `--jq=${OPEN_PULL_REQUEST_JQ}`], { env, timeout: 30_000 });
+	const open = await runner("gh", ["api", "--method=GET", `repos/${target.repository}/pulls`, "--raw-field=state=open", `--raw-field=head=${owner}:${branch}`, "--raw-field=per_page=2", `--jq=${OPEN_PULL_REQUEST_JQ}`], { env, timeout: 30_000 });
 	if (!open.ok || open.stdout.length > PR_RESPONSE_LIMIT) return { kind: "error", message: "Could not query the existing pull request." };
 	try {
 		const rows = JSON.parse(open.stdout) as unknown;
@@ -238,7 +242,8 @@ async function findOpenPullRequest(target: PinnedPullRequestTarget, branch: stri
 		if (!row || typeof row !== "object") return { kind: "error", message: "Existing pull request does not match the pinned branch and base." };
 		const value = row as Record<string, unknown>, repository = value.headRepository as { nameWithOwner?: unknown } | null, repositoryOwner = value.headRepositoryOwner as { login?: unknown } | null;
 		const headRepository = repository?.nameWithOwner, headOwner = repositoryOwner?.login;
-		if (typeof value.number !== "number" || !Number.isSafeInteger(value.number) || value.number <= 0 || value.headRefName !== branch || value.baseRefName !== target.defaultBranch || value.isCrossRepository !== false || typeof headRepository !== "string" || typeof headOwner !== "string" || headRepository.toLowerCase() !== target.repository || headOwner.toLowerCase() !== owner.toLowerCase()) return { kind: "error", message: "Existing pull request does not match the pinned branch and base." };
+		if (typeof value.number !== "number" || !Number.isSafeInteger(value.number) || value.number <= 0 || value.headRefName !== branch || typeof value.baseRefName !== "string" || !BRANCH.test(value.baseRefName) || value.isCrossRepository !== false || typeof headRepository !== "string" || typeof headOwner !== "string" || headRepository.toLowerCase() !== target.repository || headOwner.toLowerCase() !== owner.toLowerCase()) return { kind: "error", message: "Existing pull request does not match the pinned branch and base." };
+		if (value.baseRefName !== base) return { kind: "mismatch" };
 		return { kind: "one", number: value.number };
 	} catch { return { kind: "error", message: "Could not parse pull request status." }; }
 }
@@ -247,7 +252,17 @@ function createdPullRequestUrl(repository: string, output: string): string | und
 	return match && match[1] === repository ? output.endsWith("\n") ? output.slice(0, -1) : output : undefined;
 }
 
-export async function publishPullRequest(target: PinnedPullRequestTarget, policy: PullRequestsConfig, title: string, body: string, runner: BrokerRunner): Promise<BrokerResult> {
+function allowedBase(base: string, target: PinnedPullRequestTarget, policy: PullRequestsConfig): boolean { return base === target.defaultBranch || policy.baseBranches?.includes(base) === true; }
+function remoteRefOutput(base: string, output: string): boolean {
+	const line = output.endsWith("\n") ? output.slice(0, -1) : output, tab = line.indexOf("\t");
+	return (tab === 40 || tab === 64) && /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(line.slice(0, tab)) && line.slice(tab + 1) === `refs/heads/${base}`;
+}
+async function remoteBaseExists(target: PinnedPullRequestTarget, base: string, runner: BrokerRunner, options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }): Promise<boolean> {
+	const result = await runner("git", networkGitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${base}`), options);
+	return result.ok && result.stdout.length <= PR_RESPONSE_LIMIT && remoteRefOutput(base, result.stdout);
+}
+
+export async function publishPullRequest(target: PinnedPullRequestTarget, policy: PullRequestsConfig, title: string, body: string, runner: BrokerRunner, requestedBase?: string): Promise<BrokerResult> {
 	// Do this before any checkout Git command: .git and its config are
 	// worker-controlled paths after delegation.
 	if (!sameMetadata(target.git, metadata(target.workspace))) return { ok: false, message: "Repository metadata no longer matches the delegated target." };
@@ -255,6 +270,10 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 	if (!repinned || repinned.workspace !== target.workspace || repinned.device !== target.device || repinned.inode !== target.inode || !sameMetadata(target.git, repinned.git) || repinned.repository !== target.repository || repinned.remoteUrl !== target.remoteUrl || repinned.defaultBranch !== target.defaultBranch) return { ok: false, message: "Repository state no longer matches the delegated target." };
 	const branch = await currentAllowedBranch(target, policy, runner);
 	if (!branch || (target.branch && target.branch !== branch)) return { ok: false, message: target.branch ? "The pinned branch changed." : "Switch to an allowed non-default branch before publishing." };
+	const base = requestedBase ?? target.defaultBranch;
+	if (!BRANCH.test(base)) return { ok: false, message: "The requested base branch is invalid." };
+	if (base === branch) return { ok: false, message: "The pull request base branch cannot match the head branch." };
+	if (!allowedBase(base, target, policy)) return { ok: false, message: "The requested base branch is not allowed by configuration." };
 	const dirty = await git(runner, target.workspace, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none");
 	if (!dirty.ok || dirty.stdout.trim()) return { ok: false, message: "Commit or remove all tracked and untracked changes before publishing." };
 	const head = await line(runner, target.workspace, "rev-parse", "--verify", "HEAD^{commit}");
@@ -275,6 +294,7 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 		const localTrustedOptions = { cwd: temp, env: { ...trustedEnv(process.env), ...GIT_ENV }, timeout: 30_000 };
 		if (!(await runner("git", gitArgs("cat-file", "-e", `${head}^{commit}`), localTrustedOptions)).ok) return { ok: false, message: "Could not prepare a trusted Git view." };
 		const trustedOptions = networkGitOptions(temp, createAskpass(tempParent));
+		if (base !== target.defaultBranch && !(await remoteBaseExists(target, base, runner, trustedOptions))) return { ok: false, message: "The requested base branch does not exist on the remote." };
 		const fetched = await runner("git", networkGitArgs("fetch", "--no-tags", target.remoteUrl, `refs/heads/${branch}:refs/remotes/pinned/${branch}`), trustedOptions);
 		if (!fetched.ok) { const remote = await runner("git", networkGitArgs("ls-remote", "--heads", target.remoteUrl, `refs/heads/${branch}`), trustedOptions); if (!remote.ok) return { ok: false, message: "Could not verify the pinned branch." }; }
 		else if (!(await runner("git", gitArgs("merge-base", "--is-ancestor", `refs/remotes/pinned/${branch}`, head), localTrustedOptions)).ok) return { ok: false, message: "The branch is not a fast-forward update." };
@@ -283,20 +303,21 @@ export async function publishPullRequest(target: PinnedPullRequestTarget, policy
 		if ((await currentAllowedBranch(target, policy, runner)) !== branch) return { ok: false, message: "The branch changed during publishing." };
 		target.branch ??= branch;
 		if (!(await runner("git", networkGitArgs("push", "--porcelain", target.remoteUrl, `${head}:refs/heads/${branch}`), { ...trustedOptions, timeout: 45_000 })).ok) return { ok: false, message: "Push was rejected." };
-		const env = trustedEnv(process.env), existing = await findOpenPullRequest(target, branch, runner, env);
+		const env = trustedEnv(process.env), existing = await findOpenPullRequest(target, branch, base, runner, env);
 		if (existing.kind === "error") return { ok: false, message: existing.message };
+		if (existing.kind === "mismatch") return { ok: false, message: `An existing open pull request for this branch targets a different base than ${base}.` };
 		const update = async (number: number): Promise<boolean> => (await runner("gh", ["api", "--method=PATCH", `repos/${target.repository}/pulls/${number}`, `--raw-field=title=${title}`, `--raw-field=body=${body}`, "--silent"], { env, timeout: 45_000 })).ok;
 		if (existing.kind === "one") {
 			if (!(await update(existing.number))) return { ok: false, message: "Pull request create/update failed." };
-			return { ok: true, message: "Updated the open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
+			return { ok: true, message: `Updated the open pull request against base ${base}.`, repository: target.repository, branch, defaultBranch: target.defaultBranch, base };
 		}
-		const created = await runner("gh", ["api", "--method=POST", `repos/${target.repository}/pulls`, `--raw-field=title=${title}`, `--raw-field=body=${body}`, `--raw-field=head=${branch}`, `--raw-field=base=${target.defaultBranch}`, "--jq=.html_url"], { env, timeout: 45_000 });
+		const created = await runner("gh", ["api", "--method=POST", `repos/${target.repository}/pulls`, `--raw-field=title=${title}`, `--raw-field=body=${body}`, `--raw-field=head=${branch}`, `--raw-field=base=${base}`, "--jq=.html_url"], { env, timeout: 45_000 });
 		const url = created.ok ? createdPullRequestUrl(target.repository, created.stdout) : undefined;
-		if (url) return { ok: true, message: `Created an open pull request: ${url}`, repository: target.repository, branch, defaultBranch: target.defaultBranch };
+		if (url) return { ok: true, message: `Created an open pull request against base ${base}: ${url}`, repository: target.repository, branch, defaultBranch: target.defaultBranch, base };
 		// A POST can have succeeded remotely despite a local failure. Query once and
 		// update only a freshly revalidated exact match; never repeat the POST.
-		const raced = await findOpenPullRequest(target, branch, runner, env);
-		if (raced.kind === "one" && await update(raced.number)) return { ok: true, message: "Updated the open pull request.", repository: target.repository, branch, defaultBranch: target.defaultBranch };
+		const raced = await findOpenPullRequest(target, branch, base, runner, env);
+		if (raced.kind === "one" && await update(raced.number)) return { ok: true, message: `Updated the open pull request against base ${base}.`, repository: target.repository, branch, defaultBranch: target.defaultBranch, base };
 		return { ok: false, message: "Pull request create/update failed." };
 	} finally { try { rmSync(tempParent, { recursive: true, force: true }); } catch {} }
 }
@@ -304,11 +325,11 @@ async function brokerStatus(target: PinnedPullRequestTarget, policy: PullRequest
 	if (target.branch) {
 		const current = await line(runner, target.workspace, "symbolic-ref", "--quiet", "--short", "HEAD");
 		return current === target.branch
-			? { ok: true, message: `Ready for pinned branch ${target.branch}.`, repository: target.repository, branch: target.branch, defaultBranch: target.defaultBranch }
-			: { ok: true, message: `Branch ${target.branch} is pinned, but the current branch does not match; publish will be rejected.`, repository: target.repository, branch: target.branch, defaultBranch: target.defaultBranch };
+			? { ok: true, message: `Ready for pinned branch ${target.branch} against default base ${target.defaultBranch}.`, repository: target.repository, branch: target.branch, defaultBranch: target.defaultBranch, base: target.defaultBranch }
+			: { ok: true, message: `Branch ${target.branch} is pinned, but the current branch does not match; publish will be rejected (default base ${target.defaultBranch}).`, repository: target.repository, branch: target.branch, defaultBranch: target.defaultBranch, base: target.defaultBranch };
 	}
 	const branch = await currentAllowedBranch(target, policy, runner);
-	return branch ? { ok: true, message: `No branch is pinned; ${branch} is eligible for first publish.`, repository: target.repository, branch, defaultBranch: target.defaultBranch } : { ok: true, message: "No branch is pinned; switch to an allowed non-default branch before publishing.", repository: target.repository, defaultBranch: target.defaultBranch };
+	return branch ? { ok: true, message: `No branch is pinned; ${branch} is eligible for first publish against default base ${target.defaultBranch}.`, repository: target.repository, branch, defaultBranch: target.defaultBranch, base: target.defaultBranch } : { ok: true, message: `No branch is pinned; switch to an allowed non-default branch before publishing (default base ${target.defaultBranch}).`, repository: target.repository, defaultBranch: target.defaultBranch, base: target.defaultBranch };
 }
 
 export function startPullRequestBroker(target: PinnedPullRequestTarget, policy: PullRequestsConfig, runner: BrokerRunner = defaultRunner): PullRequestBroker {
@@ -340,7 +361,7 @@ export function startPullRequestBroker(target: PinnedPullRequestTarget, policy: 
 					if (!validPublish(request)) return done({ ok: false, message: "Unsupported broker request." });
 					if (publishing) return done({ ok: false, message: "A publish is already in progress." });
 					clearTimeout(timer); timer = setTimeout(() => socket.destroy(), 90_000);
-					publishing = true; try { done(await publishPullRequest(target, policy, request.title, request.body, brokerRunner)); } finally { publishing = false; }
+					publishing = true; try { done(await publishPullRequest(target, policy, request.title, request.body, brokerRunner, request.base)); } finally { publishing = false; }
 				} catch { done({ ok: false, message: "Broker operation failed." }); }
 			})();
 			handlers.add(handler); void handler.finally(() => handlers.delete(handler));
