@@ -11,10 +11,7 @@
   "sandbox": {
     "mode": "off",
     "network": "host",
-    "env": "allowlist",
-    "envAllow": [],
-    "readOnlyPaths": [],
-    "workspaceRoots": ["~/code"]
+    "env": "allowlist"
   },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,
