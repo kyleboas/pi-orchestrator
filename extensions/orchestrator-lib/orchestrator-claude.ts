@@ -2,7 +2,7 @@ export type ClaudeUsageTotals = { inputTokens?: number; outputTokens?: number; c
 export type ClaudeResultSettlement = { result?: string; isError: boolean; sessionId?: string; usage: ClaudeUsageTotals; /** API-equivalent estimate emitted by Claude Code, not subscription billing. */ estimatedCostUsd?: number };
 export type ClaudeStreamParse = { ok: true; events: Record<string, unknown>[] } | { ok: false };
 /** Arguments for one persistent Claude Code stream-json worker process. */
-export function claudeCodeArgs(model: string): string[] { return ["-p", "--model", model, "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]; }
+export function claudeCodeArgs(model: string, effort?: "low" | "medium" | "high"): string[] { return ["-p", "--model", model, ...(effort ? ["--effort", effort] : []), "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]; }
 export function claudeUserEvent(instructions: string): Record<string, unknown> { return { type: "user", message: { role: "user", content: instructions } }; }
 /** Accept the documented object form plus Claude Code's top-level event-array variant. */
 export function parseClaudeStreamLine(line: string): ClaudeStreamParse {

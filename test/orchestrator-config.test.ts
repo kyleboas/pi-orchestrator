@@ -31,6 +31,7 @@ test("default catalog uses eight explicit individual worker profiles", () => {
 	const terra = config.workers.Terra!;
 	assert.equal(terra.backend, "pi-rpc");
 	assert.deepEqual(piRpcWorkerArgs(terra), ["--mode", "rpc", "--no-session", "--no-extensions", "--tools", "read,bash,edit,write", "--model", "openai-codex/gpt-5.6-terra", "--thinking", "high"]);
+	assert.equal(piRpcWorkerArgs(terra, "low").at(-1), "low");
 	assert.equal(config.commands.pi, "pi"); assert.equal(config.commands.claude, "claude");
 	assert.equal(config.checkInMinutes, DEFAULT_CHECKIN_MINUTES);
 	assert.equal(config.rolloverContextPercent, DEFAULT_ROLLOVER_CONTEXT_PERCENT);
@@ -82,6 +83,7 @@ test("configured map generates dynamic names, explicit Pi metadata, commands, an
 		const fable = config.workers.Fable!;
 		assert.equal(fable.backend, "claude-code");
 		assert.deepEqual(claudeCodeArgs(fable.model).slice(0, 3), ["-p", "--model", "fable-placeholder"]);
+	assert.deepEqual(claudeCodeArgs(fable.model, "high").slice(0, 5), ["-p", "--model", "fable-placeholder", "--effort", "high"]);
 		assert.deepEqual(config.coordinator, { provider: "example", id: "lead", thinking: "medium" });
 	} finally { remove(file); }
 });

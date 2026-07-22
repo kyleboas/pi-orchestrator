@@ -1,6 +1,8 @@
 export const ORCHESTRATOR_TOOL_NAMES = ["orchestrator_delegate", "orchestrator_steer", "orchestrator_workers", "orchestrator_stop", "orchestrator_takeover"] as const;
 export const RPC_WORKER_TOOL_NAMES = ["read", "bash", "edit", "write"] as const;
 export type PiThinkingLevel = "low" | "medium" | "high";
+export type DelegationEffort = PiThinkingLevel;
+export const DELEGATION_EFFORTS = ["low", "medium", "high"] as const;
 /** Explicit per-worker containment opt-out; the only accepted value is "off". */
 export type WorkerSandboxOverride = "off";
 export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel; description?: string; sandbox?: WorkerSandboxOverride };
@@ -24,8 +26,8 @@ export function workerRpcArgs(model: string, thinking: PiThinkingLevel): string[
 	return ["--mode", "rpc", "--no-session", "--no-extensions", "--tools", RPC_WORKER_TOOL_NAMES.join(","), "--model", model, "--thinking", thinking];
 }
 /** Build Pi launch arguments solely from the worker's explicit profile. */
-export function piRpcWorkerArgs(profile: PiRpcWorkerProfile): string[] {
-	return workerRpcArgs(profile.model, profile.thinking);
+export function piRpcWorkerArgs(profile: PiRpcWorkerProfile, effort?: DelegationEffort): string[] {
+	return workerRpcArgs(profile.model, effort ?? profile.thinking);
 }
 export const SOL_PLANNING_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
 export function solRestrictedTools(allTools: readonly string[]): string[] { const available = new Set(allTools); return [...ORCHESTRATOR_TOOL_NAMES, ...SOL_PLANNING_TOOL_NAMES.filter((name) => available.has(name))]; }
