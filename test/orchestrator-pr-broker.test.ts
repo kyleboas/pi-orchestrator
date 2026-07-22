@@ -62,6 +62,23 @@ function fakeTrustedClone(args: string[]): void {
 	writeFileSync(join(destination, "config"), "[core]\n\tbare = true\n");
 }
 
+function baseFlowRunner(workspace: string, branch: string, rows: unknown, calls: string[][], remoteBase = true) {
+	return async (command: string, args: string[]) => {
+		calls.push(args); fakeTrustedClone(args); const joined = args.join(" ");
+		if (joined.includes("--is-inside-work-tree")) return { ok: true, stdout: "true" };
+		if (joined.includes("--show-toplevel")) return { ok: true, stdout: workspace };
+		if (joined.includes("remote get-url origin")) return { ok: true, stdout: "https://github.com/owner/repository.git" };
+		if (joined.includes("symbolic-ref --quiet --short HEAD")) return { ok: true, stdout: branch };
+		if (joined.includes("status --porcelain")) return { ok: true, stdout: "" };
+		if (joined.includes("rev-parse --verify")) return { ok: true, stdout: "a".repeat(40) };
+		if (args.includes("ls-remote") && args.includes("refs/heads/staging")) return { ok: true, stdout: remoteBase ? `${"b".repeat(40)}\trefs/heads/staging\n` : "" };
+		if (command === "gh" && args.includes("--method=GET") && args[2] === "repos/owner/repository") return { ok: true, stdout: "main\n" };
+		if (command === "gh" && args.includes("--method=GET") && args[2] === "repos/owner/repository/pulls") return { ok: true, stdout: JSON.stringify(rows) };
+		if (command === "gh" && args[0] === "api" && args.includes("--method=POST")) return { ok: true, stdout: "https://github.com/owner/repository/pull/42\n" };
+		return { ok: true, stdout: "" };
+	};
+}
+
 function request(path: string, value: unknown): Promise<Record<string, unknown>> {
 	return new Promise((resolve, reject) => {
 		const socket = net.createConnection(path); let output = "";
@@ -74,7 +91,8 @@ function request(path: string, value: unknown): Promise<Record<string, unknown>>
 
 test("PR policy is opt-in, bounded, normalized, and fails closed", () => {
 	assert.deepEqual(parsePullRequestsConfig({ repositories: ["Owner/Repository"], branchPrefixes: ["feat/"] }), { repositories: ["owner/repository"], branchPrefixes: ["feat/"] });
-	for (const value of [undefined, {}, { repositories: ["owner/repository", "OWNER/repository"], branchPrefixes: ["feat/"] }, { repositories: ["owner/repository"], branchPrefixes: ["../"] }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], extra: true }]) assert.equal(parsePullRequestsConfig(value), undefined);
+	assert.deepEqual(parsePullRequestsConfig({ repositories: ["Owner/Repository"], branchPrefixes: ["feat/"], baseBranches: ["staging", "release/2026"] }), { repositories: ["owner/repository"], branchPrefixes: ["feat/"], baseBranches: ["staging", "release/2026"] });
+	for (const value of [undefined, {}, { repositories: ["owner/repository", "OWNER/repository"], branchPrefixes: ["feat/"] }, { repositories: ["owner/repository"], branchPrefixes: ["../"] }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], baseBranches: ["staging", "staging"] }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], baseBranches: ["bad branch"] }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], baseBranches: "staging" }, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], extra: true }]) assert.equal(parsePullRequestsConfig(value), undefined);
 });
 
 test("owner wildcard entries parse only as the exact owner/* form and match only that owner", () => {
@@ -182,17 +200,59 @@ test("publish uses HTTPS, fixed credential-free argv, and a host-only askpass", 
 		assert.ok(network.length && network.every((call) => call.args.includes("credential.helper=") && call.args.includes("https://github.com/owner/repository.git") && call.env?.GIT_ASKPASS && call.env.GIT_TERMINAL_PROMPT === "0"));
 		assert.ok(calls.filter((call) => call.command === "git" && !network.includes(call)).every((call) => call.env?.GIT_ASKPASS === undefined));
 		const query = calls.find((call) => call.command === "gh" && call.args[2] === "repos/owner/repository/pulls");
-		assert.deepEqual(query?.args, ["api", "--method=GET", "repos/owner/repository/pulls", "--raw-field=state=open", "--raw-field=head=owner:feat/broker", "--raw-field=base=main", "--raw-field=per_page=2", "--jq=[.[] | {number: .number, headRefName: .head.ref, baseRefName: .base.ref, isCrossRepository: (.head.repo.full_name != .base.repo.full_name), headRepository: {nameWithOwner: .head.repo.full_name}, headRepositoryOwner: {login: .head.repo.owner.login}}]"]);
+		assert.deepEqual(query?.args, ["api", "--method=GET", "repos/owner/repository/pulls", "--raw-field=state=open", "--raw-field=head=owner:feat/broker", "--raw-field=per_page=2", "--jq=[.[] | {number: .number, headRefName: .head.ref, baseRefName: .base.ref, isCrossRepository: (.head.repo.full_name != .base.repo.full_name), headRepository: {nameWithOwner: .head.repo.full_name}, headRepositoryOwner: {login: .head.repo.owner.login}}]"]);
 		assert.equal(calls.some((call) => call.args[0] === "pr"), false);
 		const create = calls.find((call) => call.command === "gh" && call.args[0] === "api" && call.args.includes("--method=POST"));
 		assert.deepEqual(create?.args, ["api", "--method=POST", "repos/owner/repository/pulls", `--raw-field=title=${title}`, `--raw-field=body=${body}`, "--raw-field=head=feat/broker", "--raw-field=base=main", "--jq=.html_url"]);
-		assert.match(result.message, /^Created an open pull request: https:\/\/github\.com\/owner\/repository\/pull\/42$/);
+		assert.match(result.message, /^Created an open pull request against base main: https:\/\/github\.com\/owner\/repository\/pull\/42$/);
 		assert.ok(!calls.some((call) => call.args.some((arg) => arg.startsWith("--field=") || arg.startsWith("--input=") || arg.startsWith("--raw-field=@") || arg === "pr" && (call.args.includes("create") || call.args.includes("edit")))));
 		assert.ok(calls.every((call) => call.command === "git" || call.command === "gh"));
 		assert.ok(calls.every((call) => Object.keys(saved).every((key) => call.env?.[key] === undefined)));
 		assert.ok(!calls.some((call) => call.args.includes("test_token") || Object.values(call.env ?? {}).includes("test_token") || call.args.join(" ").includes("test_token")));
 		assert.ok(askpass && !existsSync(askpass), "temp askpass is removed after publication");
 	} finally { for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : process.env[key] = value; rmSync(ghBin, { recursive: true, force: true }); rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("configured non-default bases are verified remotely and used for create or update", async () => {
+	const workspace = gitWorkspace("pio-pr-base-staging-"), stat = statSync(workspace), calls: string[][] = [];
+	const target: PinnedPullRequestTarget = { workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! };
+	const policyWithStaging = { ...policy, baseBranches: ["staging"] };
+	try {
+		const result = await publishPullRequest(target, policyWithStaging, "t", "b", baseFlowRunner(workspace, "feat/staging", [], calls), "staging");
+		assert.deepEqual(result.base, "staging"); assert.match(result.message, /against base staging/);
+		assert.ok(calls.some((args) => args.includes("ls-remote") && args.includes("refs/heads/staging")), "configured base is checked as an exact remote ref");
+		const create = calls.find((args) => args[0] === "api" && args.includes("--method=POST"));
+		assert.ok(create?.includes("--raw-field=base=staging"));
+		const query = calls.find((args) => args[2] === "repos/owner/repository/pulls");
+		assert.equal(query?.some((arg) => arg.startsWith("--raw-field=base=")), false, "same-head discovery sees PRs against every base");
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("non-default bases reject unconfigured, malformed, same-head, and absent remote refs before push", async () => {
+	const workspace = gitWorkspace("pio-pr-base-reject-"), stat = statSync(workspace);
+	const target = () => ({ workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! });
+	try {
+		for (const [base, expected] of [["staging", /not allowed by configuration/], ["feat/staging", /cannot match the head branch/], ["bad branch", /base branch is invalid/]] as const) {
+			const calls: string[][] = [], result = await publishPullRequest(target(), policy, "t", "b", baseFlowRunner(workspace, "feat/staging", [], calls), base);
+			assert.equal(result.ok, false); assert.match(result.message, expected); assert.equal(calls.some((args) => args.includes("push")), false);
+		}
+		const calls: string[][] = [], result = await publishPullRequest(target(), { ...policy, baseBranches: ["staging"] }, "t", "b", baseFlowRunner(workspace, "feat/staging", [], calls, false), "staging");
+		assert.equal(result.ok, false); assert.match(result.message, /does not exist on the remote/); assert.equal(calls.some((args) => args.includes("push")), false);
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+test("a same-head PR against another base is not changed, while an exact base updates in place", async () => {
+	const workspace = gitWorkspace("pio-pr-base-existing-"), stat = statSync(workspace), policyWithStaging = { ...policy, baseBranches: ["staging"] };
+	const target = () => ({ workspace, repository: "owner/repository", remoteUrl: "https://github.com/owner/repository.git", defaultBranch: "main", generation: "one", device: stat.dev, inode: stat.ino, git: gitMetadataForTesting(workspace)! });
+	const row = (baseRefName: string) => [{ number: 7, headRefName: "feat/staging", baseRefName, isCrossRepository: false, headRepository: { nameWithOwner: "owner/repository" }, headRepositoryOwner: { login: "owner" } }];
+	try {
+		const mismatchedCalls: string[][] = [], mismatch = await publishPullRequest(target(), policyWithStaging, "t", "b", baseFlowRunner(workspace, "feat/staging", row("main"), mismatchedCalls), "staging");
+		assert.equal(mismatch.ok, false); assert.match(mismatch.message, /targets a different base than staging/);
+		assert.equal(mismatchedCalls.some((args) => args[0] === "api" && (args.includes("--method=POST") || args.includes("--method=PATCH"))), false);
+		const updateCalls: string[][] = [], updated = await publishPullRequest(target(), policyWithStaging, "t", "b", baseFlowRunner(workspace, "feat/staging", row("staging"), updateCalls), "staging");
+		assert.equal(updated.ok, true); assert.match(updated.message, /Updated.*base staging/);
+		assert.ok(updateCalls.some((args) => args[0] === "api" && args.includes("--method=PATCH"))); assert.equal(updateCalls.some((args) => args[0] === "api" && args.includes("--method=POST")), false);
+	} finally { rmSync(workspace, { recursive: true, force: true }); }
 });
 
 test("async pinning ignores stale origin/HEAD and trusts only bounded REST repository metadata", async () => {

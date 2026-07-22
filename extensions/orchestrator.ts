@@ -730,7 +730,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	}
 
 	const prInstructions = spawned.prBroker
-		? `\n\nA credential-free PR broker is available only for this delegated branch at /pr/pio-pr. Use it only when the task explicitly requests creating or updating a PR, after committing all work and ensuring the worktree (including untracked files) is clean: /pr/pio-pr status, then /pr/pio-pr publish "title" "body". It can only publish this pinned branch and create/update its open PR; do not seek GitHub, SSH, token, remote, merge, close, or review access.`
+		? `\n\nA credential-free PR broker is available only for this delegated branch at /pr/pio-pr. Use it only when the task explicitly requests creating or updating a PR, after committing all work and ensuring the worktree (including untracked files) is clean: /pr/pio-pr status, then /pr/pio-pr publish "title" "body" (or /pr/pio-pr publish --base <configured-branch> "title" "body"). It can only publish this pinned branch and create/update its open PR against its default base or an explicitly configured base; do not seek GitHub, SSH, token, remote, merge, close, or review access.`
 		: "";
 	const prompt = `You are ${name}, an implementation worker. Work directly in ${cwd}.
 

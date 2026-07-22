@@ -103,10 +103,10 @@ test("configured list is accepted and malformed, missing-model, empty, or duplic
 test("pull request broker config is opt-in and malformed policy fails closed", () => {
 	const absent = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "absent-pr-broker-config") });
 	assert.equal(absent.pullRequests, undefined);
-	const valid = configFile({ pullRequests: { repositories: ["Owner/Repository"], branchPrefixes: ["feat/"] } });
+	const valid = configFile({ pullRequests: { repositories: ["Owner/Repository"], branchPrefixes: ["feat/"], baseBranches: ["staging"] } });
 	const invalid = configFile({ pullRequests: { repositories: ["owner/repository"], branchPrefixes: ["feat/", "feat/"] } });
 	try {
-		assert.deepEqual(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: valid }).pullRequests, { repositories: ["owner/repository"], branchPrefixes: ["feat/"] });
+		assert.deepEqual(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: valid }).pullRequests, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], baseBranches: ["staging"] });
 		const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: invalid });
 		assert.equal(config.pullRequests, undefined);
 		assert.match(config.warning ?? "", /Pull request broker configuration was invalid/);
