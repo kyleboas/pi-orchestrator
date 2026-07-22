@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { WorkerProfile } from "./orchestrator-core.ts";
+import type { DelegationEffort, WorkerProfile } from "./orchestrator-core.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 import type { WorkerLifecycle } from "./worker-lifecycle.ts";
 
@@ -16,6 +16,7 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	id: string;
 	name: string;
 	profile: WorkerProfile;
+	effort?: DelegationEffort;
 	task: string;
 	/** Stable delegated-task lineage; each steer shares this root. */
 	rootTaskId: string;

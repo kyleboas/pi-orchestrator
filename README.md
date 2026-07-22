@@ -29,7 +29,7 @@ Every worker is an individual, explicit model profile. Pi workers **never inheri
 - `Haiku`: Claude Code, `haiku`
 - `Fable`: Claude Code, `fable`
 
-Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with Luna unless its already-inspected scope demonstrably requires Sol or Terra; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task.
+Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with Luna unless its already-inspected scope demonstrably requires Sol or Terra; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task. Each delegation may also choose a backend-neutral effort level (`low`, `medium`, or `high`) independently for the selected worker/model. If omitted, Pi uses the profile's configured `thinking` level and Claude Code keeps its normal default.
 
 ## Outcome ledger and routing advice
 
@@ -55,7 +55,7 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
 
 `rolloverContextPercent` is an optional finite percentage from `0` through `100`, defaulting to the conservative `38`. Set it to `0` to disable outcome-boundary rollover. After a worker result is delivered, if no worker is starting, working, or settling and context use is at least this threshold, the extension requests one Pi compaction at the next `agent_end` boundary. Its handoff preserves the user goal, decisions, authoritative paths, changed files, validation, commits/PRs, and blockers while dropping routine tool/status chatter. It never compacts active work or small contexts, does not repeat the same outcome, and safely retries after a failed compaction.
 
-`workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string.
+`workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string. `orchestrator_delegate` optionally accepts `effort` (`low`, `medium`, or `high`) per delegation; this overrides Pi's profile thinking for that launch or passes Claude Code's `--effort` option, without changing the catalog.
 
 A worker profile may additionally declare `"sandbox": "off"`, the explicit per-worker opt-out described under [Worker sandbox](#worker-sandbox-linux-bubblewrap). Only the exact literal `"off"` is accepted; any other present value rejects the catalog (the config falls back to defaults with a warning) rather than loading with a different containment meaning.
 
