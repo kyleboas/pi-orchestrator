@@ -28,17 +28,27 @@ export type OrchestratorConfig = {
 
 type Json = Record<string, unknown>;
 const NAME = /^[A-Za-z][A-Za-z0-9 -]{0,48}$/;
-const THINKING = new Set<PiThinkingLevel>(["low", "medium", "high"]);
+const THINKING = new Set<PiThinkingLevel>(["low", "medium", "high", "xhigh"]);
 
 export const DEFAULT_WORKERS: Record<string, WorkerProfile> = {
-	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
-	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation when Luna would be out of its depth." },
-	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
-	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier; reserve for genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
-	Opus: { backend: "claude-code", model: "opus" },
-	Sonnet: { backend: "claude-code", model: "sonnet" },
-	Haiku: { backend: "claude-code", model: "haiku" },
-	Fable: { backend: "claude-code", model: "fable" },
+	"Opus 5 Medium": { backend: "claude-code", model: "claude-opus-5", thinking: "medium", description: "Opus 5 at medium effort; use for multi-step changes, edge cases, harder implementation, and design-sensitive work." },
+	"Opus 5 Low": { backend: "claude-code", model: "claude-opus-5", thinking: "low", description: "Opus 5 at low effort; good for routine bounded work, small edits, config changes, and verification runs." },
+	"GPT-5.6 Terra xHigh": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "xhigh", description: "Heavy tier at maximum thinking; reserve for the hardest multi-file work and design-sensitive changes." },
+	"GPT-5.6 Terra High": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier at high thinking; for genuinely hard multi-file work and tricky debugging." },
+	"GPT-5.6 Terra Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "medium", description: "Heavy tier at medium thinking; for moderately complex multi-file changes." },
+	"GPT-5.6 Terra Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "low", description: "Heavy tier at low thinking; for simpler tasks that still benefit from Terra's capability." },
+	"GPT-5.6 Luna xHigh": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "xhigh", description: "Fast tier at maximum thinking; for tasks needing Luna's speed with deep reasoning." },
+	"GPT-5.6 Luna High": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "high", description: "Fast tier at high thinking; for moderate tasks needing more reasoning than the default." },
+	"GPT-5.6 Luna Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "medium", description: "Fast tier at medium thinking; for bounded work with some edge cases." },
+	"GPT-5.6 Luna Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
+	"GPT-5.6 Sol Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
+	"GPT-5.6 Sol Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation." },
+	"Sonnet High": { backend: "claude-code", model: "sonnet", thinking: "high", description: "Mid Claude worker at high effort; for harder implementation tasks." },
+	"Sonnet Medium": { backend: "claude-code", model: "sonnet", thinking: "medium", description: "Mid Claude worker at medium effort; for ordinary implementation." },
+	"Sonnet Low": { backend: "claude-code", model: "sonnet", thinking: "low", description: "Mid Claude worker at low effort; for small self-contained tasks." },
+	"Haiku High": { backend: "claude-code", model: "haiku", thinking: "high", description: "Cheap Claude worker at high effort; for moderate tasks on a budget." },
+	"Haiku Medium": { backend: "claude-code", model: "haiku", thinking: "medium", description: "Cheap Claude worker at medium effort; for bounded tasks on a budget." },
+	"Haiku Low": { backend: "claude-code", model: "haiku", thinking: "low", description: "Cheapest Claude worker; for the smallest self-contained tasks." },
 };
 
 function nonempty(value: unknown): value is string {
@@ -79,7 +89,7 @@ function profile(value: unknown): WorkerProfile | undefined {
 		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model)) return undefined;
 		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description), ...sandbox.sandbox };
 	}
-	if (value.backend === "claude-code" && nonempty(value.model)) return { backend: "claude-code", model: value.model.trim(), ...description(value.description), ...sandbox.sandbox };
+	if (value.backend === "claude-code" && nonempty(value.model) && (value.thinking === undefined || THINKING.has(value.thinking as PiThinkingLevel))) return { backend: "claude-code", model: value.model.trim(), ...(value.thinking === undefined ? {} : { thinking: value.thinking as PiThinkingLevel }), ...description(value.description), ...sandbox.sandbox };
 	return undefined;
 }
 function workers(value: unknown): Record<string, WorkerProfile> | undefined {
