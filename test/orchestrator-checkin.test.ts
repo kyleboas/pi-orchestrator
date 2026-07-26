@@ -30,6 +30,23 @@ test("assessment deterministically identifies stalls, blocking language, and rep
 	assert.equal(assessWorkerCheckIn(worker({ transcript: [{ at: at + 14 * MIN, role: "assistant", text: "No failed checks; validation is healthy." }] }), base, at + base).status, "healthy");
 });
 
+test("tracked background jobs explain transcript silence without hiding real blockers", () => {
+	const at = startedAt.getTime(); const base = 15 * MIN;
+	const waiting = worker({ pendingBackgroundJobIds: new Set(["job-1"]) });
+	const assessment = assessWorkerCheckIn(waiting, base, at + 22 * MIN);
+	assert.deepEqual(assessment, { status: "healthy", signals: [] });
+	const digest = buildCheckInDigest(waiting, base, at + 22 * MIN, assessment);
+	assert.match(digest, /waiting for 1 tracked background job/i);
+	assert.match(digest, /healthy\/on track while the tracked background job runs/i);
+	assert.doesNotMatch(digest, /Assessment: suspicious/i);
+
+	const blocked = worker({
+		pendingBackgroundJobIds: new Set(["job-1"]),
+		transcript: [{ at: at + 14 * MIN, role: "assistant", text: "Blocked: permission denied by the repository." }],
+	});
+	assert.equal(assessWorkerCheckIn(blocked, base, at + 22 * MIN).status, "suspicious");
+});
+
 test("check-in delivery integration uses triggerTurn:false for healthy work and wakes only suspicious work without touching worker", () => {
 	const calls: Array<{ kind: string; options: unknown }> = []; const original = worker();
 	const api = { sendMessage: (_message: unknown, options: unknown) => calls.push({ kind: "custom", options }), sendUserMessage: (_text: string, options: unknown) => calls.push({ kind: "user", options }) };

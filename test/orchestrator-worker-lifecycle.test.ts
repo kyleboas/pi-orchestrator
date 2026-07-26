@@ -9,6 +9,7 @@ import {
 	claimWorkerReport,
 	finishWorkerSettlement,
 	selectFinalWorkerText,
+	shouldAutoStopReportedWorker,
 	stopWorker,
 	type WorkerLifecycle,
 	type WorkerProcessState,
@@ -64,6 +65,17 @@ test("a live follow-up starts a new generation and cannot reuse the prior report
 	beginWorkerRun(lifecycle);
 	assert.equal(lifecycle.run, 2);
 	assert.equal(claimWorkerReport(lifecycle), true);
+});
+
+test("auto-stop selects only current reported terminal runs outside settlement", () => {
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "idle", reportedRun: 1 })), true);
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "failed", reportedRun: 1 })), true);
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "idle", run: 2, reportedRun: 1 })), false, "a steer makes the prior report stale");
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "idle", reportedRun: 1, settlingRun: 1 })), false);
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "starting", reportedRun: 1 })), false);
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "working", reportedRun: 1 })), false);
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "stopped", reportedRun: 1 })), false);
+	assert.equal(shouldAutoStopReportedWorker(worker({ state: "idle" })), false, "an undelivered report remains retryable");
 });
 
 test("only the last outstanding Claude turn settles a steered worker", () => {

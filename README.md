@@ -14,22 +14,17 @@ pi install git:github.com/kyleboas/pi-orchestrator
 
 Restart Pi or run `/reload`. If you already use a vendored/local orchestrator extension, disable or remove it first: running two orchestrators creates conflicting tools and worker ownership.
 
-Pi workers require `pi` on `PATH`. Claude workers are optional and require Claude Code (`claude`) on `PATH` and its normal authentication. Workers run in the coordinator's current directory with implementation tools. Sandbox mode `off` is the default: all configured workers run directly with inherited host access. An Ops or other host-only worker is not required; designate one with a per-worker opt-out only when a task genuinely needs host operations. Optional sandboxing remains available below.
+Pi workers require `pi` on `PATH`. Claude workers are optional and require Claude Code (`claude`) on `PATH` and its normal authentication. Workers run in the coordinator's current directory with implementation tools.
 
 ## Default catalog
 
 Every worker is an individual, explicit model profile. Pi workers **never inherit the coordinator model**: each Pi RPC launch always uses the `model` and `thinking` in that worker's profile. The default catalog is:
 
-- `Luna`: Pi RPC, `openai-codex/gpt-5.6-luna`, low thinking — the cheap default for routine bounded work
-- `Sol-Low`: Pi RPC, `openai-codex/gpt-5.6-sol`, low thinking
-- `Sol-Medium`: Pi RPC, `openai-codex/gpt-5.6-sol`, medium thinking
-- `Terra`: Pi RPC, `openai-codex/gpt-5.6-terra`, high thinking — reserved for genuinely hard work
-- `Opus`: Claude Code, `opus`
-- `Sonnet`: Claude Code, `sonnet`
-- `Haiku`: Claude Code, `haiku`
-- `Fable`: Claude Code, `fable`
+- Claude Code: `Opus 5 Medium`, `Opus 5 Low`, `Sonnet High/Medium/Low`, and `Haiku High/Medium/Low`
+- Pi RPC: `GPT-5.6 Terra xHigh/High/Medium/Low`, `GPT-5.6 Luna xHigh/High/Medium/Low`, and `GPT-5.6 Sol Medium/Low`
+- `GPT-5.6 Luna Low` is the cheap default for routine bounded work. Higher tiers are for harder work; `xHigh` is the maximum thinking level.
 
-Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with Luna unless its already-inspected scope demonstrably requires Sol or Terra; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task. Each delegation may also choose a backend-neutral effort level (`low`, `medium`, or `high`) independently for the selected worker/model. If omitted, Pi uses the profile's configured `thinking` level and Claude Code keeps its normal default.
+Each worker may carry a `description` (in config too) that tells the coordinator what the tier is for. For an unqualified new task, the coordinator starts with GPT-5.6 Luna Low unless its already-inspected scope needs a stronger tier; explicit user worker choices always win. It escalates only for known complexity or after a cheaper attempt cannot finish. Distinct tasks receive new delegates; steering is only continuation/correction of the same task.
 
 ## Outcome ledger and routing advice
 
@@ -45,7 +40,7 @@ The ledger is advisory and backwards-compatible with aggregate-only v1/v2 data. 
 
 For example: “ask Opus to implement the migration and run its tests.” While a worker is live: “steer Opus with correction: also cover rollback behavior.”
 
-The Terra, Sol, and Fable aliases are opinionated defaults from this package's author and may not exist in another user's provider or Claude setup. Supply your own complete `workers` catalog when they are unavailable; a configured catalog replaces all seven defaults and may use arbitrary valid display names, Pi `provider/model` IDs, and Pi thinking levels.
+These model names are product defaults and may not exist in another user's provider or Claude setup. Supply your own complete `workers` catalog when they are unavailable; a configured catalog replaces all built-in defaults and may use arbitrary valid display names, Pi `provider/model` IDs, and Pi thinking levels.
 
 ## Configuration
 
@@ -55,7 +50,7 @@ Configuration is read once when the extension initializes. It uses `PI_ORCHESTRA
 
 `rolloverContextPercent` is an optional finite percentage from `0` through `100`, defaulting to the conservative `38`. Set it to `0` to disable outcome-boundary rollover. After a worker result is delivered, if no worker is starting, working, or settling and context use is at least this threshold, the extension requests one Pi compaction at the next `agent_end` boundary. Its handoff preserves the user goal, decisions, authoritative paths, changed files, validation, commits/PRs, and blockers while dropping routine tool/status chatter. It never compacts active work or small contexts, does not repeat the same outcome, and safely retries after a failed compaction.
 
-`workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, or `high`). Every Claude worker requires a nonempty model alias or model string. `orchestrator_delegate` optionally accepts `effort` (`low`, `medium`, or `high`) per delegation; this overrides Pi's profile thinking for that launch or passes Claude Code's `--effort` option, without changing the catalog.
+`workers` is a complete catalog, either an object keyed by display name or an array whose entries have `name`. Names must be unique (case-insensitive), start with a letter, and contain only letters, numbers, spaces, and hyphens. Every Pi RPC worker requires a nonempty `provider/model` `model` and a `thinking` level (`low`, `medium`, `high`, or `xhigh`). Every Claude worker requires a nonempty model alias or model string.
 
 A worker profile may additionally declare `"sandbox": "off"`, the explicit per-worker opt-out described under [Worker sandbox](#worker-sandbox-linux-bubblewrap). Only the exact literal `"off"` is accepted; any other present value rejects the catalog (the config falls back to defaults with a warning) rather than loading with a different containment meaning.
 
@@ -67,23 +62,22 @@ A worker profile may additionally declare `"sandbox": "off"`, the explicit per-w
 {
   "pullRequests": {
     "repositories": ["owner/repository", "owner/*"],
-    "branchPrefixes": ["feat/", "fix/"],
-    "baseBranches": ["staging"]
+    "branchPrefixes": ["feat/", "fix/"]
   }
 }
 ```
 
 A repository entry is either an exact `owner/repository` or the explicit owner-wide `owner/*`, which allows every repository under that owner. Only those two full forms parse; any partial pattern (`*`, `*/name`, `owner/pre*`) rejects the whole block — authority is never broadened by a typo. The wildcard affects eligibility only: the pinned target is always the exact repository parsed from the workspace's canonical origin, and every subsequent check runs against that pin.
 
-Each branch policy entry is either a slash-terminated prefix such as `feat/` or the exact wildcard `*`. Use `"branchPrefixes": ["*"]` to authorize any syntactically valid branch in an allowlisted repository; the repository's default branch remains forbidden. `baseBranches` is optional and is an exact, bounded, duplicate-free list of syntactically valid extra base branches. The pinned repository default branch is always permitted; every other requested base must be listed in `baseBranches` and exist as that exact remote branch. Malformed broker configuration disables the broker with a generic warning. For an eligible **sandboxed** worker, the host pins the canonical repository `origin` and its default branch before worker code starts through trusted GitHub REST metadata. Linked Git worktrees are not eligible because their `.git` file points outside the mounted workspace; the broker fails closed rather than claiming sandbox support for them. It mounts only a per-worker `/pr` directory containing `/pr/pio-pr` and a mode-0600 Unix socket. Existing narrow model-provider authentication/config mounts remain available so the worker can reach its model, but the broker feature exposes no host HOME, GitHub `gh` configuration, SSH files/agent socket, `GH_TOKEN`/`GITHUB_TOKEN`, or GitHub credentials.
+Each branch policy entry is either a slash-terminated prefix such as `feat/` or the exact wildcard `*`. Use `"branchPrefixes": ["*"]` to authorize any syntactically valid branch in an allowlisted repository; the repository's default branch remains forbidden. Both arrays are bounded, duplicate-free, and strictly validated, and wildcard-like values such as `feat/*` are invalid; malformed broker configuration disables the broker with a generic warning. For an eligible **sandboxed** worker, the host pins the canonical repository `origin` and its default branch before worker code starts (using the local origin HEAD when available, otherwise trusted `gh repo view`). Linked Git worktrees are not eligible because their `.git` file points outside the mounted workspace; the broker fails closed rather than claiming sandbox support for them. It mounts only a per-worker `/pr` directory containing `/pr/pio-pr` and a mode-0600 Unix socket. Existing narrow model-provider authentication/config mounts remain available so the worker can reach its model, but the broker feature exposes no host HOME, GitHub `gh` configuration, SSH files/agent socket, `GH_TOKEN`/`GITHUB_TOKEN`, or GitHub credentials.
 
-Workers may run `/pr/pio-pr status`; it reports whether a branch is pinned, whether the current branch is eligible, and the default base. Only when the task explicitly requests a PR create/update, after committing everything and obtaining a clean worktree (including no untracked files), they may run `/pr/pio-pr publish "title" "body"` or `/pr/pio-pr publish --base <configured-branch> "title" "body"`. The first successful publish pins the then-current allowed non-default branch for that broker generation; later branch changes are rejected. Publish can only fast-forward that pinned origin branch and create or update that branch's one open PR against the pinned default base or an explicitly configured, exact existing remote base. It detects a same-head open PR against another base and rejects rather than updating or creating across bases. It cannot select a remote, repository, unconfigured base, or head, force-push, run git/gh/API commands, or merge, close, delete, review, label, or otherwise administer a PR. Broker publication requires only that the host has already completed `gh auth login`; host SSH is neither required nor exposed. The trusted host broker uses that host-only GitHub authentication without returning or logging credentials, and workers still receive no GitHub credentials. A coordinator never delegates merge; delegated workers must not merge, close, or otherwise finalize pull requests. The coordinator may merge only after the user explicitly authorizes it, normally through takeover.
+Workers may run `/pr/pio-pr status`; it reports whether a branch is pinned and whether the current branch is eligible. Only when the task explicitly requests a PR create/update, after committing everything and obtaining a clean worktree (including no untracked files), they may run `/pr/pio-pr publish "title" "body"`. The first successful publish pins the then-current allowed non-default branch for that broker generation; later branch changes are rejected. Publish can only fast-forward that pinned origin branch and create or update that branch's one open PR, always against the pinned default branch. It cannot select a remote, repository, base, or head, force-push, run git/gh/API commands, or merge, close, delete, review, label, or otherwise administer a PR. Broker publication requires only that the host has already completed `gh auth login`; host SSH is neither required nor exposed. The trusted host broker uses that host-only GitHub authentication without returning or logging credentials, and workers still receive no GitHub credentials. A coordinator never delegates merge; it may merge only after an explicit user request, normally through takeover.
 
 ```json
 {
   "coordinator": {
-    "provider": "example-provider",
-    "id": "coordinator-model-placeholder",
+    "provider": "openai-codex",
+    "id": "gpt-5.6-sol",
     "thinking": "high"
   },
   "commands": { "pi": "pi", "claude": "claude-auto" },
@@ -91,8 +85,7 @@ Workers may run `/pr/pio-pr status`; it reports whether a branch is pinned, whet
   "rolloverContextPercent": 38,
   "pullRequests": {
     "repositories": ["example-owner/example-repository"],
-    "branchPrefixes": ["feat/", "fix/"],
-    "baseBranches": ["staging"]
+    "branchPrefixes": ["feat/", "fix/"]
   },
   "workers": {
     "Builder": {
@@ -149,7 +142,7 @@ npm run smoke:bwrap   # in a checkout: opt-in real-bwrap smoke test
 
 Modes:
 
-- `off` (default): every configured worker uses direct spawn with inherited host access; no Ops/host-only worker is required.
+- `off` (default): legacy direct spawn.
 - `preferred`: sandbox when a cached functional probe passes; otherwise the worker launches unsandboxed with a prominent warning in the delegate result and worker transcript.
 - `required`: fail closed. A missing binary, failed namespace probe, unresolvable worker executable, or unenforceable isolated network rejects the delegation; nothing ever silently falls back. A malformed `sandbox` block also disables delegation rather than quietly becoming `off`. `network: "gateway"` always fails closed, including with `mode: "preferred"`; it can never fall back to a credential-bearing host launch.
 
@@ -192,7 +185,7 @@ Exact non-guarantees — this is containment, not a full security boundary:
 
 ## Worker session view
 
-Like Claude Code's subagent navigation: with the editor empty, press **down** to move focus into the worker rows in the footer, **up/down** to change the highlighted worker, and **enter** to open that worker's live session view — the task, assistant replies, and tool calls captured from its stream. **Up/down** scrolls the view (page up/down for pages; scrolled views stop following live output until scrolled back to the bottom), and **esc** (or `q`) returns to the row list; **esc** again, or moving up past the first row, returns focus to the editor. Only live workers are listed; settled ones leave the rows immediately (they remain steerable in memory for an hour after their result is delivered). Any other key cancels selection and types into the editor as normal. Transcripts are kept in memory only, bounded to the last 400 entries per worker.
+Like Claude Code's subagent navigation: with the editor empty, press **down** to move focus into the worker rows in the footer, **up/down** to change the highlighted worker, and **enter** to open that worker's live session view — the task, assistant replies, and tool calls captured from its stream. **Up/down** scrolls the view (page up/down for pages; scrolled views stop following live output until scrolled back to the bottom), and **esc** (or `q`) returns to the row list; **esc** again, or moving up past the first row, returns focus to the editor. Only live workers are listed; settled ones leave the rows immediately. A completed worker remains steerable through the coordinator's review turn, then its subprocess is stopped automatically at the safe settled boundary; retained metadata ages out after an hour. Any other key cancels selection and types into the editor as normal. Transcripts are kept in memory only, bounded to the last 400 entries per worker.
 
 ## Claude account failover
 

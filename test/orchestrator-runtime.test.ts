@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { shouldReapHeadlessSession } from "../extensions/orchestrator.ts";
+import { workerStatusSnapshot, workerStatusWidgetLines } from "../extensions/orchestrator-lib/orchestrator-worker-status.ts";
+import { shouldAutoStopReportedWorker } from "../extensions/orchestrator-lib/worker-lifecycle.ts";
 import {
 	bindOrchestratorApi,
 	killWorkerProcessTree,
@@ -12,7 +15,9 @@ import {
 	ensureOrchestratorExitHook,
 	getOrchestratorRuntime,
 	notifyOrchestratorStateChange,
+	nextWorkerStatusRevision,
 	releaseOrchestratorSession,
+	stopWorkerProcess,
 	type OrchestratorWorker,
 } from "../extensions/orchestrator-lib/orchestrator-runtime.ts";
 
@@ -31,7 +36,7 @@ function worker(): OrchestratorWorker {
 		category: "tests",
 		complexity: "low",
 		cwd: "/tmp",
-		process: { kill: () => true } as unknown as OrchestratorWorker["process"],
+		process: { pid: undefined, exitCode: null, signalCode: null, kill: () => true } as unknown as OrchestratorWorker["process"],
 		state: "idle",
 		run: 1,
 		startedAt: new Date(),
@@ -41,6 +46,53 @@ function worker(): OrchestratorWorker {
 		rpcPending: new Map(),
 	};
 }
+
+test("worker status is one bounded JSON widget line without task or transcript text", () => {
+	const startedAt = new Date("2026-01-01T00:00:00.000Z");
+	const entries = Array.from({ length: 70 }, (_, index) => ({
+		id: `worker-${index}`,
+		name: "Luna",
+		state: index === 0 ? "working" : "idle",
+		startedAt,
+		lastActivityAt: startedAt,
+		rootTaskId: "task-1",
+		runId: `run-${index}`,
+		task: "do not export this secret prompt",
+		transcript: [{ role: "assistant", text: "do not export this transcript" }],
+	}));
+	const metadata = { revision: 7, sessionId: "parent-session-1", emittedAt: startedAt };
+	const line = workerStatusWidgetLines(entries, metadata)[0]!;
+	assert.equal(line.includes("\\n"), false);
+	const snapshot = JSON.parse(line) as ReturnType<typeof workerStatusSnapshot>;
+	assert.deepEqual(Object.keys(snapshot), ["version", "revision", "sessionId", "emittedAt", "workers"]);
+	assert.equal(snapshot.version, 1);
+	assert.equal(snapshot.revision, 7);
+	assert.equal(snapshot.sessionId, "parent-session-1");
+	assert.equal(snapshot.emittedAt, "2026-01-01T00:00:00.000Z");
+	assert.equal(snapshot.workers.length, 64);
+	assert.deepEqual(snapshot.workers[0], {
+		id: "worker-0",
+		name: "Luna",
+		state: "working",
+		activity: "Working on assigned task",
+		startedAt: "2026-01-01T00:00:00.000Z",
+		lastActivityAt: "2026-01-01T00:00:00.000Z",
+		rootTaskId: "task-1",
+		runId: "run-0",
+	});
+	assert.equal(line.includes("secret prompt"), false);
+	assert.equal(line.includes("transcript"), false);
+	assert.deepEqual(JSON.parse(workerStatusWidgetLines([], metadata)[0]!), {
+		version: 1,
+		revision: 7,
+		sessionId: "parent-session-1",
+		emittedAt: "2026-01-01T00:00:00.000Z",
+		workers: [],
+	});
+	const runtime = createOrchestratorRuntimeForTesting();
+	assert.equal(nextWorkerStatusRevision(runtime), 1);
+	assert.equal(nextWorkerStatusRevision(runtime), 2);
+});
 
 test("reload generations share workers while API/notifier ownership moves safely", () => {
 	const runtime = getOrchestratorRuntime();
@@ -86,6 +138,34 @@ test("reload generations share workers while API/notifier ownership moves safely
 	assert.equal(secondDisposed, 1);
 });
 
+test("Mi coordinator headless mode retains idle workers while ordinary headless mode reaps them", () => {
+	const previousMode = process.env.MI_COORDINATOR_MODE;
+	const item = worker();
+	item.state = "idle";
+	item.reportedRun = item.run;
+	let killed = 0;
+	item.process = {
+		pid: undefined,
+		exitCode: null,
+		signalCode: null,
+		kill: () => { killed++; return true; },
+	} as unknown as OrchestratorWorker["process"];
+	try {
+		process.env.MI_COORDINATOR_MODE = "1";
+		assert.equal(shouldReapHeadlessSession(), false);
+		assert.equal(shouldAutoStopReportedWorker(item), true);
+		assert.equal(killed, 0, "Mi coordinator keeps a reported worker available for steering");
+
+		delete process.env.MI_COORDINATOR_MODE;
+		assert.equal(shouldReapHeadlessSession(), true);
+		if (shouldReapHeadlessSession() && shouldAutoStopReportedWorker(item)) stopWorkerProcess(item);
+		assert.equal(killed, 1, "ordinary headless sessions reap reported workers");
+	} finally {
+		if (previousMode === undefined) delete process.env.MI_COORDINATOR_MODE;
+		else process.env.MI_COORDINATOR_MODE = previousMode;
+	}
+});
+
 test("check-in timers are retired on reload and current-session shutdown", async () => {
 	const runtime = createOrchestratorRuntimeForTesting();
 	let staleTicks = 0;
@@ -127,6 +207,56 @@ test("the process exit cleanup hook is registered once across generations", () =
 	assert.equal(ensureOrchestratorExitHook(runtime, register), true);
 	assert.equal(ensureOrchestratorExitHook(runtime, register), false);
 	assert.equal(registrations, 1);
+});
+
+test("process exit cleanup kills every live worker regardless of lifecycle state", () => {
+	const runtime = createOrchestratorRuntimeForTesting();
+	let listener: (() => void) | undefined;
+	const killed: string[] = [];
+	for (const state of ["starting", "working", "idle", "failed", "stopped"] as const) {
+		const item = worker();
+		item.id = state;
+		item.state = state;
+		item.process = {
+			pid: undefined,
+			exitCode: null,
+			signalCode: null,
+			kill: () => { killed.push(state); return true; },
+		} as unknown as OrchestratorWorker["process"];
+		runtime.workers.set(item.id, item);
+	}
+	const exited = worker();
+	exited.id = "exited";
+	exited.process = {
+		pid: undefined,
+		exitCode: 0,
+		signalCode: null,
+		kill: () => { killed.push("exited"); return true; },
+	} as unknown as OrchestratorWorker["process"];
+	runtime.workers.set(exited.id, exited);
+
+	ensureOrchestratorExitHook(runtime, (_event, callback) => { listener = callback; });
+	listener?.();
+	assert.deepEqual(killed.sort(), ["failed", "idle", "starting", "stopped", "working"]);
+});
+
+test("stopWorkerProcess invalidates lifecycle and terminates a live child", () => {
+	const item = worker();
+	item.state = "idle";
+	item.reportedRun = item.run;
+	item.settlingRun = item.run;
+	let killed = 0;
+	item.process = {
+		pid: undefined,
+		exitCode: null,
+		signalCode: null,
+		kill: () => { killed++; return true; },
+	} as unknown as OrchestratorWorker["process"];
+
+	stopWorkerProcess(item);
+	assert.equal(item.state, "stopped");
+	assert.equal(item.settlingRun, undefined);
+	assert.equal(killed, 1);
 });
 
 test("killWorkerProcessTree kills a detached worker's whole process group", async () => {

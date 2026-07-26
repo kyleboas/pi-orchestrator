@@ -12,23 +12,16 @@ import { coordinatorInstructions, createWorkerSchema } from "../extensions/orche
 function configFile(value: unknown): string { const dir = mkdtempSync(join(tmpdir(), "pi-orchestrator-")); const file = join(dir, "config.json"); writeFileSync(file, JSON.stringify(value)); return file; }
 function remove(file: string) { rmSync(join(file, ".."), { recursive: true, force: true }); }
 
-const EXPECTED_DEFAULT_WORKERS = {
-	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
-	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation when Luna would be out of its depth." },
-	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
-	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier; reserve for genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
-	Opus: { backend: "claude-code", model: "opus" },
-	Sonnet: { backend: "claude-code", model: "sonnet" },
-	Haiku: { backend: "claude-code", model: "haiku" },
-	Fable: { backend: "claude-code", model: "fable" },
-} as const;
+const EXPECTED_DEFAULT_WORKERS = DEFAULT_WORKERS;
 
 test("default catalog uses eight explicit individual worker profiles", () => {
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "absent-config") });
-	assert.deepEqual(workerNames(config.workers), ["Luna", "Sol-Low", "Sol-Medium", "Terra", "Opus", "Sonnet", "Haiku", "Fable"]);
+	assert.deepEqual(workerNames(config.workers), Object.keys(EXPECTED_DEFAULT_WORKERS));
 	assert.deepEqual(config.workers, EXPECTED_DEFAULT_WORKERS);
 	assert.deepEqual(DEFAULT_WORKERS, EXPECTED_DEFAULT_WORKERS);
-	const terra = config.workers.Terra!;
+	assert.deepEqual(config.coordinator, { thinking: "high" });
+	assert.equal(config.workers["GPT-5.6 Terra xHigh"]!.thinking, "xhigh");
+	const terra = config.workers["GPT-5.6 Terra High"]!;
 	assert.equal(terra.backend, "pi-rpc");
 	assert.deepEqual(piRpcWorkerArgs(terra), ["--mode", "rpc", "--no-session", "--no-extensions", "--tools", "read,bash,edit,write", "--model", "openai-codex/gpt-5.6-terra", "--thinking", "high"]);
 	assert.equal(piRpcWorkerArgs(terra, "low").at(-1), "low");
@@ -64,12 +57,12 @@ test("Pi launch arguments always use the profile model, never the coordinator mo
 });
 
 test("configured map generates dynamic names, explicit Pi metadata, commands, and custom Claude aliases", () => {
-	const file = configFile({ coordinator: { provider: "example", id: "lead", thinking: "medium" }, commands: { pi: "pi-custom", claude: "claude-auto" }, workers: { Builder: { backend: "pi-rpc", model: "example/worker", thinking: "high" }, Fable: { backend: "claude-code", model: "fable-placeholder" } } });
+	const file = configFile({ coordinator: { provider: "example", id: "lead", thinking: "medium" }, commands: { pi: "pi-custom", claude: "claude-auto" }, workers: { Builder: { backend: "pi-rpc", model: "example/worker", thinking: "xhigh" }, Fable: { backend: "claude-code", model: "fable-placeholder" } } });
 	try {
 		const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file, PI_ORCHESTRATOR_PI_BIN: "pi-env" });
 		assert.deepEqual(workerNames(config.workers), ["Builder", "Fable"]);
 		assert.equal(catalogText(config.workers), "Builder, or Fable");
-		assert.match(workerDescription("Builder", config.workers.Builder!), /example\/worker, high thinking/);
+		assert.match(workerDescription("Builder", config.workers.Builder!), /example\/worker, xhigh thinking/);
 		assert.match(workerDescription("Fable", config.workers.Fable!), /Fable: persistent Claude Code implementation worker \(fable-placeholder\)/);
 		const schema = createWorkerSchema(config.workers) as unknown as { anyOf: Array<{ const: string; description: string }> };
 		assert.deepEqual(schema.anyOf.map((entry) => entry.const), ["Builder", "Fable"]);
