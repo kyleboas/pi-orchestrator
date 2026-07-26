@@ -16,6 +16,7 @@ export type CheckInWorkerView = {
 	lastAlertRevision?: number;
 	transcriptRevision?: number;
 	healthStreak?: number;
+	pendingBackgroundJobIds?: ReadonlySet<string>;
 };
 
 export type CheckInAssessment = {
@@ -70,7 +71,8 @@ export function assessWorkerCheckIn(worker: CheckInWorkerView, baseIntervalMs: n
 	const last = activity.at(-1);
 	const lastWorkerActivityAt = last?.at;
 	const activityAnchor = lastWorkerActivityAt ?? worker.startedAt.getTime();
-	if (now - activityAnchor >= baseIntervalMs) {
+	const pendingBackgroundJobCount = worker.pendingBackgroundJobIds?.size ?? 0;
+	if (pendingBackgroundJobCount === 0 && now - activityAnchor >= baseIntervalMs) {
 		signals.push(`no assistant or tool activity for ${Math.max(1, Math.floor((now - activityAnchor) / 60_000))}m`);
 	}
 	const since = Math.max(worker.lastCheckinAt?.getTime() ?? 0, now - baseIntervalMs);
@@ -95,13 +97,17 @@ export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, n
 		.filter((entry) => (entry.role === "tool" || entry.role === "assistant") && entry.text.trim())
 		.slice(-3)
 		.map((entry) => `${entry.role === "tool" ? "tool" : "worker"}: ${clip(entry.text, 100)}`);
+	const pendingBackgroundJobCount = worker.pendingBackgroundJobIds?.size ?? 0;
 	const lines = [
 		`[${worker.name} passive progress check — ${worker.id}]`,
 		`Task: ${clip(worker.task, 140)}`,
 		...(signals.length ? [`Recent: ${signals.join(" | ")}`] : ["Recent: no captured assistant or tool activity."]),
+		...(pendingBackgroundJobCount > 0 ? [`Background: waiting for ${pendingBackgroundJobCount} tracked background job${pendingBackgroundJobCount === 1 ? "" : "s"}.`] : []),
 	];
 	if (assessment.status === "healthy") {
-		lines.push("Assessment: healthy/on track from captured activity; worker was not interrupted.");
+		lines.push(pendingBackgroundJobCount > 0
+			? "Assessment: healthy/on track while the tracked background job runs; worker was not interrupted."
+			: "Assessment: healthy/on track from captured activity; worker was not interrupted.");
 	} else {
 		lines.push(`Assessment: suspicious — ${assessment.signals.join("; ")}. Review only for actual drift; steer only if correction is needed. Worker was not interrupted.`);
 	}

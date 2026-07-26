@@ -23,7 +23,9 @@ import {
 	type WorkerProfile,
 } from "./orchestrator-lib/orchestrator-core.ts";
 import {
+	claudeAssistantText,
 	claudeCodeArgs,
+	drainClaudeStreamBuffer,
 	claudeResultSettlement,
 	claudeUsageTokenTotal,
 	claudeUserEvent,
@@ -58,7 +60,7 @@ import {
 	finishWorkerSettlement,
 	queueClaudeTurn,
 	selectFinalWorkerText,
-	stopWorker,
+	shouldAutoStopReportedWorker,
 } from "./orchestrator-lib/worker-lifecycle.ts";
 import {
 	bindOrchestratorApi,
@@ -66,12 +68,16 @@ import {
 	deliverWorkerReport,
 	ensureOrchestratorExitHook,
 	getOrchestratorRuntime,
+	isWorkerProcessLive,
 	killWorkerProcessTree,
 	notifyOrchestratorStateChange,
+	nextWorkerStatusRevision,
 	releaseOrchestratorSession,
+	stopWorkerProcess,
 	type OrchestratorWorker as Worker,
 } from "./orchestrator-lib/orchestrator-runtime.ts";
 import { renderBaseFooter } from "./orchestrator-lib/orchestrator-footer.ts";
+import { WORKER_STATUS_WIDGET_ID, workerStatusWidgetLines } from "./orchestrator-lib/orchestrator-worker-status.ts";
 import {
 	hasAnimatingWorker,
 	isExpiredWorker,
@@ -126,6 +132,11 @@ import {
 } from "./orchestrator-lib/orchestrator-session-view.ts";
 
 const LEGACY_WORKER_WIDGET_ID = "orchestrator-workers";
+
+/** Mi keeps reported workers alive so the coordinator can steer them again. */
+export function shouldReapHeadlessSession(): boolean {
+	return process.env.MI_COORDINATOR_MODE !== "1";
+}
 
 export function createWorkerSchema(catalog: WorkerCatalog) {
 	return Type.Union(workerNames(catalog).map((name) => Type.Literal(name, { description: workerDescription(name, catalog[name]!) })));
@@ -309,10 +320,8 @@ function rejectPendingRpc(worker: Worker, error: Error): void {
 
 function reapIfHeadless(worker: Worker): void {
 	const runtime = getOrchestratorRuntime();
-	if (!runtime.headlessReap || worker.reportedRun !== worker.run) return;
-	if (worker.state !== "idle" && worker.state !== "failed") return;
-	stopWorker(worker);
-	killWorkerProcessTree(worker.process);
+	if (!runtime.headlessReap || !shouldAutoStopReportedWorker(worker)) return;
+	stopWorkerProcess(worker);
 }
 
 function reportWorkerResult(worker: Worker): void {
@@ -377,7 +386,11 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 	}
 	const run = beginWorkerSettlement(worker);
 	if (run === undefined) return;
-	if (settlement.isError || !settlement.result) {
+	// Some Claude Code result events omit result even though the last assistant
+	// event already contained the final text. That is a successful terminal
+	// turn, not a reason to leave the reusable worker working or fail it.
+	const finalText = selectFinalWorkerText(worker.lastResult, settlement.result);
+	if (settlement.isError || !finalText) {
 		worker.settlingRun = undefined;
 		worker.state = "failed";
 		worker.settledAt ??= new Date();
@@ -385,7 +398,7 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 		recordRunOutcome(worker, "failed");
 		reportWorkerResult(worker);
 	} else {
-		worker.lastResult = settlement.result;
+		worker.lastResult = finalText;
 		if (finishWorkerSettlement(worker, run)) {
 			recordRunOutcome(worker, "completed");
 			reportWorkerResult(worker);
@@ -452,16 +465,36 @@ function handleRpcLine(worker: Worker, line: string): void {
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
+function handleClaudeEvents(worker: Worker, events: Record<string, unknown>[], config?: OrchestratorConfig): void {
+	for (const event of events) {
+		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry);
+		// A successful result can omit its direct result text. Preserve the last
+		// complete assistant message as the safe fallback for that terminal event.
+		const text = claudeAssistantText(event);
+		if (text) worker.lastResult = text;
+		settleClaudeResult(worker, event, config);
+		notifyOrchestratorStateChange(getOrchestratorRuntime());
+	}
+}
+
 function handleClaudeLine(worker: Worker, line: string, config?: OrchestratorConfig): void {
 	const parsed = parseClaudeStreamLine(line);
 	if (!parsed.ok) {
 		failWorker(worker, "Invalid Claude Code stream JSON.");
 		return;
 	}
-	for (const event of parsed.events) {
-		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry);
-		settleClaudeResult(worker, event, config);
+	handleClaudeEvents(worker, parsed.events, config);
+}
+
+/** Consume Claude output without waiting for its persistent process to exit. */
+function drainClaudeWorkerOutput(worker: Worker, config: OrchestratorConfig): void {
+	const parsed = drainClaudeStreamBuffer(worker.buffer);
+	worker.buffer = parsed.remainder;
+	if (!parsed.ok) {
+		failWorker(worker, "Invalid Claude Code stream JSON.");
+		return;
 	}
+	handleClaudeEvents(worker, parsed.events, config);
 }
 
 /** A sandbox-policy rejection: the worker process was never spawned. */
@@ -606,14 +639,15 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 	child.stdout.on("data", (chunk: Buffer) => {
 		if (worker.process !== child) return;
 		worker.buffer += chunk.toString("utf8");
+		if (worker.profile.backend === "claude-code") {
+			drainClaudeWorkerOutput(worker, config);
+			return;
+		}
 		let newline: number;
 		while ((newline = worker.buffer.indexOf("\n")) >= 0) {
 			const line = worker.buffer.slice(0, newline).trim();
 			worker.buffer = worker.buffer.slice(newline + 1);
-			if (line) {
-				if (worker.profile.backend === "pi-rpc") handleRpcLine(worker, line);
-				else handleClaudeLine(worker, line, config);
-			}
+			if (line) handleRpcLine(worker, line);
 		}
 	});
 	child.stderr.on("data", (chunk: Buffer) => {
@@ -628,6 +662,10 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 	});
 	child.on("exit", (code, signal) => {
 		if (worker.process !== child) return;
+		// stdout data normally arrives before exit. Drain once more so an older
+		// Claude Code version that ends on a final JSON event without a newline
+		// can settle and report before this persistent-worker error path runs.
+		if (worker.profile.backend === "claude-code" && worker.buffer.trim()) drainClaudeWorkerOutput(worker, config);
 		rejectPendingRpc(worker, new Error("Worker process exited."));
 		if (worker.state !== "stopped" && worker.state !== "idle") {
 			failWorker(worker, code === 0
@@ -746,6 +784,7 @@ ${task}${prInstructions}
 Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Write it as plain sentences leading with the content — never open with a label prefix such as "Checkpoint:" or "Status:". Sol receives your final response directly and may send follow-up instructions while you work.`;
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
+	notifyOrchestratorStateChange(getOrchestratorRuntime());
 	return worker;
 }
 
@@ -820,9 +859,21 @@ export default function orchestrator(pi: ExtensionAPI) {
 		stopWorkerWidgetTimer();
 		refreshWorkerWidget = () => {};
 		await activate(ctx);
-		// RPC workers never create footer components or timers.
+		// RPC workers never create footer components or timers. Their status uses
+		// Pi's structured extension UI channel, not the rendered TUI footer.
 		if (!ctx.hasUI || ctx.mode !== "tui") {
-			bindOrchestratorSession(runtime, generation, pi, () => {}, true, () => {});
+			const emitHeadlessWorkerStatus = () => {
+				if (runtime.generation !== generation) return;
+				const revision = nextWorkerStatusRevision(runtime);
+				ctx.ui.setWidget(WORKER_STATUS_WIDGET_ID, workerStatusWidgetLines(runtime.workers.values(), {
+					revision,
+					sessionId: ctx.sessionManager.getSessionId(),
+					emittedAt: new Date(),
+				}));
+			};
+			refreshWorkerWidget = emitHeadlessWorkerStatus;
+			bindOrchestratorSession(runtime, generation, pi, emitHeadlessWorkerStatus, shouldReapHeadlessSession(), () => {});
+			emitHeadlessWorkerStatus();
 			flushDeferredWorkerReports();
 			return;
 		}
@@ -836,12 +887,17 @@ export default function orchestrator(pi: ExtensionAPI) {
 		// rows, enter opens that worker's session view, esc/up-past-top returns.
 		let selectedWorkerId: string | undefined;
 		let viewerOpen = false;
-		// Only live workers are shown and selectable; settled ones leave the
-		// list immediately but stay in memory (still steerable) until their
-		// report is delivered and the retention window passes.
+		// Only live workers are shown and selectable. Expiration must never
+		// discard the final handle to a child that has not exited: enforce the
+		// post-review stop invariant first, then prune on a later render.
 		const pruneExpiredWorkers = () => {
 			for (const worker of [...runtime.workers.values()]) {
-				if (worker.id !== selectedWorkerId && !viewerOpen && isExpiredWorker(worker)) runtime.workers.delete(worker.id);
+				if (worker.id === selectedWorkerId || viewerOpen || !isExpiredWorker(worker)) continue;
+				if (isWorkerProcessLive(worker.process)) {
+					stopWorkerProcess(worker);
+					continue;
+				}
+				runtime.workers.delete(worker.id);
 			}
 		};
 		const selectableWorkerIds = () => {
@@ -1152,10 +1208,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 				}
 			}
 		}
-		// Do not let a stale generation reap workers after a reload. Deferred
-		// reports stay live until a current API target accepts them.
-		if (runtime.generation !== generation || !runtime.headlessReap) return;
-		for (const worker of runtime.workers.values()) reapIfHeadless(worker);
+		// Do not let a stale generation reap workers after a reload. At the
+		// current generation's safe review boundary, stop every delivered run
+		// that was not steered into a newer generation during review.
+		if (runtime.generation !== generation) return;
+		for (const worker of runtime.workers.values()) {
+			if (shouldAutoStopReportedWorker(worker)) stopWorkerProcess(worker);
+		}
 	});
 
 	pi.registerCommand("orchestrator", {
@@ -1324,8 +1383,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 				worker.settledAt = new Date();
 				recordRunOutcome(worker, "cancelled");
 			}
-			stopWorker(worker);
-			killWorkerProcessTree(worker.process);
+			stopWorkerProcess(worker);
 			refreshWorkerWidget();
 			return content(`Stopped ${worker.id}.`);
 		},

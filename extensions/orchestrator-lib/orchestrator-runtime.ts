@@ -2,7 +2,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { DelegationEffort, WorkerProfile } from "./orchestrator-core.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
-import type { WorkerLifecycle } from "./worker-lifecycle.ts";
+import { stopWorker, type WorkerLifecycle } from "./worker-lifecycle.ts";
 
 /** Process-wide key: extension modules are replaced by /reload, globalThis is not. */
 const ORCHESTRATOR_RUNTIME = Symbol.for("com.kyleboas.pi.orchestrator.runtime.v1");
@@ -78,6 +78,17 @@ export function killWorkerProcessTree(child: Pick<OrchestratorWorker["process"],
 	try { child.kill("SIGTERM"); } catch { /* already exited */ }
 }
 
+/** Whether the child still needs a process-tree termination signal. */
+export function isWorkerProcessLive(child: Pick<OrchestratorWorker["process"], "exitCode" | "signalCode">): boolean {
+	return child.exitCode === null && child.signalCode === null;
+}
+
+/** Keep lifecycle invalidation and process-tree termination as one operation. */
+export function stopWorkerProcess(worker: OrchestratorWorker): void {
+	stopWorker(worker);
+	if (isWorkerProcessLive(worker.process)) killWorkerProcessTree(worker.process);
+}
+
 export type OrchestratorRuntime = {
 	workers: Map<string, OrchestratorWorker>;
 	api?: ExtensionAPI;
@@ -93,6 +104,8 @@ export type OrchestratorRuntime = {
 	/** Outcome delivery makes one idle-boundary context rollover eligible. */
 	outcomeVersion: number;
 	outcomePending: boolean;
+	/** Monotonic structured worker-status revision for this coordinator process. */
+	workerStatusRevision: number;
 	rolloverInFlight?: number;
 	rolloverCompletedVersion?: number;
 };
@@ -104,12 +117,19 @@ function createRuntime(): OrchestratorRuntime {
 		exitHookInstalled: false,
 		outcomeVersion: 0,
 		outcomePending: false,
+		workerStatusRevision: 0,
 	};
 }
 
 /** Exported for isolated lifecycle tests; production callers use the global getter. */
 export function createOrchestratorRuntimeForTesting(): OrchestratorRuntime {
 	return createRuntime();
+}
+
+/** Advance the process-local revision used to order headless worker snapshots. */
+export function nextWorkerStatusRevision(runtime: OrchestratorRuntime): number {
+	runtime.workerStatusRevision = (runtime.workerStatusRevision ?? 0) + 1;
+	return runtime.workerStatusRevision;
 }
 
 /** Get the one runtime shared by every loaded generation of the extension. */
@@ -215,9 +235,10 @@ export function ensureOrchestratorExitHook(
 	if (runtime.exitHookInstalled) return false;
 	runtime.exitHookInstalled = true;
 	register("exit", () => {
-		const activeRuntime = getOrchestratorRuntime();
-		for (const worker of activeRuntime.workers.values()) {
-			if (worker.state === "starting" || worker.state === "working") killWorkerProcessTree(worker.process);
+		// /reload retains this process and runtime; only an actual process exit
+		// invokes this hook, at which point no worker child may be left behind.
+		for (const worker of runtime.workers.values()) {
+			if (isWorkerProcessLive(worker.process)) killWorkerProcessTree(worker.process);
 		}
 	});
 	return true;

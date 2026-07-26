@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	claudeAssistantText,
 	claudeCodeArgs,
+	drainClaudeStreamBuffer,
 	claudeResultSettlement,
 	claudeUsageTokenTotal,
 	claudeUserEvent,
@@ -13,6 +15,7 @@ import {
 	claimWorkerReport,
 	finishWorkerSettlement,
 	stopWorker,
+	selectFinalWorkerText,
 	type WorkerLifecycle,
 } from "../extensions/orchestrator-lib/worker-lifecycle.ts";
 
@@ -20,7 +23,7 @@ function lifecycle(overrides: Partial<WorkerLifecycle> = {}): WorkerLifecycle {
 	return { state: "working", run: 1, ...overrides };
 }
 
-test("Claude Code uses the persistent stream-json command with arbitrary aliases", () => {
+test("all Claude profiles use the shared persistent stream-json backend", () => {
 	assert.deepEqual(claudeCodeArgs("haiku"), [
 		"-p",
 		"--model", "haiku",
@@ -29,9 +32,10 @@ test("Claude Code uses the persistent stream-json command with arbitrary aliases
 		"--verbose",
 		"--permission-mode", "bypassPermissions",
 	]);
-	assert.equal(claudeCodeArgs("sonnet")[2], "sonnet");
-	assert.equal(claudeCodeArgs("opus")[2], "opus");
-	assert.equal(claudeCodeArgs("Fable")[2], "Fable");
+	for (const profile of ["opus", "sonnet", "haiku", "Fable"]) {
+		assert.equal(claudeCodeArgs(profile)[2], profile);
+		assert.deepEqual(claudeCodeArgs(profile).slice(3), claudeCodeArgs("haiku").slice(3));
+	}
 });
 
 test("Claude user instructions use the stream-json user event envelope", () => {
@@ -55,6 +59,32 @@ test("Claude stream parser rejects malformed or non-event output without retaini
 	assert.deepEqual(parseClaudeStreamLine("not-json"), { ok: false });
 	assert.deepEqual(parseClaudeStreamLine("[]"), { ok: false });
 	assert.deepEqual(parseClaudeStreamLine('[{"type":"result"}, 3]'), { ok: false });
+});
+
+test("Claude stream drain handles split chunks and a final result without a newline", () => {
+	let remainder = "";
+	const events: Record<string, unknown>[] = [];
+	for (const chunk of [
+		'{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done',
+		'"}]}}\n{"type":"result","result":"done","is_error":false}',
+	]) {
+		const drained = drainClaudeStreamBuffer(remainder + chunk);
+		assert.equal(drained.ok, true);
+		if (!drained.ok) return;
+		remainder = drained.remainder;
+		events.push(...drained.events);
+	}
+	assert.equal(remainder, "");
+	assert.deepEqual(events.map((event) => event.type), ["assistant", "result"]);
+});
+
+test("an incomplete Claude chunk stays buffered until it becomes complete", () => {
+	const partial = drainClaudeStreamBuffer('{"type":"result","result":"do');
+	assert.equal(partial.ok, true);
+	assert.equal(partial.remainder, '{"type":"result","result":"do');
+	const complete = drainClaudeStreamBuffer(`${partial.remainder}ne","is_error":false}`);
+	assert.equal(complete.ok, true);
+	if (complete.ok) assert.deepEqual(complete.events, [{ type: "result", result: "done", is_error: false }]);
 });
 
 test("final Claude result captures final text, error status, session ID, and safe usage", () => {
@@ -99,6 +129,12 @@ test("Claude error results and empty result events remain terminal settlements",
 		usage: {},
 	});
 	assert.equal(claudeResultSettlement({ type: "assistant" }), undefined);
+	const assistant = claudeAssistantText({
+		type: "assistant",
+		message: { role: "assistant", content: [{ type: "text", text: "assistant final report" }] },
+	});
+	const missingDirectText = claudeResultSettlement({ type: "result", result: "   ", is_error: false });
+	assert.equal(selectFinalWorkerText(assistant, missingDirectText?.result), "assistant final report");
 });
 
 test("a successful Claude result settles and reports exactly once across a second stream turn", () => {

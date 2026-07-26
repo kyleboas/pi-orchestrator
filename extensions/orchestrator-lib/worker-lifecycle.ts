@@ -76,6 +76,12 @@ export function claimWorkerReport(worker: WorkerLifecycle): boolean {
 	return true;
 }
 
+/** A delivered terminal run is safe to reap only if steering has not started a newer run. */
+export function shouldAutoStopReportedWorker(worker: WorkerLifecycle): boolean {
+	return (worker.state === "idle" || worker.state === "failed") &&
+		worker.reportedRun === worker.run && worker.settlingRun === undefined;
+}
+
 /** Stop invalidates any in-flight settlement lookup before the child is killed. */
 export function stopWorker(worker: WorkerLifecycle): void {
 	worker.state = "stopped";
