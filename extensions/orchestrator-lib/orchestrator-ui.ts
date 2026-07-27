@@ -12,8 +12,10 @@ export type WorkerPanelItem = {
 	settledAt?: Date;
 	tokens?: number;
 	transcript?: readonly TranscriptEntry[];
-	/** Ledger p50 for this worker's task class, fixed when the run starts. */
+	/** Ledger p50 for this worker's reference class, fixed when the run starts. */
 	estimateMs?: number;
+	/** True when the p50 came from a widened class, shown with a trailing asterisk. */
+	estimateWidened?: boolean;
 };
 
 /** Low-frequency local redraw: enough for elapsed time without wasting VPS CPU. */
@@ -39,15 +41,6 @@ function elapsed(worker: WorkerPanelItem, now: number): string {
 	// Whole minutes past the first one: the row is glanced at, not stopwatched.
 	const seconds = Math.max(0, Math.floor((end - start) / 1_000));
 	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m`;
-}
-
-function formatTokens(tokens: number): string {
-	if (tokens < 1_000) return `${Math.max(0, Math.round(tokens))}`;
-	if (tokens < 1_000_000) {
-		const value = tokens / 1_000;
-		return `${value >= 10 ? value.toFixed(1) : value.toFixed(1)}k`;
-	}
-	return `${(tokens / 1_000_000).toFixed(1)}m`;
 }
 
 function conciseActivity(task: string): string {
@@ -113,19 +106,24 @@ function formatEstimate(ms: number): string {
 }
 
 /**
- * Space-separated glanceable fields: `23m ~20m ↑21.7k`. Elapsed and the
- * estimate measure the same thing — time since the last instruction — because
- * the ledger records run durations from that same anchor, so an overrun reads
- * honestly.
+ * Space-separated glanceable fields: `23m ~20m`. Elapsed and the estimate
+ * measure the same thing — time since the last instruction — because the
+ * ledger records run durations from that same anchor, so an overrun reads
+ * honestly. A trailing asterisk marks a p50 drawn from a widened class.
+ *
+ * Token totals are deliberately absent: providers report usage only at the end
+ * of a turn, so a live row could show nothing at all for a single-turn run and
+ * a stale carried-over total for the rest.
  */
 function statusFor(worker: WorkerPanelItem, now: number): string {
 	const fields = [elapsed(worker, now)];
 	const estimate = worker.estimateMs;
 	const live = worker.state === "starting" || worker.state === "working";
-	if (live && estimate !== undefined && Number.isFinite(estimate) && estimate > 0) fields.push(`~${formatEstimate(estimate)}`);
+	if (live && estimate !== undefined && Number.isFinite(estimate) && estimate > 0) {
+		fields.push(`~${formatEstimate(estimate)}${worker.estimateWidened ? "*" : ""}`);
+	}
 	if (worker.state === "failed") fields.push("failed");
 	else if (worker.state === "stopped") fields.push("stopped");
-	else if (worker.tokens !== undefined && worker.tokens > 0) fields.push(`↑${formatTokens(worker.tokens)}`);
 	return fields.join(" ");
 }
 
@@ -171,7 +169,7 @@ export function isExpiredWorker(
 
 /**
  * Claude-style one-line subagent rows:
- *   ○ Terra  Inspect the repository                            23m ~20m ↑21.7k
+ *   ○ Terra  Inspect the repository                                   23m ~20m
  *
  * `width` comes from Pi's Component.render(width), allowing the trailing
  * status to be genuinely right-aligned rather than padded for one terminal.

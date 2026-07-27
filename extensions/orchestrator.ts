@@ -105,7 +105,6 @@ import {
 	isOutcomeRolloverEligible,
 } from "./orchestrator-lib/orchestrator-rollover.ts";
 import {
-	ESTIMATE_MIN_SAMPLES,
 	TASK_CATEGORIES,
 	TASK_COMPLEXITIES,
 	acceptReviewedRuns,
@@ -115,8 +114,8 @@ import {
 	recoverStaleV2StatsLedger,
 	recordWorkerOutcome,
 	recordWorkerSteer,
-	rollingWorkerMetrics,
 	statsSummary,
+	workerDurationEstimate,
 	updateWorkerRunStatus,
 	type StatsLedger,
 	type TaskCategory,
@@ -232,23 +231,23 @@ function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 		worker.healthStreak = 0;
 		worker.runTokensBase = worker.tokens ?? 0;
 		worker.runCostBase = worker.costUsd ?? 0;
-		worker.estimateMs = runDurationEstimateMs(worker);
+		applyRunEstimate(worker);
 	}
 }
 
 /**
- * The footer row's `/ ~20m` reference, resolved once per run because the row
+ * The footer row's `~20m` reference, resolved once per run because the row
  * repaints every couple of seconds and must never read the ledger per frame.
- * It is the p50 for this worker's own task class, or absent when the class has
- * too few recent runs to say anything.
  */
-function runDurationEstimateMs(worker: Worker): number | undefined {
+function applyRunEstimate(worker: Worker): void {
 	try {
-		const metrics = rollingWorkerMetrics(loadStats(), worker.name, { category: worker.category, complexity: worker.complexity });
-		return metrics.samples >= ESTIMATE_MIN_SAMPLES ? metrics.p50DurationMs : undefined;
+		const estimate = workerDurationEstimate(loadStats(), worker.name, { category: worker.category, complexity: worker.complexity });
+		worker.estimateMs = estimate?.p50DurationMs;
+		worker.estimateWidened = estimate ? estimate.basis !== "class" : undefined;
 	} catch {
 		// An unreadable ledger only costs the estimate, never the delegation.
-		return undefined;
+		worker.estimateMs = undefined;
+		worker.estimateWidened = undefined;
 	}
 }
 
@@ -759,14 +758,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 				if (!isCheckInDue(worker, checkInIntervalMs)) continue;
 				const checkedAt = Date.now();
 				const assessment = assessWorkerCheckIn(worker, checkInIntervalMs, checkedAt);
-				const classification = { category: worker.category, complexity: worker.complexity };
 				try {
 					ledger ??= loadStats(undefined, workerNames(catalog));
 				} catch {
 					// A missing or unreadable ledger only costs the estimate.
 				}
-				const metrics = ledger ? rollingWorkerMetrics(ledger, worker.name, classification, checkedAt) : undefined;
-				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment, { classification, metrics });
+				const estimate = ledger ? workerDurationEstimate(ledger, worker.name, { category: worker.category, complexity: worker.complexity }, checkedAt) : undefined;
+				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment, estimate);
 				try {
 					const wake = shouldWakeForCheckIn(worker, assessment);
 					if (assessment.status === "healthy") deliverCheckIn(runtime.api, digest, assessment);

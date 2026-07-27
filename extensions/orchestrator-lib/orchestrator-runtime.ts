@@ -48,8 +48,10 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	runCostBase?: number;
 	/** Run whose outcome was already written to the stats ledger. */
 	statsRecordedRun?: number;
-	/** Ledger p50 for this worker's task class, refreshed at each run start. */
+	/** Ledger p50 for this worker's reference class, refreshed at each run start. */
 	estimateMs?: number;
+	/** True when that p50 came from a widened class rather than an exact match. */
+	estimateWidened?: boolean;
 	/** Last passive progress digest delivered to the coordinator. */
 	lastCheckinAt?: Date;
 	lastCheckinRevision?: number;

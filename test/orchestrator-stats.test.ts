@@ -16,6 +16,7 @@ import {
 	rollingWorkerMetrics,
 	statsSummary,
 	updateWorkerRunStatus,
+	workerDurationEstimate,
 } from "../extensions/orchestrator-lib/orchestrator-stats.ts";
 function tempStatsPath(): string { return join(mkdtempSync(join(tmpdir(), "orch-stats-")), "stats.json"); }
 function outcome(runId: string, status: "completed" | "accepted" | "rework" | "failed" | "unavailable" | "cancelled" = "completed", timestamp = new Date().toISOString()) {
@@ -142,4 +143,31 @@ test("recent runs remain bounded", () => {
 	const path = tempStatsPath();
 	for (let i = 0; i < MAX_RECENT_RUNS + 2; i++) recordWorkerOutcome("Terra", { ...outcome(`run-${i}`), rootTaskId: `root-${i}` }, path);
 	assert.equal(loadStats(path).recentRuns.length, MAX_RECENT_RUNS);
+});
+
+test("the duration estimate widens its reference class until it has enough samples", () => {
+	const path = tempStatsPath();
+	const run = (worker: string, category: string, complexity: string, durationMs: number, index: number) => ({
+		runId: `run-${worker}-${index}`, rootTaskId: `root-${index}`, worker, timestamp: new Date(Date.now() - index * 60_000).toISOString(),
+		status: "accepted" as const, failed: false, durationMs, tokens: 0, category: category as never, complexity: complexity as never,
+	});
+	const recentRuns = [
+		run("Terra", "code", "high", 10 * 60_000, 1),
+		run("Terra", "tests", "high", 20 * 60_000, 2),
+		run("Terra", "operations", "high", 30 * 60_000, 3),
+		run("Terra", "research", "low", 4 * 60_000, 4),
+	];
+	writeFileSync(path, JSON.stringify({ version: 3, workers: {}, recentRuns }));
+	const ledger = loadStats(path);
+
+	// One code/high run is not enough, so the same-complexity class answers instead.
+	const widened = workerDurationEstimate(ledger, "Terra", { category: "code", complexity: "high" });
+	assert.equal(widened?.basis, "complexity");
+	assert.equal(widened?.samples, 3);
+	assert.equal(widened?.p50DurationMs, 20 * 60_000);
+
+	// A complexity with too few runs falls back to the worker's whole history.
+	assert.equal(workerDurationEstimate(ledger, "Terra", { category: "code", complexity: "low" })?.basis, "worker");
+	// An unknown worker has nothing to widen to.
+	assert.equal(workerDurationEstimate(ledger, "Luna", { category: "code", complexity: "high" }), undefined);
 });

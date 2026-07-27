@@ -292,6 +292,35 @@ export function rollingWorkerMetrics(ledger: StatsLedger, worker: string, classi
 	return { samples: runs.length, ...(percentile(durations, .5) === undefined ? {} : { p50DurationMs: percentile(durations, .5), p95DurationMs: percentile(durations, .95) }), ...(percentile(reported, .5) === undefined ? {} : { p50ReportedCostUsd: percentile(reported, .5), p95ReportedCostUsd: percentile(reported, .95) }), ...(percentile(estimated, .5) === undefined ? {} : { p50EstimatedCostUsd: percentile(estimated, .5), p95EstimatedCostUsd: percentile(estimated, .95) }), statuses, accepted: statuses.accepted ?? 0, rework: statuses.rework ?? 0 };
 }
 
+/** Which reference class a duration estimate could actually be drawn from. */
+export type DurationEstimateBasis = "class" | "complexity" | "worker";
+export type DurationEstimate = { basis: DurationEstimateBasis; label: string; samples: number; p50DurationMs: number; p95DurationMs: number };
+
+/**
+ * Widen the reference class until it holds enough runs to say something. The
+ * exact category/complexity bucket is the most informative but the thinnest,
+ * so a worker's rarer task shapes would otherwise never get an estimate at
+ * all. Callers should disclose a widened basis rather than pass it off as an
+ * exact match.
+ */
+export function workerDurationEstimate(ledger: StatsLedger, worker: string, classification: TaskClassification, now = Date.now()): DurationEstimate | undefined {
+	const since = now - 7 * 24 * 60 * 60 * 1_000;
+	const recent = ledger.recentRuns.filter((run) => run.worker === worker && Date.parse(run.timestamp) >= since);
+	const ladder: { basis: DurationEstimateBasis; label: string; runs: RecentRun[] }[] = [
+		{ basis: "class", label: `${classification.category}/${classification.complexity}`, runs: recent.filter((run) => run.category === classification.category && run.complexity === classification.complexity) },
+		{ basis: "complexity", label: `${classification.complexity} complexity, any category`, runs: recent.filter((run) => run.complexity === classification.complexity) },
+		{ basis: "worker", label: "all recent runs", runs: recent },
+	];
+	for (const { basis, label, runs } of ladder) {
+		if (runs.length < ESTIMATE_MIN_SAMPLES) continue;
+		const durations = runs.map((run) => run.durationMs);
+		const p50 = percentile(durations, .5); const p95 = percentile(durations, .95);
+		if (p50 === undefined || p95 === undefined) continue;
+		return { basis, label, samples: runs.length, p50DurationMs: p50, p95DurationMs: p95 };
+	}
+	return undefined;
+}
+
 /** Bounded routing context: lifetime overview plus task-specific seven-day evidence. */
 export function statsSummary(ledger: StatsLedger, catalogNames: readonly string[], classification?: TaskClassification): string | undefined {
 	const lines = catalogNames.filter((name) => (ledger.workers[name]?.tasks ?? 0) > 0).map((name) => {

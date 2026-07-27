@@ -27,7 +27,7 @@ function worker(overrides: Partial<WorkerPanelItem> = {}): WorkerPanelItem {
 test("renders the compact Claude-style row without header, tree, or state prose", () => {
 	const [line] = renderWorkerPanel([worker({ tokens: 21_700 })], now, 80)!;
 	assert.equal(Array.from(line).length, 80);
-	assert.match(line, /^○ Terra  Simple delegation test\s+2s ↑21\.7k$/);
+	assert.match(line, /^○ Terra  Simple delegation test\s+2s$/);
 	assert.doesNotMatch(line, /Workers|[├└]||working|\$/);
 });
 
@@ -35,8 +35,12 @@ test("a live row shows elapsed time against the ledger estimate for its task cla
 	const MIN = 60_000;
 	const [line] = renderWorkerPanel([worker({ estimateMs: 20 * MIN })], now, 80)!;
 	assert.match(line, /2s ~20m$/);
+	// Token totals are never shown: providers only report them at turn end.
 	const [withTokens] = renderWorkerPanel([worker({ estimateMs: 20 * MIN, tokens: 21_700 })], now, 80)!;
-	assert.match(withTokens, /2s ~20m ↑21\.7k$/);
+	assert.match(withTokens, /2s ~20m$/);
+	// A widened reference class is disclosed rather than shown as an exact one.
+	const [widened] = renderWorkerPanel([worker({ estimateMs: 20 * MIN, estimateWidened: true })], now, 80)!;
+	assert.match(widened, /2s ~20m\*$/);
 	// An overrun is stated plainly rather than hidden or capped at the estimate.
 	const [overrun] = renderWorkerPanel([worker({ estimateMs: 20 * MIN })], startedAt.getTime() + 52 * MIN, 80)!;
 	assert.match(overrun, /52m ~20m$/);
