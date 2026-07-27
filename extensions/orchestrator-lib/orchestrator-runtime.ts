@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { DelegationEffort, WorkerProfile } from "./orchestrator-core.ts";
+import type { WorkerProfile } from "./orchestrator-core.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 import { stopWorker, type WorkerLifecycle } from "./worker-lifecycle.ts";
 
@@ -16,7 +16,6 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	id: string;
 	name: string;
 	profile: WorkerProfile;
-	effort?: DelegationEffort;
 	task: string;
 	/** Stable delegated-task lineage; each steer shares this root. */
 	rootTaskId: string;
@@ -89,6 +88,8 @@ export function stopWorkerProcess(worker: OrchestratorWorker): void {
 	if (isWorkerProcessLive(worker.process)) killWorkerProcessTree(worker.process);
 }
 
+export type ReportDeliveryHoldReason = "settling" | "compaction";
+
 export type OrchestratorRuntime = {
 	workers: Map<string, OrchestratorWorker>;
 	api?: ExtensionAPI;
@@ -97,6 +98,10 @@ export type OrchestratorRuntime = {
 	exitHookInstalled: boolean;
 	/** Worker session view is open: hold result reports so no coordinator turn starts and rewrites the screen. */
 	reportsHeld?: boolean;
+	/** Pi lifecycle windows in which a follow-up can enter a queue that compaction strands. */
+	reportDeliveryHolds?: Set<ReportDeliveryHoldReason>;
+	/** Monotonic reason epochs prevent an old scheduled release from clearing a renewed hold. */
+	reportDeliveryHoldVersions?: Map<ReportDeliveryHoldReason, number>;
 	generation?: symbol;
 	disposeUi?: () => void;
 	/** One passive check-in ticker across reload generations. */
@@ -161,6 +166,10 @@ export function bindOrchestratorApi(runtime: OrchestratorRuntime, api: Extension
 	runtime.generation = generation;
 	runtime.api = api;
 	runtime.onStateChange = undefined;
+	// Holds belong to the session callback generation. A reload's stale
+	// compaction callback must neither retain nor release the new binding's hold.
+	runtime.reportDeliveryHolds?.clear();
+	runtime.reportDeliveryHoldVersions?.clear();
 	// Do not reap during the factory/session_start handoff. The new session sets
 	// its actual mode below.
 	runtime.headlessReap = false;
@@ -192,8 +201,61 @@ export function releaseOrchestratorSession(runtime: OrchestratorRuntime, generat
 	runtime.api = undefined;
 	runtime.onStateChange = undefined;
 	runtime.headlessReap = false;
+	runtime.reportDeliveryHolds?.clear();
+	runtime.reportDeliveryHoldVersions?.clear();
 	runtime.generation = undefined;
 	return true;
+}
+
+/** Add an idempotent lifecycle reason that blocks only worker-result delivery. */
+export function holdWorkerReportDelivery(runtime: OrchestratorRuntime, reason: ReportDeliveryHoldReason): boolean {
+	const holds = runtime.reportDeliveryHolds ??= new Set();
+	const versions = runtime.reportDeliveryHoldVersions ??= new Map();
+	versions.set(reason, (versions.get(reason) ?? 0) + 1);
+	const size = holds.size;
+	holds.add(reason);
+	return holds.size !== size;
+}
+
+/** Remove one reason without disturbing independent (for example nested) holds. */
+export function releaseWorkerReportDelivery(runtime: OrchestratorRuntime, reason: ReportDeliveryHoldReason): boolean {
+	return runtime.reportDeliveryHolds?.delete(reason) ?? false;
+}
+
+export function isWorkerReportDeliveryHeld(runtime: OrchestratorRuntime): boolean {
+	return runtime.reportsHeld === true || (runtime.reportDeliveryHolds?.size ?? 0) > 0;
+}
+
+/**
+ * Leave an event/input callback before releasing and flushing. The generation
+ * check prevents a delayed compaction callback from targeting a rebound API.
+ */
+export function scheduleWorkerReportDelivery(
+	runtime: OrchestratorRuntime,
+	generation: symbol,
+	releaseReasons: readonly ReportDeliveryHoldReason[],
+	flush: () => void,
+): ReturnType<typeof setTimeout> {
+	const releaseVersions = releaseReasons.map((reason) => [reason, runtime.reportDeliveryHoldVersions?.get(reason)] as const);
+	const timer = setTimeout(() => {
+		if (runtime.generation !== generation) return;
+		for (const [reason, version] of releaseVersions) {
+			if (runtime.reportDeliveryHoldVersions?.get(reason) === version) releaseWorkerReportDelivery(runtime, reason);
+		}
+		if (!isWorkerReportDeliveryHeld(runtime)) flush();
+	}, 0);
+	return timer;
+}
+
+/** Recover abandoned lifecycle holds only when real input arrives at a proven idle boundary. */
+export function scheduleIdleWorkerReportRecovery(
+	runtime: OrchestratorRuntime,
+	generation: symbol,
+	isIdle: boolean,
+	flush: () => void,
+): ReturnType<typeof setTimeout> | undefined {
+	if (!isIdle || !isWorkerReportDeliveryHeld(runtime)) return undefined;
+	return scheduleWorkerReportDelivery(runtime, generation, ["compaction", "settling"], flush);
 }
 
 export function notifyOrchestratorStateChange(runtime: OrchestratorRuntime): void {
@@ -209,7 +271,7 @@ export function notifyOrchestratorStateChange(runtime: OrchestratorRuntime): voi
  * targets intentionally leave the run pending for the next generation.
  */
 export function deliverWorkerReport(runtime: OrchestratorRuntime, worker: OrchestratorWorker, text: string): boolean {
-	if (runtime.reportsHeld) return false;
+	if (isWorkerReportDeliveryHeld(runtime)) return false;
 	if (worker.state === "stopped" || worker.reportedRun === worker.run || worker.reportingRun === worker.run) return false;
 	const api = runtime.api;
 	if (!api) return false;

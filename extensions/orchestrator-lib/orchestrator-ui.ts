@@ -1,3 +1,5 @@
+import type { TranscriptEntry } from "./orchestrator-transcript.ts";
+
 export type WorkerPanelState = "starting" | "working" | "idle" | "failed" | "stopped";
 
 export type WorkerPanelItem = {
@@ -9,6 +11,7 @@ export type WorkerPanelItem = {
 	lastActivityAt?: Date;
 	settledAt?: Date;
 	tokens?: number;
+	transcript?: readonly TranscriptEntry[];
 };
 
 /** Low-frequency local redraw: enough for elapsed time without wasting VPS CPU. */
@@ -51,6 +54,30 @@ function conciseActivity(task: string): string {
 	const firstLine = task.trim().split(/\r?\n/, 1)[0] ?? "";
 	const firstSentence = firstLine.match(/^.*?[.!?](?:\s|$)/)?.[0]?.trim();
 	return firstSentence || firstLine || "Working";
+}
+
+function usefulTranscriptActivity(transcript: readonly TranscriptEntry[] | undefined): string | undefined {
+	if (!transcript) return undefined;
+	for (let index = transcript.length - 1; index >= 0; index -= 1) {
+		const entry = transcript[index]!;
+		if (entry.thinking || entry.role === "user") continue;
+		if (entry.role === "tool" && entry.tool?.name?.trim() && entry.text.trim()) {
+			return entry.text.trim().split(/\r?\n/, 1)[0]?.trim() || undefined;
+		}
+		if (entry.role !== "assistant" && entry.role !== "system") continue;
+		const text = entry.text.trim().split(/\r?\n/, 1)[0]?.trim() ?? "";
+		if (!text || /^(?:still\s+working|i(?:'m| am)\s+(?:still\s+)?working|done|completed|finished|final(?:ly)?|summary|here(?:'s| is)\s+(?:the|a)\s+(?:summary|result))/i.test(text)) continue;
+		return conciseActivity(text);
+	}
+	return undefined;
+}
+
+function workerActivity(worker: WorkerPanelItem): string {
+	// Finished rows describe their state; an old tool call must not look active.
+	if (worker.state === "starting" || worker.state === "working") {
+		return usefulTranscriptActivity(worker.transcript) ?? conciseActivity(worker.task);
+	}
+	return conciseActivity(worker.task);
 }
 
 function textWidth(text: string): number {
@@ -96,6 +123,11 @@ export type WorkerPanelOptions = {
 	/** Include settled workers so finished sessions stay enterable while selecting. */
 	includeSettled?: boolean;
 };
+
+/** The session view must show the configured worker label without shortening it. */
+export function workerSessionTitle(name: string, state: WorkerPanelState, id: string): string {
+	return `${name} · ${state} · ${id}`;
+}
 
 /**
  * Workers shown by the panel, in stable row order, for selection to walk.
@@ -148,10 +180,10 @@ export function renderWorkerPanel(
 		const status = statusFor(worker, now);
 		const minimumGap = 2;
 		const available = Math.max(1, width - textWidth(prefix) - textWidth(status) - minimumGap);
-		const activity = truncate(conciseActivity(worker.task), available);
+		const activity = truncate(workerActivity(worker), available);
 		const gap = " ".repeat(Math.max(minimumGap, width - textWidth(prefix) - textWidth(activity) - textWidth(status)));
 
-		return `${prefix}${activity}${gap}${status}`;
+		return truncate(`${prefix}${activity}${gap}${status}`, width);
 	});
 }
 

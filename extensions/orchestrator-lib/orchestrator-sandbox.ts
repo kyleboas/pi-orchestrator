@@ -331,6 +331,12 @@ export type WorkerLaunchRequest = {
 
 /** The only files a sandboxed Pi RPC worker may see from the host Pi agent directory. */
 export const PI_WORKER_CONFIG_FILES: readonly string[] = ["auth.json", "models.json"];
+/** Exact worker-only files mounted for the explicit --no-extensions capability. */
+export const PI_WORKER_BACKGROUND_JOB_FILES: readonly string[] = [
+	"extensions/worker-background-job.ts",
+	"extensions/orchestrator-lib/background-job.ts",
+];
+export const PI_WORKER_RUN_HEAVY_PATH = "/home/kyle/bin/run-heavy";
 
 /**
  * Isolation plan for a Pi RPC worker: an isolated agent dir inside the worker
@@ -340,22 +346,29 @@ export const PI_WORKER_CONFIG_FILES: readonly string[] = ["auth.json", "models.j
  * provider-only models.json inside the isolated HOME and mounts no Pi auth,
  * host model configuration, token file, or surrounding config directory.
  */
-export function piWorkerSandboxPlan(homeDir: string, home?: string, gateway?: false): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry: SandboxFileMount[] };
+export function piWorkerSandboxPlan(homeDir: string, home?: string, gateway?: false): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry: SandboxFileMount[]; fileMountsReadOnly: SandboxFileMount[] };
 export function piWorkerSandboxPlan(homeDir: string, home: string | undefined, gateway: true): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnly: SandboxFileMount[] };
-export function piWorkerSandboxPlan(homeDir: string, home: string | undefined, gateway: boolean): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry?: SandboxFileMount[]; fileMountsReadOnly?: SandboxFileMount[] };
+export function piWorkerSandboxPlan(homeDir: string, home: string | undefined, gateway: boolean): { sandboxEnvOverrides: Record<string, string>; fileMountsReadOnlyTry?: SandboxFileMount[]; fileMountsReadOnly: SandboxFileMount[] };
 export function piWorkerSandboxPlan(homeDir: string, home: string = homedir(), gateway = false): {
 	sandboxEnvOverrides: Record<string, string>;
 	fileMountsReadOnlyTry?: SandboxFileMount[];
-	fileMountsReadOnly?: SandboxFileMount[];
+	fileMountsReadOnly: SandboxFileMount[];
 } {
 	const sourceDir = join(home, ".pi", "agent");
 	const isolatedDir = join(homeDir, "pi-agent");
+	// Mount the two extension source files and wrapper, not their directories:
+	// worker extension loading stays available without exposing ~/.pi/agent.
+	const backgroundJobFiles = [
+		...PI_WORKER_BACKGROUND_JOB_FILES.map((path) => ({ source: join(sourceDir, path), dest: join(sourceDir, path) })),
+		{ source: PI_WORKER_RUN_HEAVY_PATH, dest: PI_WORKER_RUN_HEAVY_PATH },
+	];
 	if (gateway) return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
-		fileMountsReadOnly: [],
+		fileMountsReadOnly: backgroundJobFiles,
 	};
 	return {
 		sandboxEnvOverrides: { PI_CODING_AGENT_DIR: isolatedDir },
+		fileMountsReadOnly: backgroundJobFiles,
 		fileMountsReadOnlyTry: [
 			...PI_WORKER_CONFIG_FILES.map((name) => ({ source: join(sourceDir, name), dest: join(isolatedDir, name) })),
 			{ source: join(home, ".config", "agent", "gateway.token"), dest: join(homeDir, ".config", "agent", "gateway.token") },

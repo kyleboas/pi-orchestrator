@@ -1,9 +1,11 @@
+import type { ClaudeEffort } from "./orchestrator-core.ts";
+
 export type ClaudeUsageTotals = { inputTokens?: number; outputTokens?: number; cacheCreationInputTokens?: number; cacheReadInputTokens?: number };
 export type ClaudeResultSettlement = { result?: string; isError: boolean; sessionId?: string; usage: ClaudeUsageTotals; /** API-equivalent estimate emitted by Claude Code, not subscription billing. */ estimatedCostUsd?: number };
 export type ClaudeStreamParse = { ok: true; events: Record<string, unknown>[] } | { ok: false };
 export type ClaudeStreamDrain = { ok: true; events: Record<string, unknown>[]; remainder: string } | { ok: false; remainder: string };
 /** Arguments for one persistent Claude Code stream-json worker process. */
-export function claudeCodeArgs(model: string, effort?: "low" | "medium" | "high"): string[] { return ["-p", "--model", model, ...(effort ? ["--effort", effort] : []), "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]; }
+export function claudeCodeArgs(model: string, effort?: ClaudeEffort): string[] { return ["-p", "--model", model, ...(effort ? ["--effort", effort] : []), "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]; }
 export function claudeUserEvent(instructions: string): Record<string, unknown> { return { type: "user", message: { role: "user", content: instructions } }; }
 
 /** Text from a complete Claude assistant event, safe as a final-result fallback. */
