@@ -7,7 +7,10 @@ import {
 	isUpKey,
 	moveSelection,
 	anchorScrollUp,
+	MOUSE_TRACKING_OFF,
+	MOUSE_TRACKING_ON,
 	renderSessionScreen,
+	wheelDirection,
 	wrapPlainText,
 } from "../extensions/orchestrator-lib/orchestrator-session-view.ts";
 import {
@@ -80,6 +83,27 @@ test("the hint line says whether the view is following or paused", () => {
 	const paused = renderSessionScreen("t", body, 60, 12, 12, theme).lines.at(-1)!;
 	assert.match(paused, /12 lines back, paused/);
 	assert.match(paused, /end to follow/);
+});
+
+test("wheel reports decode to a scroll direction across encodings and modifiers", () => {
+	const ESC = String.fromCharCode(27);
+	assert.equal(wheelDirection(`${ESC}[<64;20;5M`), "up");
+	assert.equal(wheelDirection(`${ESC}[<65;20;5M`), "down");
+	// Shift/alt/ctrl ride on the 4/8/16 bits and must not change the direction.
+	assert.equal(wheelDirection(`${ESC}[<68;20;5M`), "up");
+	assert.equal(wheelDirection(`${ESC}[<69;20;5M`), "down");
+	assert.equal(wheelDirection(`${ESC}[<80;20;5M`), "up");
+	// Legacy X10 reports encode the button as a byte offset by 32.
+	assert.equal(wheelDirection(`${ESC}[M${String.fromCharCode(96, 52, 37)}`), "up");
+	assert.equal(wheelDirection(`${ESC}[M${String.fromCharCode(97, 52, 37)}`), "down");
+	// Clicks, releases, and ordinary keys are not scroll events.
+	assert.equal(wheelDirection(`${ESC}[<0;20;5M`), undefined);
+	assert.equal(wheelDirection(`${ESC}[<0;20;5m`), undefined);
+	assert.equal(wheelDirection(`${ESC}[A`), undefined);
+	assert.equal(wheelDirection("q"), undefined);
+	// Tracking must be switched off with exactly what was switched on.
+	assert.equal(MOUSE_TRACKING_ON, `${ESC}[?1000h${ESC}[?1006h`);
+	assert.equal(MOUSE_TRACKING_OFF, `${ESC}[?1006l${ESC}[?1000l`);
 });
 
 test("renderSessionScreen handles an empty body", () => {
