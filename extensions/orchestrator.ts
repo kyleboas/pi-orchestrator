@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Type } from "typebox";
 import {
@@ -33,19 +32,6 @@ import {
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
 import { buildCoordinatorInstructions } from "./orchestrator-lib/orchestrator-instructions.ts";
 import { withOrchestratorDelegationContract } from "./orchestrator-lib/orchestrator-delegation-contract.ts";
-import { pinPullRequestTargetSync, startPullRequestBroker, type PullRequestBroker } from "./orchestrator-lib/orchestrator-pr-broker.ts";
-import {
-	cleanupWorkerHomeDir,
-	createWorkerHomeDir,
-	piWorkerSandboxPlan,
-	resolveWorkerCommand,
-	resolveWorkerLaunch,
-	resolveWorkerWorkspace,
-	sandboxConfigForWorker,
-	workerHomeDirPath,
-	type WorkerLaunchRequest,
-} from "./orchestrator-lib/orchestrator-sandbox.ts";
-import { claudeGatewayEnv, effectiveWorkerModel, gatewayPiModel, startGatewayRelay, writeGatewayPiModels } from "./orchestrator-lib/orchestrator-gateway.ts";
 import {
 	earliestAccountReset,
 	isUsageLimitText,
@@ -149,7 +135,7 @@ import {
 const LEGACY_WORKER_WIDGET_ID = "orchestrator-workers";
 
 /** Mi keeps reported workers alive so the coordinator can steer them again. */
-function shouldReapHeadlessSession(): boolean {
+export function shouldReapHeadlessSession(): boolean {
 	return process.env.MI_COORDINATOR_MODE !== "1";
 }
 
@@ -538,140 +524,55 @@ function drainClaudeWorkerOutput(worker: Worker, config: OrchestratorConfig): vo
 	handleClaudeEvents(worker, parsed.events, config);
 }
 
-/** A sandbox-policy rejection: the worker process was never spawned. */
-class WorkerLaunchRejected extends Error {}
-
-export function brokerSafeWorkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/**
+ * Workers inherit the coordinator's environment minus every GitHub, SSH, and
+ * Git credential vector. Model-provider auth is preserved exactly. This is not
+ * containment — a worker still reads ~/.config/gh and ~/.ssh from disk — it
+ * only keeps ambient tokens out of a delegated process that never needs them.
+ */
+export function workerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const safe: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(env)) {
-		// Preserve model-provider auth exactly while removing every inherited
-		// worker-side GitHub, SSH, and Git credential/command/path vector.
 		if (["GH_", "GITHUB_", "SSH_", "GIT_"].some((prefix) => key.startsWith(prefix))) continue;
 		safe[key] = value;
 	}
 	return safe;
 }
 
-type SpawnedWorkerChild = {
-	child: Worker["process"];
-	sandboxed: boolean;
-	warning?: string;
-	prBroker?: PullRequestBroker;
-};
-
 /**
  * Single spawn path for every worker process (initial Pi RPC, initial Claude,
- * and Claude failover respawns) so sandbox policy cannot be bypassed by one
- * call site. Throws WorkerLaunchRejected when the policy fails closed.
+ * and Claude failover respawns). Workers run on the host in the coordinator's
+ * repository; each becomes its own process group so a stop, a failover, or
+ * coordinator exit can signal the whole tree and no grandchild survives as an
+ * orphan.
  */
 function spawnWorkerChild(
-	workerKey: string,
 	command: string,
 	args: string[],
 	cwd: string,
 	envOverrides: Record<string, string>,
-	config: OrchestratorConfig,
 	hostEnv: NodeJS.ProcessEnv,
-	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "fileMountsReadOnly" | "readWritePaths"> & { gatewayPiModel?: string } = {},
-	sandboxOptOut = false,
-): SpawnedWorkerChild {
-	// A gateway network exists precisely so no worker launch can carry host
-	// credentials; a per-worker opt-out must be rejected loudly, never honored
-	// silently as either a host launch or an unexpected sandboxed one.
-	if (sandboxOptOut && config.sandbox.network === "gateway") {
-		throw new WorkerLaunchRejected('This worker opts out of the sandbox ("sandbox": "off"), but network "gateway" never permits a credential-bearing host launch; remove the worker\'s opt-out or use a host/none sandbox network');
-	}
-	const sandbox = sandboxConfigForWorker(config.sandbox, sandboxOptOut);
-	const homeDir = workerHomeDirPath(workerKey);
-	let relay: ReturnType<typeof startGatewayRelay> | undefined;
-	if (sandbox.network === "gateway") {
-		if (!sandbox.gateway) throw new WorkerLaunchRejected("Gateway configuration is unavailable.");
-		createWorkerHomeDir(homeDir);
-		try {
-			if (paths.gatewayPiModel) writeGatewayPiModels(homeDir, paths.gatewayPiModel);
-			relay = startGatewayRelay(workerKey, sandbox.gateway, undefined, sandbox.command);
-		}
-		catch { cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected("Gateway relay failed its readiness check."); }
-	}
-	const node = relay ? resolveWorkerCommand(relay.nodePath, process.env) : undefined;
-	const request = { command, args, cwd, envOverrides, homeDir, ...paths,
-		...(relay && node ? { gateway: { relayDirectory: relay.directory, nodePath: relay.nodePath, nodeRoot: node.readOnlyRoots[0]!, bootstrapPath: relay.bootstrapPath, entrypointPath: relay.entrypointPath } } : {}),
-	};
-	// Broker env stripping exists to make /pr the only PR path for sandboxed
-	// workers. An explicit host worker never receives a broker, and it can read
-	// every credential file on the host anyway, so stripping would only break
-	// its Git/SSH tooling without containing anything.
-	const workerEnv = config.pullRequests && !sandboxOptOut ? brokerSafeWorkerEnv(hostEnv) : hostEnv;
-	let launch = resolveWorkerLaunch(sandbox, request, workerEnv);
-	if (!launch.ok) { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected(launch.error); }
-	// The broker is intentionally unavailable to direct/legacy workers: only a
-	// sandbox can expose its fixed /pr mount without exposing host credentials.
-	let prBroker: PullRequestBroker | undefined;
-	if (launch.sandboxed && config.pullRequests) {
-		const target = pinPullRequestTargetSync(cwd, config.pullRequests);
-		if (target) {
-			try {
-				prBroker = startPullRequestBroker(target, config.pullRequests);
-				// Add only /pr. Existing narrow Pi/Claude provider-auth/config mounts
-				// are required for model access and remain exactly as configured.
-				const brokerLaunch = resolveWorkerLaunch(sandbox, { ...request, prBrokerDirectory: prBroker.directory }, workerEnv);
-				if (brokerLaunch.ok) launch = brokerLaunch;
-				else { void prBroker.cleanup(); prBroker = undefined; }
-			} catch {
-				// A broker setup failure removes authority rather than preventing a
-				// normal delegation to an unlisted/unavailable repository.
-				if (prBroker) void prBroker.cleanup(); prBroker = undefined;
-			}
-		}
-	}
-	if (launch.sandboxed) createWorkerHomeDir(homeDir);
-	let child: Worker["process"];
-	try {
-		// Unsandboxed workers become their own process group so a stop can
-		// signal the whole tree; sandboxed trees already die with bwrap.
-		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const, detached: !launch.sandboxed });
-	} catch (error) {
-		if (relay) void relay.cleanup().catch(() => {});
-		if (prBroker) void prBroker.cleanup();
-		if (launch.sandboxed) cleanupWorkerHomeDir(homeDir);
-		throw error;
-	}
-	if (launch.sandboxed) {
-		const clean = () => { if (relay) void relay.cleanup().catch(() => {}); if (prBroker) void prBroker.cleanup(); cleanupWorkerHomeDir(homeDir); };
-		child.once("exit", clean);
-		child.once("error", clean);
-	}
-	return { child, sandboxed: launch.sandboxed, ...(launch.warning ? { warning: launch.warning } : {}), ...(prBroker ? { prBroker } : {}) };
+): Worker["process"] {
+	return spawn(command, args, {
+		cwd,
+		env: { ...workerEnv(hostEnv), ...envOverrides },
+		stdio: ["pipe", "pipe", "pipe"] as const,
+		detached: true,
+	});
 }
 
-function spawnClaudeChild(profile: ClaudeCodeWorkerProfile, cwd: string, config: OrchestratorConfig, workerKey: string, accountDir?: string, resumeSessionId?: string): SpawnedWorkerChild {
+function spawnClaudeChild(profile: ClaudeCodeWorkerProfile, cwd: string, config: OrchestratorConfig, accountDir?: string, resumeSessionId?: string): Worker["process"] {
 	// An inherited CLAUDE_CONFIG_DIR (e.g. pi launched from a shell that set
 	// one) must not pin every worker to a single account: account choice
 	// belongs to the orchestrator's rotation, or to the launcher's own.
 	const hostEnv: NodeJS.ProcessEnv = { ...process.env };
 	delete hostEnv.CLAUDE_CONFIG_DIR;
-	// A sandboxed worker's isolated HOME has no ~/.claude, so the selected
-	// account directory (or the host default when no rotation is configured) is
-	// mounted and pinned explicitly — sandbox-only, so unsandboxed launches
-	// keep exact legacy behavior. That directory's credentials remain visible
-	// to that worker until a gateway-based auth relay replaces them.
-	const sandboxAccountDir = accountDir ?? resolve(homedir(), ".claude");
-	const gateway = config.sandbox.network === "gateway";
 	return spawnWorkerChild(
-		workerKey,
 		config.commands.claude,
-		[...claudeCodeArgs(effectiveWorkerModel(profile.model, config.sandbox.gateway), profile.thinking), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
+		[...claudeCodeArgs(profile.model, profile.thinking), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
-		gateway
-			? claudeGatewayEnv(resolve(workerHomeDirPath(workerKey), ".claude-gateway"))
-			: { PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
-		config,
+		{ PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
 		hostEnv,
-		gateway ? {} : {
-			...(accountDir ? {} : { sandboxEnvOverrides: { CLAUDE_CONFIG_DIR: sandboxAccountDir } }),
-			readWritePaths: [sandboxAccountDir],
-		},
-		profile.sandbox === "off",
 	);
 }
 
@@ -726,7 +627,7 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
  */
 function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitText: string): boolean {
 	const accounts = config.claudeAccounts;
-	if (!accounts || worker.profile.backend !== "claude-code" || config.sandbox.network === "gateway") return false;
+	if (!accounts || worker.profile.backend !== "claude-code") return false;
 	if (worker.claudeAccount) {
 		markClaudeAccountLimited(accounts, worker.claudeAccount, parseUsageLimitReset(limitText));
 	}
@@ -734,18 +635,13 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	if (!pick) return false;
 	// killWorkerProcessTree tolerates an already-gone limited process.
 	killWorkerProcessTree(worker.process);
-	let spawned: SpawnedWorkerChild;
+	let child: Worker["process"];
 	try {
-		spawned = spawnClaudeChild(worker.profile, worker.cwd, config, worker.id, pick.configDir, worker.claudeSessionId);
+		child = spawnClaudeChild(worker.profile, worker.cwd, config, pick.configDir, worker.claudeSessionId);
 	} catch (error) {
-		if (error instanceof WorkerLaunchRejected) {
-			failWorker(worker, `Account failover was rejected: ${error.message}`, "unavailable");
-			return true; // Handled: the worker is already failed, no double-report.
-		}
-		throw error;
+		failWorker(worker, `Account failover could not start a replacement worker: ${error instanceof Error ? error.message : String(error)}`, "unavailable");
+		return true; // Handled: the worker is already failed, no double-report.
 	}
-	const child = spawned.child;
-	if (spawned.warning) recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
 	worker.process = child;
 	worker.buffer = "";
 	worker.pendingTurns = 0;
@@ -768,15 +664,10 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 
 function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
-	const account = profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" ? pickClaudeAccount(config.claudeAccounts) : undefined;
-	const gateway = config.sandbox.network === "gateway";
-	const spawned = profile.backend === "pi-rpc"
-		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(gateway ? { ...profile, model: gatewayPiModel(effectiveWorkerModel(profile.model, config.sandbox.gateway)) } : profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, {
-			...piWorkerSandboxPlan(workerHomeDirPath(id), homedir(), gateway),
-			...(gateway ? { gatewayPiModel: config.sandbox.gateway!.model } : {}),
-		}, profile.sandbox === "off")
-		: spawnClaudeChild(profile, cwd, config, id, account?.configDir);
-	const child = spawned.child;
+	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
+	const child = profile.backend === "pi-rpc"
+		? spawnWorkerChild(config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, process.env)
+		: spawnClaudeChild(profile, cwd, config, account?.configDir);
 	const worker: Worker = {
 		id,
 		name,
@@ -801,21 +692,14 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 	wireWorkerChild(worker, child, config);
-	if (spawned.warning) {
-		worker.sandboxWarning = spawned.warning;
-		recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
-	}
-	if (profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" && !account) {
+	if (profile.backend === "claude-code" && config.claudeAccounts && !account) {
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
 		killWorkerProcessTree(child);
 		return worker;
 	}
 
-	const prInstructions = spawned.prBroker
-		? `A credential-free PR broker is available only for this delegated branch at /pr/pio-pr. Use it only when the task explicitly requests creating or updating a PR, after committing all work and ensuring the worktree (including untracked files) is clean: /pr/pio-pr status, then /pr/pio-pr publish "title" "body". It can only publish this pinned branch and create/update its open PR; do not seek GitHub, SSH, token, remote, merge, close, or review access.`
-		: undefined;
-	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend, prAppendix: prInstructions });
+	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend });
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -827,7 +711,6 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const config = loadOrchestratorConfig();
 	const catalog = config.workers;
 	const catalogNames = catalogText(catalog);
-	const hostWorkerNames = workerNames(catalog).filter((name) => catalog[name]!.sandbox === "off");
 	const delegateWorkerSchema = createWorkerSchema(catalog);
 	// First recover the narrowly scoped stale-v2 overwrite mode, then normalize
 	// any remaining legacy shape. Both paths snapshot before writing.
@@ -1319,12 +1202,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.${config.sandbox.mode !== "off" ? ` Sandboxed workers require a workspace: pass cwd as the exact repository directory, which must be inside a configured sandbox workspace root${config.sandbox.workspaceRoots.length ? ` (${config.sandbox.workspaceRoots.join(", ")})` : " (none are currently configured, so delegation will be rejected until one is added)"}. cwd is REQUIRED whenever this session's own cwd is outside those roots (e.g. a coordinator started in the home directory).${hostWorkerNames.length ? ` Exception: ${hostWorkerNames.join(", ")} run(s) directly on the host without sandbox containment — delegate host-level work (host processes, services, systemd, files outside the workspace roots) there instead of reporting it impossible; for such workers cwd may be any accessible directory and is optional.` : ""}` : ""}`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
 		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
 			task: Type.String({ description: "Complete worker brief. Start directly with coordinator investigation, facts, conclusions, and constraints. Carry forward exact paths, stable symbols or line ranges when useful, concrete root cause, planned changes, edge cases, acceptance criteria, and exact focused validation commands when discoverable. Do not begin with a Requested outcome heading, a request paraphrase, a command, an implementation summary, or any similar restatement of what the user wants. Do not require broad rediscovery, brittle line numbers, or large code dumps. End with a separately labeled verbatim user operative request; only when the request is too large, use a clearly labeled faithful excerpt. Nothing may follow that final user-request section. Never ask the worker to diagnose something you already determined, and never silently replace the user's request with your inferred plan." }),
-			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. With the sandbox enabled it must be equal to or inside a configured sandbox workspace root; only this directory is mounted read-write. Required when the coordinator session cwd is outside the configured roots." })),
+			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. Defaults to the coordinator's session directory." })),
 			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
 			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
@@ -1340,13 +1223,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			const suppliedComplexity: unknown = params.complexity;
 			const profile = catalog[name];
 			if (!profile) return content(`Delegation rejected: ${name} is not a configured worker.`);
-			// Fail closed before any spawn: a cwd that is (or contains) the host
-			// home or falls outside the configured workspace roots must never be
-			// mounted; the coordinator is told exactly what to pass instead. A
-			// worker with an explicit sandbox opt-out follows mode-"off" workspace
-			// rules instead (any accessible directory, including the session cwd).
-			const workspace = resolveWorkerWorkspace(sandboxConfigForWorker(config.sandbox, profile.sandbox === "off"), typeof params.cwd === "string" ? params.cwd : undefined, ctx.cwd);
-			if (!workspace.ok) return content(`Delegation rejected: ${workspace.error}`);
+			const cwd = resolve(typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : ctx.cwd);
 			let workerTask: string;
 			try {
 				workerTask = withOrchestratorDelegationContract(params.task, rootTaskId);
@@ -1355,21 +1232,16 @@ export default function orchestrator(pi: ExtensionAPI) {
 			}
 			let worker: Worker;
 			try {
-				worker = launchWorker(name, profile, workerTask, workspace.cwd, config, {
+				worker = launchWorker(name, profile, workerTask, cwd, config, {
 					rootTaskId,
 					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
 					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
 					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
 				});
 			} catch (error) {
-				// Fail closed and visibly: a required-sandbox rejection never spawns
-				// an unsandboxed worker and never silently degrades.
-				if (error instanceof WorkerLaunchRejected) return content(`Delegation rejected: ${error.message}`);
-				throw error;
+				return content(`Delegation rejected: the worker process could not be started (${error instanceof Error ? error.message : String(error)}).`);
 			}
-			const sandboxNote = worker.sandboxWarning ? ` WARNING: ${worker.sandboxWarning}` : "";
-			const hostNote = profile.sandbox === "off" && config.sandbox.mode !== "off" ? ` ${worker.name} runs directly on the host without sandbox containment.` : "";
-			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.${sandboxNote}${hostNote}`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
+			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
 		},
 	});
 

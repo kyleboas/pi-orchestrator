@@ -36,8 +36,6 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	claudeAccount?: string;
 	/** Latest instruction sent; resent after a usage-limit account failover. */
 	lastInstruction?: string;
-	/** Bounded preferred-mode fallback notice: this worker launched WITHOUT sandbox containment. */
-	sandboxWarning?: string;
 	tokens?: number;
 	/** Cumulative provider-reported run/session total when available. */
 	costUsd?: number;
@@ -63,9 +61,7 @@ export type OrchestratorWorker = WorkerLifecycle & {
 };
 
 /**
- * Kill a worker's entire process tree. Sandboxed workers need only the direct
- * child killed: bwrap's PID namespace plus --die-with-parent tears down the
- * inner tree. Unsandboxed (host opt-out) workers are spawned detached as their
+ * Kill a worker's entire process tree. Workers are spawned detached as their
  * own process group precisely so this group signal can reach grandchildren —
  * a stuck deploy or railway invocation must not survive as an orphan. The
  * group kill is a no-op (ESRCH) when the child was not a group leader.

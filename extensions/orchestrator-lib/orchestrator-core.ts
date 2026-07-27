@@ -9,10 +9,8 @@ export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
 /** Claude Code accepts only these effort values. */
 export const CLAUDE_EFFORTS = ["low", "medium", "high"] as const;
 export type ClaudeEffort = (typeof CLAUDE_EFFORTS)[number];
-/** Explicit per-worker containment opt-out; the only accepted value is "off". */
-export type WorkerSandboxOverride = "off";
-export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel; description?: string; sandbox?: WorkerSandboxOverride };
-export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string; thinking?: ClaudeEffort; description?: string; sandbox?: WorkerSandboxOverride };
+export type PiRpcWorkerProfile = { backend: "pi-rpc"; model: string; thinking: PiThinkingLevel; description?: string };
+export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string; thinking?: ClaudeEffort; description?: string };
 export type WorkerProfile = PiRpcWorkerProfile | ClaudeCodeWorkerProfile;
 export type WorkerCatalog = Record<string, WorkerProfile>;
 
@@ -22,10 +20,7 @@ export function workerDescription(name: string, profile: WorkerProfile): string 
 	const base = profile.backend === "pi-rpc"
 		? `${name}: Pi RPC implementation worker (${profile.model}, ${profile.thinking} thinking).`
 		: `${name}: persistent Claude Code implementation worker (${profile.model}${profile.thinking ? `, ${profile.thinking} effort` : ""}).`;
-	const host = profile.sandbox === "off"
-		? " UNSANDBOXED HOST WORKER: runs directly on the host with no sandbox containment; reserve it for tasks that genuinely need host processes, services, or paths outside the sandbox workspace roots."
-		: "";
-	return profile.description ? `${base}${host} ${profile.description}` : `${base}${host}`;
+	return profile.description ? `${base} ${profile.description}` : base;
 }
 export function catalogText(catalog: WorkerCatalog): string { const names = workerNames(catalog); return names.length < 2 ? names[0] ?? "workers" : `${names.slice(0, -1).join(", ")}, or ${names.at(-1)}`; }
 export function workerRpcArgs(model: string, thinking: PiThinkingLevel, backgroundJobExtensionPath = BACKGROUND_JOB_WORKER_EXTENSION_PATH): string[] {
@@ -41,11 +36,10 @@ export type WorkerPromptOptions = {
 	task: string;
 	cwd: string;
 	backend?: WorkerProfile["backend"];
-	prAppendix?: string;
 };
 
 /** Build the complete implementation brief shared by every worker backend. */
-export function buildWorkerPrompt({ worker, task, cwd, backend, prAppendix }: WorkerPromptOptions): string {
+export function buildWorkerPrompt({ worker, task, cwd, backend }: WorkerPromptOptions): string {
 	const guidance = `You are ${worker}, an implementation worker. Work directly in ${cwd}.
 
 The coordinator brief is your starting map. Open the named files and relevant symbols to confirm what you will edit; source files remain the truth. Do not repeat broad repository discovery or reread unrelated documentation unless the brief is missing a necessary fact, looks stale, or validation exposes a new problem. Inspect adjacent callers, tests, configuration, documentation, and user-facing behavior only as needed for the named change, and prefer root-cause fixes over symptom patches.
@@ -56,8 +50,7 @@ Implement the task and run validation proportional to its risk and changed surfa
 	const backgroundJobGuidance = backend === "pi-rpc"
 		? `For heavy local commands expected to take more than two minutes, use background_job instead of bash. Do not pass the bash timeout field and do not invoke GNU timeout. After starting a background job, immediately continue any other independent useful work when possible and never poll it. End the turn to await its completion only when no useful independent work remains. When the background_job completion follow-up arrives, inspect its log path and continue the work before finishing.`
 		: undefined;
-	const appendix = prAppendix?.trim();
-	return [guidance, backgroundJobGuidance, appendix, task.trim()].filter((part): part is string => Boolean(part)).join("\n\n");
+	return [guidance, backgroundJobGuidance, task.trim()].filter((part): part is string => Boolean(part)).join("\n\n");
 }
 
 export const SOL_PLANNING_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
