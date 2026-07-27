@@ -1263,7 +1263,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count.${config.maxConcurrentWorkers > 0 ? ` At most ${config.maxConcurrentWorkers} workers may be live at once; delegation beyond that is rejected until one settles, so plan fan-out within that limit.` : ""} For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
 		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
@@ -1290,6 +1290,14 @@ export default function orchestrator(pi: ExtensionAPI) {
 				workerTask = withOrchestratorDelegationContract(params.task, rootTaskId);
 			} catch (error) {
 				return content(`Delegation rejected: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			// Settled workers stay in the map until a later render prunes them, so
+			// admission counts live processes: those are what actually hold memory.
+			// This check and the launch stay in one synchronous block because
+			// delegation runs in parallel mode and two calls must not both pass.
+			const live = [...runtime.workers.values()].filter((candidate) => isWorkerProcessLive(candidate.process));
+			if (config.maxConcurrentWorkers > 0 && live.length >= config.maxConcurrentWorkers) {
+				return content(`Delegation rejected: ${live.length} of ${config.maxConcurrentWorkers} allowed workers are already live (${live.map((candidate) => candidate.id).join(", ")}). Wait for one to settle, or stop one, before delegating again.`);
 			}
 			let worker: Worker;
 			try {

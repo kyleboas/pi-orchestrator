@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_ROLLOVER_CONTEXT_PERCENT, DEFAULT_WORKERS, loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
+import { DEFAULT_MAX_CONCURRENT_WORKERS, DEFAULT_ROLLOVER_CONTEXT_PERCENT, DEFAULT_WORKERS, loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
 import { BACKGROUND_JOB_WORKER_EXTENSION_PATH, catalogText, piRpcWorkerArgs, workerDescription, workerNames } from "../extensions/orchestrator-lib/orchestrator-core.ts";
 import { claudeCodeArgs } from "../extensions/orchestrator-lib/orchestrator-claude.ts";
@@ -26,6 +26,14 @@ test("default catalog uses nine explicit individual worker profiles", () => {
 	assert.equal(config.commands.pi, "pi"); assert.equal(config.commands.claude, "claude");
 	assert.equal(config.checkInMinutes, DEFAULT_CHECKIN_MINUTES);
 	assert.equal(config.rolloverContextPercent, DEFAULT_ROLLOVER_CONTEXT_PERCENT);
+	assert.equal(config.maxConcurrentWorkers, DEFAULT_MAX_CONCURRENT_WORKERS);
+});
+
+test("maxConcurrentWorkers accepts non-negative integers with zero disabling the cap", () => {
+	for (const [value, expected] of [[0, 0], [1, 1], [4, 4], [-1, DEFAULT_MAX_CONCURRENT_WORKERS], [1.5, DEFAULT_MAX_CONCURRENT_WORKERS], ["2", DEFAULT_MAX_CONCURRENT_WORKERS], [null, DEFAULT_MAX_CONCURRENT_WORKERS]] as const) {
+		const file = configFile({ maxConcurrentWorkers: value });
+		try { assert.equal(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file }).maxConcurrentWorkers, expected); } finally { remove(file); }
+	}
 });
 
 test("checkInMinutes and rollover threshold accept bounded configuration with zero disable", () => {
