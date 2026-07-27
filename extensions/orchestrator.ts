@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	SolToolMode,
+	buildModeChangeDirective,
 	buildWorkerPrompt,
 	catalogText,
 	workerDescription,
@@ -766,7 +767,7 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, reason
 	return true;
 }
 
-function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity; selfPlan?: boolean; planOnly?: boolean }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const child = profile.backend === "pi-rpc"
@@ -792,6 +793,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		rpcNextId: 0,
 		rpcPending: new Map(),
 		...(account ? { claudeAccount: account.name } : {}),
+		...(lineage.planOnly ? { planOnly: true } : {}),
 	};
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -803,7 +805,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		return worker;
 	}
 
-	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend });
+	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend, selfPlan: lineage.selfPlan ?? profile.selfPlanning === true, ...(lineage.planOnly ? { planOnly: true } : {}) });
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -1350,6 +1352,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
 			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
+			selfPlan: Type.Optional(Type.Boolean({ description: "True when this brief states a goal and leaves the approach to the worker; false when it carries a plan for the worker to execute. Set it explicitly whenever the user says in plain English who should plan. Omit to use the worker's configured default." })),
+			planOnly: Type.Optional(Type.Boolean({ description: "True when the plan itself is the deliverable: the worker investigates and reports an approach, changing nothing. Set it whenever the user asked for a plan, approach, or options without asking for the work to be done. The plan returns to you for the user to approve; implementing it is a separate delegation." })),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const name = params.worker as string;
@@ -1384,6 +1388,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
 					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
 					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
+					// An explicit per-task choice wins; the profile default applies only when the coordinator did not choose.
+					selfPlan: typeof params.selfPlan === "boolean" ? params.selfPlan : profile.selfPlanning === true,
+					...(params.planOnly === true ? { planOnly: true } : {}),
 				});
 			} catch (error) {
 				return content(`Delegation rejected: the worker process could not be started (${error instanceof Error ? error.message : String(error)}).`);
@@ -1401,6 +1408,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			instructions: Type.String({ description: "Concrete follow-up instructions for the worker." }),
 			kind: Type.Optional(Type.Union([Type.Literal("correction"), Type.Literal("continuation")])),
 			interrupt: Type.Optional(Type.Boolean({ description: "Abort the in-flight run before delivering the instructions (Pi workers only; discards the aborted run's partial result). Use only to stop active wrong-direction work, never for routine follow-ups." })),
+			planOnly: Type.Optional(Type.Boolean({ description: "Switch this live worker's mode. False authorizes it to implement the plan it reported; true stops it implementing and makes the plan the deliverable, keeping any work already on disk. Omit to leave the current mode unchanged." })),
 		}),
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
@@ -1451,16 +1459,23 @@ export default function orchestrator(pi: ExtensionAPI) {
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
 			worker.claudeAuthFailed = undefined;
-			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: params.instructions });
-			if (!sendWorkerInstruction(worker, params.instructions, true)) {
+			// The launch prompt issued the opposite standing order, so a mode switch
+			// must lead the instructions rather than trail them.
+			const requestedMode = typeof params.planOnly === "boolean" ? params.planOnly : undefined;
+			const modeChanged = requestedMode !== undefined && requestedMode !== (worker.planOnly === true);
+			const instructions = modeChanged ? `${buildModeChangeDirective(requestedMode!)}\n\n${params.instructions}` : params.instructions;
+			if (modeChanged) worker.planOnly = requestedMode;
+			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: instructions });
+			if (!sendWorkerInstruction(worker, instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
 				return content(`${worker.id} could not accept follow-up instructions.`);
 			}
+			const modeNote = modeChanged ? ` It switched to ${requestedMode ? "planning only, keeping any work already on disk" : "implementing"}.` : "";
 			if (kind === "correction" && completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
 			else if (kind === "continuation" && completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
 			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
-			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}`);
+			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}`);
 		},
 	});
 

@@ -66,16 +66,22 @@ function description(value: unknown): { description?: string } {
 	const cleaned = value.replace(/\s+/g, " ").trim().slice(0, 300);
 	return cleaned ? { description: cleaned } : {};
 }
+// Only an exact `true` grants the exemption, and anything else is ignored
+// rather than rejected: a typo here must not invalidate the whole catalog and
+// silently drop every worker back to the defaults.
+function selfPlanning(value: unknown): { selfPlanning?: boolean } {
+	return value === true ? { selfPlanning: true } : {};
+}
 function profile(value: unknown): WorkerProfile | undefined {
 	if (!object(value)) return undefined;
 	if (value.backend === "pi-rpc") {
 		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model) || !supportsThinking(value.model.trim(), value.thinking as PiThinkingLevel)) return undefined;
-		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description) };
+		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description), ...selfPlanning(value.selfPlanning) };
 	}
 	if (value.backend === "claude-code" && nonempty(value.model)) {
 		if (value.thinking !== undefined && !CLAUDE_EFFORT.has(value.thinking as ClaudeEffort)) return undefined;
 		const thinking = value.thinking === undefined ? {} : { thinking: value.thinking as ClaudeEffort };
-		return { backend: "claude-code", model: value.model.trim(), ...thinking, ...description(value.description) };
+		return { backend: "claude-code", model: value.model.trim(), ...thinking, ...description(value.description), ...selfPlanning(value.selfPlanning) };
 	}
 	return undefined;
 }

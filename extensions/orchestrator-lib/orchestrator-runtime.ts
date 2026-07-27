@@ -25,6 +25,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	category: import("./orchestrator-stats.ts").TaskCategory;
 	complexity: import("./orchestrator-stats.ts").TaskComplexity;
 	cwd: string;
+	/** Current delivery mode: true while the plan is the deliverable. Steering may flip this mid-task. */
+	planOnly?: boolean;
 	process: ChildProcessWithoutNullStreams;
 	startedAt: Date;
 	/** Last delegate/steer instruction; the footer row timer counts from here. */
