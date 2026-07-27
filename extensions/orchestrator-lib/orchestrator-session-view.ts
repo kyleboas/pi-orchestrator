@@ -32,6 +32,30 @@ export function isPageDownKey(data: string): boolean {
 	return data === `${ESC}[6~`;
 }
 
+export function isHomeKey(data: string): boolean {
+	return data === `${ESC}[H` || data === `${ESC}OH` || data === `${ESC}[1~` || data === `${ESC}[7~`;
+}
+
+export function isEndKey(data: string): boolean {
+	return data === `${ESC}[F` || data === `${ESC}OF` || data === `${ESC}[4~` || data === `${ESC}[8~`;
+}
+
+/**
+ * Hold a scrolled viewport on the content it is showing. `scrollUp` counts
+ * lines up from the bottom, so appended output would otherwise slide the
+ * window down and drag the reader toward live output mid-sentence. Growing
+ * the offset by the number of appended lines keeps the same lines on screen.
+ *
+ * A viewport that is already following (0) stays at the bottom by design, and
+ * entries trimmed off the front of a bounded transcript need no adjustment
+ * because the offset is measured from the bottom.
+ */
+export function anchorScrollUp(scrollUp: number, previousBodyLength: number, bodyLength: number): number {
+	if (scrollUp <= 0) return 0;
+	const appended = bodyLength - previousBodyLength;
+	return appended > 0 ? scrollUp + appended : scrollUp;
+}
+
 export type SelectableWorker = {
 	id: string;
 	state: WorkerPanelState;
@@ -112,7 +136,7 @@ export function renderSessionScreen(
 	height: number,
 	scrollUp: number,
 	theme: ViewerTheme,
-): { lines: string[]; maxScrollUp: number } {
+): { lines: string[]; maxScrollUp: number; viewport: number; bodyLength: number } {
 	const fullWidth = Math.max(24, width);
 	const body = bodyLines.length ? bodyLines : ["No output yet."];
 
@@ -123,12 +147,15 @@ export function renderSessionScreen(
 	const visible = body.slice(Math.max(0, end - viewport), end).map((line) => padVisible(line, fullWidth));
 	while (visible.length < viewport) visible.push(" ".repeat(fullWidth));
 
-	const hints = `↑/↓ scroll${clamped > 0 ? ` (+${clamped})` : ""} · esc to go back`;
+	// Say plainly that a scrolled view is no longer following, and how to resume.
+	const hints = clamped > 0
+		? `↑/↓ scroll · ${clamped} line${clamped === 1 ? "" : "s"} back, paused · end to follow · esc to go back`
+		: "↑/↓ scroll · following live · esc to go back";
 	const lines = [
 		theme.fg("text", padVisible(` ${title}`, fullWidth)),
 		theme.fg("dim", "─".repeat(fullWidth)),
 		...visible,
 		theme.fg("dim", padVisible(` ${hints}`, fullWidth)),
 	];
-	return { lines, maxScrollUp };
+	return { lines, maxScrollUp, viewport, bodyLength: body.length };
 }
