@@ -21,19 +21,23 @@ import {
 	type WorkerProfile,
 } from "./orchestrator-lib/orchestrator-core.ts";
 import {
+	claudeApiErrorEvent,
 	claudeAssistantText,
 	claudeCodeArgs,
 	drainClaudeStreamBuffer,
 	claudeResultSettlement,
 	claudeUsageTokenTotal,
 	claudeUserEvent,
+	isClaudeTurnStart,
 	parseClaudeStreamLine,
+	type ClaudeResultSettlement,
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
 import { buildCoordinatorInstructions } from "./orchestrator-lib/orchestrator-instructions.ts";
 import { withOrchestratorDelegationContract } from "./orchestrator-lib/orchestrator-delegation-contract.ts";
 import {
 	earliestAccountReset,
+	isClaudeAuthFailureText,
 	isUsageLimitText,
 	markClaudeAccountLimited,
 	parseUsageLimitReset,
@@ -43,10 +47,13 @@ import {
 	beginWorkerRun,
 	beginWorkerSettlement,
 	canSteerWorker,
+	clearClaudeMergeGrace,
 	completeClaudeTurn,
 	finishWorkerSettlement,
 	markWorkerRunActive,
+	mergeOutstandingClaudeTurns,
 	queueClaudeTurn,
+	startClaudeTurn,
 	selectFinalWorkerText,
 	shouldAbortPiWorkerRun,
 	shouldAutoStopReportedWorker,
@@ -309,6 +316,9 @@ function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
 		worker.process.stdin.write(`${JSON.stringify(claudeUserEvent(instructions))}\n`, (error) => {
 			if (error) failWorker(worker, "Claude Code worker stdin failed.", "unavailable");
 		});
+		// New instructions invalidate any held merge verdict: its result belongs
+		// to a turn this write supersedes.
+		clearClaudeMergeGrace(worker);
 		queueClaudeTurn(worker);
 		worker.lastInstruction = instructions;
 		// Unlike Pi RPC's agent_start event, Claude's stream-json protocol has
@@ -397,6 +407,60 @@ async function settleWorker(worker: Worker): Promise<void> {
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
+/**
+ * How long a result waits for a turn-start event before its outstanding
+ * instructions are treated as merged into the turn that just ended. Claude
+ * Code starts a genuinely queued turn within milliseconds of the prior result,
+ * so this only delays the merged case, and only by the window itself.
+ */
+const CLAUDE_MERGED_TURN_GRACE_MS = 3_000;
+
+/**
+ * A result answered the current turn while an instruction is still outstanding.
+ * Claude Code either starts that instruction's own turn in a moment (its result
+ * settles the worker) or already merged it into the turn that just ended, in
+ * which case no further result will ever arrive and the worker would hang in
+ * "working" holding the finished text. Wait one window for a turn-start event
+ * to decide, then settle on this result if none came.
+ */
+function holdClaudeMergeVerdict(worker: Worker, settlement: ClaudeResultSettlement): void {
+	clearClaudeMergeGrace(worker);
+	const run = worker.run;
+	const timer = setTimeout(() => {
+		worker.claudeMergeGraceTimer = undefined;
+		if (worker.run !== run || worker.state === "stopped" || worker.state === "failed") return;
+		mergeOutstandingClaudeTurns(worker);
+		applyClaudeSettlement(worker, settlement);
+		notifyOrchestratorStateChange(getOrchestratorRuntime());
+	}, CLAUDE_MERGED_TURN_GRACE_MS);
+	timer.unref?.();
+	worker.claudeMergeGraceTimer = timer;
+}
+
+/** Settle or fail the worker on a result that owns the last outstanding turn. */
+function applyClaudeSettlement(worker: Worker, settlement: ClaudeResultSettlement): void {
+	const run = beginWorkerSettlement(worker);
+	if (run === undefined) return;
+	// Some Claude Code result events omit result even though the last assistant
+	// event already contained the final text. That is a successful terminal
+	// turn, not a reason to leave the reusable worker working or fail it.
+	const finalText = selectFinalWorkerText(worker.lastResult, settlement.result);
+	if (settlement.isError || !finalText) {
+		worker.settlingRun = undefined;
+		worker.state = "failed";
+		worker.settledAt ??= new Date();
+		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
+		recordRunOutcome(worker, "failed");
+		reportWorkerResult(worker);
+		return;
+	}
+	worker.lastResult = finalText;
+	if (finishWorkerSettlement(worker, run)) {
+		recordRunOutcome(worker, "completed");
+		reportWorkerResult(worker);
+	}
+}
+
 function settleClaudeResult(worker: Worker, event: Record<string, unknown>, config?: OrchestratorConfig): void {
 	const settlement = claudeResultSettlement(event);
 	if (!settlement) return;
@@ -411,38 +475,31 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 	// A usage-limit result is an account problem, not a task outcome: fail
 	// over to the next available account instead of settling or failing.
 	if (settlement.isError && isUsageLimitText(settlement.result) && config?.claudeAccounts) {
-		if (failoverClaudeWorker(worker, config, settlement.result ?? "")) return;
+		if (failoverClaudeWorker(worker, config, "usage-limit", settlement.result ?? "")) return;
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Usage limit reached and every Claude account is in cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
+		return;
+	}
+	// Expired credentials are the same class of problem: this account cannot
+	// serve any work, but the session (and everything the worker has already
+	// done in it) survives on the next account. Never report a /login
+	// instruction as a task result.
+	if (settlement.isError && (worker.claudeAuthFailed === true || isClaudeAuthFailureText(settlement.result)) && config?.claudeAccounts) {
+		const loggedOut = worker.claudeAccount;
+		if (failoverClaudeWorker(worker, config, "auth", settlement.result ?? "")) return;
+		failWorker(
+			worker,
+			`Claude account ${loggedOut ?? "(unknown)"} needs re-authentication (run claude /login for it) and no other account is available.${worker.claudeSessionId ? ` Its work is preserved in session ${worker.claudeSessionId}; a worker resumed on that session continues where it stopped.` : ""}`,
+			"unavailable",
+		);
 		return;
 	}
 	// A result for an earlier turn (one that was already streaming when a
 	// steer queued another) must not settle the steered run: the worker is
 	// still working on the follow-up instructions.
-	if (!completeClaudeTurn(worker)) {
-		notifyOrchestratorStateChange(getOrchestratorRuntime());
-		return;
-	}
-	const run = beginWorkerSettlement(worker);
-	if (run === undefined) return;
-	// Some Claude Code result events omit result even though the last assistant
-	// event already contained the final text. That is a successful terminal
-	// turn, not a reason to leave the reusable worker working or fail it.
-	const finalText = selectFinalWorkerText(worker.lastResult, settlement.result);
-	if (settlement.isError || !finalText) {
-		worker.settlingRun = undefined;
-		worker.state = "failed";
-		worker.settledAt ??= new Date();
-		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
-		recordRunOutcome(worker, "failed");
-		reportWorkerResult(worker);
-	} else {
-		worker.lastResult = finalText;
-		if (finishWorkerSettlement(worker, run)) {
-			recordRunOutcome(worker, "completed");
-			reportWorkerResult(worker);
-		}
-	}
+	const completion = completeClaudeTurn(worker);
+	if (completion === "unstarted") holdClaudeMergeVerdict(worker, settlement);
+	else if (completion === "settles") applyClaudeSettlement(worker, settlement);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
@@ -521,9 +578,20 @@ function handleRpcLine(worker: Worker, line: string): void {
 function handleClaudeEvents(worker: Worker, events: Record<string, unknown>[], config?: OrchestratorConfig): void {
 	for (const event of events) {
 		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry);
+		// A turn that actually started proves its instructions were not merged
+		// into the previous one, so a held result must not settle the worker.
+		if (isClaudeTurnStart(event)) {
+			clearClaudeMergeGrace(worker);
+			startClaudeTurn(worker);
+		}
+		// An API-level failure is not model output: "Please run /login" must never
+		// survive as this worker's final result, and an auth failure arms the
+		// account rotation its result event performs.
+		const apiError = claudeApiErrorEvent(event);
+		if (apiError?.authenticationFailed || isClaudeAuthFailureText(apiError?.text)) worker.claudeAuthFailed = true;
 		// A successful result can omit its direct result text. Preserve the last
 		// complete assistant message as the safe fallback for that terminal event.
-		const text = claudeAssistantText(event);
+		const text = apiError ? undefined : claudeAssistantText(event);
 		if (text) worker.lastResult = text;
 		settleClaudeResult(worker, event, config);
 		notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -645,17 +713,22 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 }
 
 /**
- * A Claude worker hit its account's usage limit: put that account in cooldown
- * (claude-select/claude-auto honor the same state file) and restart the
- * worker on the next available account, resuming the same Claude session and
- * resending the interrupted instruction. Returns false when no account is
- * available, in which case the caller fails the worker.
+ * A Claude worker's account became unusable — its usage limit was reached, or
+ * its credentials expired ("Please run /login"). Both are account problems
+ * rather than task outcomes: put that account in cooldown (claude-select and
+ * claude-auto honor the same state file) and restart the worker on the next
+ * available account, resuming the same Claude session so everything the worker
+ * has already done is carried over, then resend the interrupted instruction.
+ * Returns false when no account is available, in which case the caller fails
+ * the worker.
  */
-function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitText: string): boolean {
+function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, reason: "usage-limit" | "auth", errorText: string): boolean {
 	const accounts = config.claudeAccounts;
 	if (!accounts || worker.profile.backend !== "claude-code") return false;
 	if (worker.claudeAccount) {
-		markClaudeAccountLimited(accounts, worker.claudeAccount, parseUsageLimitReset(limitText));
+		// A logged-out account has no reset time to parse; the default cooldown
+		// keeps rotation off it until it is re-authenticated.
+		markClaudeAccountLimited(accounts, worker.claudeAccount, reason === "auth" ? undefined : parseUsageLimitReset(errorText));
 	}
 	const pick = pickClaudeAccount(accounts);
 	if (!pick) return false;
@@ -670,14 +743,19 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	}
 	worker.process = child;
 	worker.buffer = "";
-	worker.pendingTurns = 0;
+	clearClaudeMergeGrace(worker);
+	mergeOutstandingClaudeTurns(worker);
+	const failedAccount = worker.claudeAccount;
 	worker.claudeAccount = pick.name;
+	worker.claudeAuthFailed = undefined;
 	worker.state = "working";
 	wireWorkerChild(worker, child, config);
 	recordWorkerActivity(worker, {
 		at: Date.now(),
 		role: "system",
-		text: `Usage limit reached; switched to account ${pick.name} and resumed.`,
+		text: reason === "auth"
+			? `Account ${failedAccount ?? "(unknown)"} needs re-authentication; switched to account ${pick.name} and resumed this session.`
+			: `Usage limit reached; switched to account ${pick.name} and resumed.`,
 	});
 	const instruction = worker.lastInstruction ?? worker.task;
 	if (!sendWorkerInstruction(worker, instruction, true)) {
@@ -1372,6 +1450,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			worker.runId = `${worker.id}:run-${worker.run}`;
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
+			worker.claudeAuthFailed = undefined;
 			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: params.instructions });
 			if (!sendWorkerInstruction(worker, params.instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");

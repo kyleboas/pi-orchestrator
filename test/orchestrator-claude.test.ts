@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	claudeApiErrorEvent,
 	claudeAssistantText,
 	claudeCodeArgs,
+	isClaudeTurnStart,
 	drainClaudeStreamBuffer,
 	claudeResultSettlement,
 	claudeUsageTokenTotal,
@@ -18,6 +20,7 @@ import {
 	selectFinalWorkerText,
 	type WorkerLifecycle,
 } from "../extensions/orchestrator-lib/worker-lifecycle.ts";
+import { isClaudeAuthFailureText } from "../extensions/orchestrator-lib/orchestrator-accounts.ts";
 
 function lifecycle(overrides: Partial<WorkerLifecycle> = {}): WorkerLifecycle {
 	return { state: "working", run: 1, ...overrides };
@@ -163,4 +166,41 @@ test("stop race suppresses a stale Claude result and early exit has one error cl
 	earlyExit.state = "failed";
 	assert.equal(claimWorkerReport(earlyExit), true);
 	assert.equal(claimWorkerReport(earlyExit), false);
+});
+
+// Captured verbatim from `claude -p --input-format stream-json` running against
+// a config dir with no credentials.
+const LOGGED_OUT_ASSISTANT = {
+	type: "assistant",
+	message: { id: "1f222b79", model: "<synthetic>", role: "assistant", content: [{ type: "text", text: "Not logged in \u00b7 Please run /login" }] },
+	session_id: "d738b136",
+	error: "authentication_failed",
+	is_api_error_message: true,
+} as Record<string, unknown>;
+
+test("a logged-out account's synthetic message is an API error, never worker output", () => {
+	const apiError = claudeApiErrorEvent(LOGGED_OUT_ASSISTANT);
+	assert.equal(apiError?.authenticationFailed, true);
+	assert.equal(apiError?.text, "Not logged in \u00b7 Please run /login");
+	assert.equal(isClaudeAuthFailureText(apiError?.text), true);
+});
+
+test("ordinary assistant messages are not treated as API errors", () => {
+	const event = { type: "assistant", message: { role: "assistant", model: "claude-opus-5", content: [{ type: "text", text: "Done." }] } };
+	assert.equal(claudeApiErrorEvent(event), undefined);
+	assert.equal(claudeAssistantText(event), "Done.");
+});
+
+test("only system/init marks a turn Claude actually started", () => {
+	assert.equal(isClaudeTurnStart({ type: "system", subtype: "init", session_id: "d738b136" }), true);
+	assert.equal(isClaudeTurnStart({ type: "system", subtype: "thinking_tokens" }), false);
+	assert.equal(isClaudeTurnStart({ type: "result", subtype: "success" }), false);
+	assert.equal(isClaudeTurnStart(LOGGED_OUT_ASSISTANT), false);
+});
+
+test("a logged-out result is an error carrying the /login text, not a task failure", () => {
+	const settlement = claudeResultSettlement({ type: "result", subtype: "success", is_error: true, terminal_reason: "api_error", session_id: "d738b136", total_cost_usd: 0, result: "Not logged in \u00b7 Please run /login" })!;
+	assert.equal(settlement.isError, true);
+	assert.equal(isClaudeAuthFailureText(settlement.result), true);
+	assert.equal(settlement.sessionId, "d738b136", "the session must survive for the next account to resume");
 });

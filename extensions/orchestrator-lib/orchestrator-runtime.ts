@@ -34,6 +34,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	claudeSessionId?: string;
 	/** Account name (claude-select state key) this Claude worker is running on. */
 	claudeAccount?: string;
+	/** This account's credentials failed during the current turn; the result event rotates instead of failing. */
+	claudeAuthFailed?: boolean;
 	/** Latest instruction sent; resent after a usage-limit account failover. */
 	lastInstruction?: string;
 	tokens?: number;

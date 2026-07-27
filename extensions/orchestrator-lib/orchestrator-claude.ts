@@ -8,6 +8,29 @@ export type ClaudeStreamDrain = { ok: true; events: Record<string, unknown>[]; r
 export function claudeCodeArgs(model: string, effort?: ClaudeEffort): string[] { return ["-p", "--model", model, ...(effort ? ["--effort", effort] : []), "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"]; }
 export function claudeUserEvent(instructions: string): Record<string, unknown> { return { type: "user", message: { role: "user", content: instructions } }; }
 
+/**
+ * Claude Code emits one system/init event per turn it actually starts. It is
+ * the only proof that instructions written to a busy worker became their own
+ * turn rather than being merged into the turn already streaming.
+ */
+export function isClaudeTurnStart(event: Record<string, unknown>): boolean {
+	return event.type === "system" && event.subtype === "init";
+}
+
+/**
+ * Claude Code reports API-level failures (expired credentials, overload) as a
+ * synthetic assistant message rather than model output. Its text is a client
+ * instruction such as "Not logged in · Please run /login", never worker
+ * findings, so it must never become a reported result.
+ */
+export function claudeApiErrorEvent(event: Record<string, unknown>): { authenticationFailed: boolean; text?: string } | undefined {
+	if (event.type !== "assistant") return undefined;
+	const model = (event.message as { model?: unknown } | undefined)?.model;
+	const error = typeof event.error === "string" ? event.error : undefined;
+	if (event.is_api_error_message !== true && error === undefined && model !== "<synthetic>") return undefined;
+	return { authenticationFailed: error === "authentication_failed", text: claudeAssistantText(event) };
+}
+
 /** Text from a complete Claude assistant event, safe as a final-result fallback. */
 export function claudeAssistantText(event: Record<string, unknown>): string | undefined {
 	if (event.type !== "assistant" || !event.message || typeof event.message !== "object") return undefined;
