@@ -41,6 +41,39 @@ export function isEndKey(data: string): boolean {
 }
 
 /**
+ * Wheel scrolling needs the terminal to report button events, which neither
+ * pi nor pi-tui turns on. Normal tracking (1000) is the narrowest mode that
+ * reports the wheel — no motion reporting — and SGR (1006) keeps coordinates
+ * correct past column 223. While this is on the terminal stops handling the
+ * wheel itself, so it must be switched off again the moment the view closes.
+ */
+export const MOUSE_TRACKING_ON = `${ESC}[?1000h${ESC}[?1006h`;
+export const MOUSE_TRACKING_OFF = `${ESC}[?1006l${ESC}[?1000l`;
+
+const SGR_MOUSE = /^\[<(\d+);\d+;\d+[Mm]$/;
+
+/**
+ * Wheel direction from an SGR or legacy X10 mouse report. Button 64 is wheel
+ * up and 65 wheel down; the 4/8/16 modifier bits ride on top, so they are
+ * masked off rather than matched exactly.
+ */
+export function wheelDirection(data: string): "up" | "down" | undefined {
+	const sgr = SGR_MOUSE.exec(data);
+	if (sgr) {
+		const button = Number(sgr[1]) & ~28;
+		return button === 64 ? "up" : button === 65 ? "down" : undefined;
+	}
+	if (data.startsWith(`${ESC}[M`) && data.length >= 6) {
+		const button = (data.charCodeAt(3) - 32) & ~28;
+		return button === 64 ? "up" : button === 65 ? "down" : undefined;
+	}
+	return undefined;
+}
+
+/** Conventional wheel step; matches what most terminals scroll natively. */
+export const WHEEL_SCROLL_LINES = 3;
+
+/**
  * Hold a scrolled viewport on the content it is showing. `scrollUp` counts
  * lines up from the bottom, so appended output would otherwise slide the
  * window down and drag the reader toward live output mid-sentence. Growing

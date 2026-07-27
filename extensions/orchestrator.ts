@@ -130,10 +130,14 @@ import {
 	isEscapeKey,
 	isPageDownKey,
 	isHomeKey,
+	MOUSE_TRACKING_OFF,
+	MOUSE_TRACKING_ON,
 	isPageUpKey,
 	isUpKey,
 	moveSelection,
 	renderSessionScreen,
+	wheelDirection,
+	WHEEL_SCROLL_LINES,
 	wrapPlainText,
 } from "./orchestrator-lib/orchestrator-session-view.ts";
 
@@ -938,6 +942,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
+						// Wheel events only reach the extension while tracking is on, and the
+						// terminal must be put back the way it was found on the way out.
+						const writeRaw = (sequence: string) => { try { process.stdout.write(sequence); } catch { /* a closed stdout is not worth failing the view over */ } };
+						writeRaw(MOUSE_TRACKING_ON);
+						const restoreMouse = () => writeRaw(MOUSE_TRACKING_OFF);
+						process.once("exit", restoreMouse);
 						let scrollUp = 0;
 						// Anchoring state: a scrolled viewport must keep showing the same
 						// lines when the worker appends new output below them.
@@ -1029,7 +1039,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 								return view.lines;
 							},
 							handleInput: (data: string) => {
-								if (isUpKey(data)) scrollUp += 1;
+								const wheel = wheelDirection(data);
+								if (wheel) scrollUp = Math.max(0, scrollUp + (wheel === "up" ? WHEEL_SCROLL_LINES : -WHEEL_SCROLL_LINES));
+								else if (isUpKey(data)) scrollUp += 1;
 								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
 								else if (isPageUpKey(data)) scrollUp += pageSize;
 								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - pageSize);
@@ -1043,7 +1055,11 @@ export default function orchestrator(pi: ExtensionAPI) {
 								tui.requestRender();
 							},
 							invalidate: () => {},
-							dispose: () => clearInterval(tick),
+							dispose: () => {
+							clearInterval(tick);
+							process.off("exit", restoreMouse);
+							restoreMouse();
+						},
 						};
 					},
 					// Full-terminal takeover: extensions cannot swap pi's core chat
