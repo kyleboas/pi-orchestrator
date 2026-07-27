@@ -1,3 +1,4 @@
+import { formatDuration, type RollingWorkerMetrics, type TaskClassification } from "./orchestrator-stats.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 
 /** Base interval for passive worker assessment; healthy workers extend to 2x. */
@@ -18,6 +19,30 @@ export type CheckInWorkerView = {
 	healthStreak?: number;
 	pendingBackgroundJobIds?: ReadonlySet<string>;
 };
+
+/** Minimum matching runs before percentiles are quoted, matching routing advice. */
+export const CHECKIN_PACE_MIN_SAMPLES = 3;
+
+/**
+ * A completion estimate built only from the outcome ledger, never from the
+ * worker: asking a running worker where it stands would mean an RPC round trip,
+ * which the passive check exists to avoid.
+ */
+export function buildPaceLine(elapsedMs: number, classification?: TaskClassification, metrics?: RollingWorkerMetrics): string {
+	const elapsed = `running ${formatDuration(Math.max(0, elapsedMs))}`;
+	const p50 = metrics?.p50DurationMs;
+	const p95 = metrics?.p95DurationMs;
+	if (!classification || !metrics || metrics.samples < CHECKIN_PACE_MIN_SAMPLES || p50 === undefined || p95 === undefined) {
+		return `Pace: ${elapsed}; too few comparable recent runs to estimate completion.`;
+	}
+	const reference = `comparable 7d ${classification.category}/${classification.complexity} runs finish at p50 ${formatDuration(p50)}, p95 ${formatDuration(p95)} over ${metrics.samples} samples`;
+	const verdict = elapsedMs < p50
+		? `about ${formatDuration(p50 - elapsedMs)} to p50`
+		: elapsedMs <= p95
+			? `past p50, about ${formatDuration(p95 - elapsedMs)} to p95`
+			: `${formatDuration(elapsedMs - p95)} past p95, so it is an outlier for this class`;
+	return `Pace: ${elapsed}; ${reference} — ${verdict}.`;
+}
 
 export type CheckInAssessment = {
 	status: "healthy" | "suspicious";
@@ -90,7 +115,7 @@ export function assessWorkerCheckIn(worker: CheckInWorkerView, baseIntervalMs: n
 }
 
 /** A compact factual digest from already-captured worker state only. */
-export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, now = Date.now(), assessment = assessWorkerCheckIn(worker, sinceMs, now)): string {
+export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, now = Date.now(), assessment = assessWorkerCheckIn(worker, sinceMs, now), pace?: { classification?: TaskClassification; metrics?: RollingWorkerMetrics }): string {
 	const since = Math.max(worker.lastCheckinAt?.getTime() ?? 0, now - sinceMs);
 	const recent = (worker.transcript ?? []).filter((entry) => entry.at >= since);
 	const signals = recent
@@ -101,6 +126,7 @@ export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, n
 	const lines = [
 		`[${worker.name} passive progress check — ${worker.id}]`,
 		`Task: ${clip(worker.task, 140)}`,
+		buildPaceLine(now - worker.startedAt.getTime(), pace?.classification, pace?.metrics),
 		...(signals.length ? [`Recent: ${signals.join(" | ")}`] : ["Recent: no captured assistant or tool activity."]),
 		...(pendingBackgroundJobCount > 0 ? [`Background: waiting for ${pendingBackgroundJobCount} tracked background job${pendingBackgroundJobCount === 1 ? "" : "s"}.`] : []),
 	];

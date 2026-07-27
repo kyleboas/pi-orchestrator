@@ -114,8 +114,10 @@ import {
 	recoverStaleV2StatsLedger,
 	recordWorkerOutcome,
 	recordWorkerSteer,
+	rollingWorkerMetrics,
 	statsSummary,
 	updateWorkerRunStatus,
+	type StatsLedger,
 	type TaskCategory,
 	type TaskComplexity,
 	type WorkerRunStatus,
@@ -732,11 +734,21 @@ export default function orchestrator(pi: ExtensionAPI) {
 		if (checkInIntervalMs <= 0 || runtime.checkInTimer !== undefined || runtime.generation !== generation) return;
 		const checkInTimer = setInterval(() => {
 			if (runtime.generation !== generation || isWorkerReportDeliveryHeld(runtime) || !runtime.api) return;
+			// Read the ledger at most once per tick, and only when a check is
+			// actually due, so idle ticks stay free of file IO.
+			let ledger: StatsLedger | undefined;
 			for (const worker of runtime.workers.values()) {
 				if (!isCheckInDue(worker, checkInIntervalMs)) continue;
 				const checkedAt = Date.now();
 				const assessment = assessWorkerCheckIn(worker, checkInIntervalMs, checkedAt);
-				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment);
+				const classification = { category: worker.category, complexity: worker.complexity };
+				try {
+					ledger ??= loadStats(undefined, workerNames(catalog));
+				} catch {
+					// A missing or unreadable ledger only costs the estimate.
+				}
+				const metrics = ledger ? rollingWorkerMetrics(ledger, worker.name, classification, checkedAt) : undefined;
+				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment, { classification, metrics });
 				try {
 					const wake = shouldWakeForCheckIn(worker, assessment);
 					if (assessment.status === "healthy") deliverCheckIn(runtime.api, digest, assessment);

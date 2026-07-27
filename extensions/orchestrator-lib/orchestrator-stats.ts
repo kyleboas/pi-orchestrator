@@ -274,7 +274,7 @@ export function recordWorkerSteer(name: string, kindOrLegacyPath: "correction" |
 	const path = kindOrLegacyPath === "correction" || kindOrLegacyPath === "continuation" ? configuredPath : kindOrLegacyPath;
 	const ledger = loadStats(path); const worker = ledger.workers[name] ?? emptyStats(); worker.steers++; if (kind === "correction") worker.correctionSteers++; else worker.continuationSteers++; ledger.workers[name] = worker; saveStats(ledger, path);
 }
-function formatDuration(ms: number): string { const seconds = Math.round(ms / 1_000); if (seconds < 60) return `${seconds}s`; const minutes = Math.floor(seconds / 60); const remainder = seconds % 60; return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`; }
+export function formatDuration(ms: number): string { const seconds = Math.round(ms / 1_000); if (seconds < 60) return `${seconds}s`; const minutes = Math.floor(seconds / 60); const remainder = seconds % 60; return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`; }
 function formatTokens(tokens: number): string { if (tokens < 1_000) return `${Math.round(tokens)}`; if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(1)}k`; return `${(tokens / 1_000_000).toFixed(1)}m`; }
 function formatUsd(cost: number): string { return `$${cost.toFixed(cost < 0.01 ? 4 : 2)}`; }
 function percentile(values: number[], p: number): number | undefined { if (!values.length) return undefined; const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)]; }
