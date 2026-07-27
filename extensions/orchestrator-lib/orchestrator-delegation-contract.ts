@@ -3,7 +3,7 @@ const INTERNAL_DELEGATION_CONTRACT_MARKER = "[INTERNAL ORCHESTRATOR DELEGATION C
 const CONTRACT_INSTRUCTIONS = `Worktree lifecycle contract:
 - Before creating or selecting a worktree, inspect \`git worktree list --porcelain\`.
 - Reuse only a clean, inactive, unlocked, unshared, certain, task-specific worktree from this same root-task lineage and branch. On continuation or correction of this same live root, reuse that owned worktree rather than creating another. Never reuse a completed worktree for a distinct task.
-- Otherwise create a fresh task-specific worktree.
+- Otherwise create a fresh task-specific worktree with \`/home/kyle/bin/wt-new <branch>\` run from inside the repository. Never place a worktree under \`/tmp\`: it is a different filesystem from \`/home/kyle/code\`, so \`node_modules\` cannot be hardlink-seeded and every worktree pays a full dependency install. Only install dependencies yourself when wt-new reports that it could not seed them.
 - Before a successful final report, preserve useful work on the task branch or in a commit, verify the worktree is clean, remove the owned worktree with \`git worktree remove <exact-path>\` without force, and run \`git worktree prune\`.
 - Never use \`rm -rf\`, delete branch refs, or remove a dirty, shared, locked, uncertain, or user-owned worktree. If cleanup is blocked, report the exact path and blocker.
 
