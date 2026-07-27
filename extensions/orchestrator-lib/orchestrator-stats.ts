@@ -279,6 +279,8 @@ function formatTokens(tokens: number): string { if (tokens < 1_000) return `${Ma
 function formatUsd(cost: number): string { return `$${cost.toFixed(cost < 0.01 ? 4 : 2)}`; }
 function percentile(values: number[], p: number): number | undefined { if (!values.length) return undefined; const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)]; }
 
+/** Minimum matching seven-day runs before percentiles are quoted as evidence. */
+export const ESTIMATE_MIN_SAMPLES = 3;
 export type RollingWorkerMetrics = { samples: number; p50DurationMs?: number; p95DurationMs?: number; p50ReportedCostUsd?: number; p95ReportedCostUsd?: number; p50EstimatedCostUsd?: number; p95EstimatedCostUsd?: number; statuses: Partial<Record<WorkerRunStatus, number>>; accepted: number; rework: number };
 export function rollingWorkerMetrics(ledger: StatsLedger, worker: string, classification?: TaskClassification, now = Date.now()): RollingWorkerMetrics {
 	const since = now - 7 * 24 * 60 * 60 * 1_000;
@@ -300,7 +302,7 @@ export function statsSummary(ledger: StatsLedger, catalogNames: readonly string[
 		return `- ${name}: ${parts.join(", ")}`;
 	});
 	if (!classification) return lines.length ? lines.join("\n") : undefined;
-	const evidence = catalogNames.map((name) => [name, rollingWorkerMetrics(ledger, name, classification)] as const).filter(([, metrics]) => metrics.samples >= 3).slice(0, 5).map(([name, metrics]) => {
+	const evidence = catalogNames.map((name) => [name, rollingWorkerMetrics(ledger, name, classification)] as const).filter(([, metrics]) => metrics.samples >= ESTIMATE_MIN_SAMPLES).slice(0, 5).map(([name, metrics]) => {
 		const parts = [`${metrics.samples} recent`, `${metrics.accepted} accepted`, `${metrics.rework} rework`, `p50/p95 ${formatDuration(metrics.p50DurationMs ?? 0)}/${formatDuration(metrics.p95DurationMs ?? 0)}`];
 		if (metrics.p50ReportedCostUsd !== undefined) parts.push(`reported p50 ${formatUsd(metrics.p50ReportedCostUsd)}`);
 		if (metrics.p50EstimatedCostUsd !== undefined) parts.push(`estimated/notional p50 ${formatUsd(metrics.p50EstimatedCostUsd)}`);

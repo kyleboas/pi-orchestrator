@@ -1,4 +1,4 @@
-import { formatDuration, type RollingWorkerMetrics, type TaskClassification } from "./orchestrator-stats.ts";
+import { ESTIMATE_MIN_SAMPLES, formatDuration, type RollingWorkerMetrics, type TaskClassification } from "./orchestrator-stats.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 
 /** Base interval for passive worker assessment; healthy workers extend to 2x. */
@@ -20,9 +20,6 @@ export type CheckInWorkerView = {
 	pendingBackgroundJobIds?: ReadonlySet<string>;
 };
 
-/** Minimum matching runs before percentiles are quoted, matching routing advice. */
-export const CHECKIN_PACE_MIN_SAMPLES = 3;
-
 /**
  * A completion estimate built only from the outcome ledger, never from the
  * worker: asking a running worker where it stands would mean an RPC round trip,
@@ -32,7 +29,7 @@ export function buildPaceLine(elapsedMs: number, classification?: TaskClassifica
 	const elapsed = `running ${formatDuration(Math.max(0, elapsedMs))}`;
 	const p50 = metrics?.p50DurationMs;
 	const p95 = metrics?.p95DurationMs;
-	if (!classification || !metrics || metrics.samples < CHECKIN_PACE_MIN_SAMPLES || p50 === undefined || p95 === undefined) {
+	if (!classification || !metrics || metrics.samples < ESTIMATE_MIN_SAMPLES || p50 === undefined || p95 === undefined) {
 		return `Pace: ${elapsed}; too few comparable recent runs to estimate completion.`;
 	}
 	const reference = `comparable 7d ${classification.category}/${classification.complexity} runs finish at p50 ${formatDuration(p50)}, p95 ${formatDuration(p95)} over ${metrics.samples} samples`;

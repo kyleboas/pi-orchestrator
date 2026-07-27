@@ -12,6 +12,8 @@ export type WorkerPanelItem = {
 	settledAt?: Date;
 	tokens?: number;
 	transcript?: readonly TranscriptEntry[];
+	/** Ledger p50 for this worker's task class, fixed when the run starts. */
+	estimateMs?: number;
 };
 
 /** Low-frequency local redraw: enough for elapsed time without wasting VPS CPU. */
@@ -107,8 +109,26 @@ function glyphFor(state: WorkerPanelState): string {
 	}
 }
 
-function statusFor(worker: WorkerPanelItem, now: number): string {
+/**
+ * Elapsed against the estimate, as `23m 14s / ~20m`. Both sides measure the
+ * same thing — time since the last instruction — because the ledger records
+ * run durations from that same anchor, so an overrun reads honestly.
+ */
+function durationFor(worker: WorkerPanelItem, now: number): string {
 	const duration = elapsed(worker, now);
+	const estimate = worker.estimateMs;
+	if (estimate === undefined || !Number.isFinite(estimate) || estimate <= 0) return duration;
+	if (worker.state !== "starting" && worker.state !== "working") return duration;
+	return `${duration} / ~${formatEstimate(estimate)}`;
+}
+
+function formatEstimate(ms: number): string {
+	const seconds = Math.round(ms / 1_000);
+	return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+}
+
+function statusFor(worker: WorkerPanelItem, now: number): string {
+	const duration = durationFor(worker, now);
 	if (worker.state === "failed") return `${duration} · failed`;
 	if (worker.state === "stopped") return `${duration} · stopped`;
 	if (worker.tokens !== undefined && worker.tokens > 0) {

@@ -105,6 +105,7 @@ import {
 	isOutcomeRolloverEligible,
 } from "./orchestrator-lib/orchestrator-rollover.ts";
 import {
+	ESTIMATE_MIN_SAMPLES,
 	TASK_CATEGORIES,
 	TASK_COMPLEXITIES,
 	acceptReviewedRuns,
@@ -231,6 +232,23 @@ function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 		worker.healthStreak = 0;
 		worker.runTokensBase = worker.tokens ?? 0;
 		worker.runCostBase = worker.costUsd ?? 0;
+		worker.estimateMs = runDurationEstimateMs(worker);
+	}
+}
+
+/**
+ * The footer row's `/ ~20m` reference, resolved once per run because the row
+ * repaints every couple of seconds and must never read the ledger per frame.
+ * It is the p50 for this worker's own task class, or absent when the class has
+ * too few recent runs to say anything.
+ */
+function runDurationEstimateMs(worker: Worker): number | undefined {
+	try {
+		const metrics = rollingWorkerMetrics(loadStats(), worker.name, { category: worker.category, complexity: worker.complexity });
+		return metrics.samples >= ESTIMATE_MIN_SAMPLES ? metrics.p50DurationMs : undefined;
+	} catch {
+		// An unreadable ledger only costs the estimate, never the delegation.
+		return undefined;
 	}
 }
 
