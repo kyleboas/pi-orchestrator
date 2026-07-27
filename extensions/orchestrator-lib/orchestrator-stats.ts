@@ -274,11 +274,13 @@ export function recordWorkerSteer(name: string, kindOrLegacyPath: "correction" |
 	const path = kindOrLegacyPath === "correction" || kindOrLegacyPath === "continuation" ? configuredPath : kindOrLegacyPath;
 	const ledger = loadStats(path); const worker = ledger.workers[name] ?? emptyStats(); worker.steers++; if (kind === "correction") worker.correctionSteers++; else worker.continuationSteers++; ledger.workers[name] = worker; saveStats(ledger, path);
 }
-function formatDuration(ms: number): string { const seconds = Math.round(ms / 1_000); if (seconds < 60) return `${seconds}s`; const minutes = Math.floor(seconds / 60); const remainder = seconds % 60; return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`; }
+export function formatDuration(ms: number): string { const seconds = Math.round(ms / 1_000); if (seconds < 60) return `${seconds}s`; const minutes = Math.floor(seconds / 60); const remainder = seconds % 60; return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`; }
 function formatTokens(tokens: number): string { if (tokens < 1_000) return `${Math.round(tokens)}`; if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(1)}k`; return `${(tokens / 1_000_000).toFixed(1)}m`; }
 function formatUsd(cost: number): string { return `$${cost.toFixed(cost < 0.01 ? 4 : 2)}`; }
 function percentile(values: number[], p: number): number | undefined { if (!values.length) return undefined; const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)]; }
 
+/** Minimum matching seven-day runs before percentiles are quoted as evidence. */
+export const ESTIMATE_MIN_SAMPLES = 3;
 export type RollingWorkerMetrics = { samples: number; p50DurationMs?: number; p95DurationMs?: number; p50ReportedCostUsd?: number; p95ReportedCostUsd?: number; p50EstimatedCostUsd?: number; p95EstimatedCostUsd?: number; statuses: Partial<Record<WorkerRunStatus, number>>; accepted: number; rework: number };
 export function rollingWorkerMetrics(ledger: StatsLedger, worker: string, classification?: TaskClassification, now = Date.now()): RollingWorkerMetrics {
 	const since = now - 7 * 24 * 60 * 60 * 1_000;
@@ -288,6 +290,35 @@ export function rollingWorkerMetrics(ledger: StatsLedger, worker: string, classi
 	const costs = (kind: "reported" | "estimated") => runs.filter((run) => run.costKind === kind && run.costUsd !== undefined).map((run) => run.costUsd!);
 	const reported = costs("reported"); const estimated = costs("estimated"); const durations = runs.map((run) => run.durationMs);
 	return { samples: runs.length, ...(percentile(durations, .5) === undefined ? {} : { p50DurationMs: percentile(durations, .5), p95DurationMs: percentile(durations, .95) }), ...(percentile(reported, .5) === undefined ? {} : { p50ReportedCostUsd: percentile(reported, .5), p95ReportedCostUsd: percentile(reported, .95) }), ...(percentile(estimated, .5) === undefined ? {} : { p50EstimatedCostUsd: percentile(estimated, .5), p95EstimatedCostUsd: percentile(estimated, .95) }), statuses, accepted: statuses.accepted ?? 0, rework: statuses.rework ?? 0 };
+}
+
+/** Which reference class a duration estimate could actually be drawn from. */
+export type DurationEstimateBasis = "class" | "complexity" | "worker";
+export type DurationEstimate = { basis: DurationEstimateBasis; label: string; samples: number; p50DurationMs: number; p95DurationMs: number };
+
+/**
+ * Widen the reference class until it holds enough runs to say something. The
+ * exact category/complexity bucket is the most informative but the thinnest,
+ * so a worker's rarer task shapes would otherwise never get an estimate at
+ * all. Callers should disclose a widened basis rather than pass it off as an
+ * exact match.
+ */
+export function workerDurationEstimate(ledger: StatsLedger, worker: string, classification: TaskClassification, now = Date.now()): DurationEstimate | undefined {
+	const since = now - 7 * 24 * 60 * 60 * 1_000;
+	const recent = ledger.recentRuns.filter((run) => run.worker === worker && Date.parse(run.timestamp) >= since);
+	const ladder: { basis: DurationEstimateBasis; label: string; runs: RecentRun[] }[] = [
+		{ basis: "class", label: `${classification.category}/${classification.complexity}`, runs: recent.filter((run) => run.category === classification.category && run.complexity === classification.complexity) },
+		{ basis: "complexity", label: `${classification.complexity} complexity, any category`, runs: recent.filter((run) => run.complexity === classification.complexity) },
+		{ basis: "worker", label: "all recent runs", runs: recent },
+	];
+	for (const { basis, label, runs } of ladder) {
+		if (runs.length < ESTIMATE_MIN_SAMPLES) continue;
+		const durations = runs.map((run) => run.durationMs);
+		const p50 = percentile(durations, .5); const p95 = percentile(durations, .95);
+		if (p50 === undefined || p95 === undefined) continue;
+		return { basis, label, samples: runs.length, p50DurationMs: p50, p95DurationMs: p95 };
+	}
+	return undefined;
 }
 
 /** Bounded routing context: lifetime overview plus task-specific seven-day evidence. */
@@ -300,7 +331,7 @@ export function statsSummary(ledger: StatsLedger, catalogNames: readonly string[
 		return `- ${name}: ${parts.join(", ")}`;
 	});
 	if (!classification) return lines.length ? lines.join("\n") : undefined;
-	const evidence = catalogNames.map((name) => [name, rollingWorkerMetrics(ledger, name, classification)] as const).filter(([, metrics]) => metrics.samples >= 3).slice(0, 5).map(([name, metrics]) => {
+	const evidence = catalogNames.map((name) => [name, rollingWorkerMetrics(ledger, name, classification)] as const).filter(([, metrics]) => metrics.samples >= ESTIMATE_MIN_SAMPLES).slice(0, 5).map(([name, metrics]) => {
 		const parts = [`${metrics.samples} recent`, `${metrics.accepted} accepted`, `${metrics.rework} rework`, `p50/p95 ${formatDuration(metrics.p50DurationMs ?? 0)}/${formatDuration(metrics.p95DurationMs ?? 0)}`];
 		if (metrics.p50ReportedCostUsd !== undefined) parts.push(`reported p50 ${formatUsd(metrics.p50ReportedCostUsd)}`);
 		if (metrics.p50EstimatedCostUsd !== undefined) parts.push(`estimated/notional p50 ${formatUsd(metrics.p50EstimatedCostUsd)}`);

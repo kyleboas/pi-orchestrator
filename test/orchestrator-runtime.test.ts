@@ -3,6 +3,7 @@ import { execSync } from "node:child_process";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { shouldReapHeadlessSession } from "../extensions/orchestrator.ts";
+
 import { workerStatusSnapshot, workerStatusWidgetLines } from "../extensions/orchestrator-lib/orchestrator-worker-status.ts";
 import { shouldAutoStopReportedWorker } from "../extensions/orchestrator-lib/worker-lifecycle.ts";
 import {

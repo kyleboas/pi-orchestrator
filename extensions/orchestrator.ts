@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Type } from "typebox";
 import {
@@ -12,12 +11,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	SolToolMode,
+	buildWorkerPrompt,
 	catalogText,
 	workerDescription,
 	workerNames,
 	piRpcWorkerArgs,
-	DELEGATION_EFFORTS,
-	type DelegationEffort,
 	type ClaudeCodeWorkerProfile,
 	type WorkerCatalog,
 	type WorkerProfile,
@@ -32,19 +30,8 @@ import {
 	parseClaudeStreamLine,
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
-import { pinPullRequestTargetSync, startPullRequestBroker, type PullRequestBroker } from "./orchestrator-lib/orchestrator-pr-broker.ts";
-import {
-	cleanupWorkerHomeDir,
-	createWorkerHomeDir,
-	piWorkerSandboxPlan,
-	resolveWorkerCommand,
-	resolveWorkerLaunch,
-	resolveWorkerWorkspace,
-	sandboxConfigForWorker,
-	workerHomeDirPath,
-	type WorkerLaunchRequest,
-} from "./orchestrator-lib/orchestrator-sandbox.ts";
-import { claudeGatewayEnv, effectiveWorkerModel, gatewayPiModel, startGatewayRelay, writeGatewayPiModels } from "./orchestrator-lib/orchestrator-gateway.ts";
+import { buildCoordinatorInstructions } from "./orchestrator-lib/orchestrator-instructions.ts";
+import { withOrchestratorDelegationContract } from "./orchestrator-lib/orchestrator-delegation-contract.ts";
 import {
 	earliestAccountReset,
 	isUsageLimitText,
@@ -58,21 +45,34 @@ import {
 	canSteerWorker,
 	completeClaudeTurn,
 	finishWorkerSettlement,
+	markWorkerRunActive,
 	queueClaudeTurn,
 	selectFinalWorkerText,
+	shouldAbortPiWorkerRun,
 	shouldAutoStopReportedWorker,
+	shouldHoldWorkerSettlement,
 } from "./orchestrator-lib/worker-lifecycle.ts";
+import {
+	clearBackgroundJobs,
+	parseBackgroundJobMarkers,
+	trackBackgroundJobEvent,
+} from "./orchestrator-lib/background-job.ts";
 import {
 	bindOrchestratorApi,
 	bindOrchestratorSession,
 	deliverWorkerReport,
 	ensureOrchestratorExitHook,
 	getOrchestratorRuntime,
+	holdWorkerReportDelivery,
+	isWorkerReportDeliveryHeld,
 	isWorkerProcessLive,
 	killWorkerProcessTree,
 	notifyOrchestratorStateChange,
 	nextWorkerStatusRevision,
 	releaseOrchestratorSession,
+	releaseWorkerReportDelivery,
+	scheduleIdleWorkerReportRecovery,
+	scheduleWorkerReportDelivery,
 	stopWorkerProcess,
 	type OrchestratorWorker as Worker,
 } from "./orchestrator-lib/orchestrator-runtime.ts";
@@ -84,6 +84,7 @@ import {
 	panelWorkers,
 	renderWorkerFooterRows,
 	renderWorkerPanel,
+	workerSessionTitle,
 	WORKER_WIDGET_TICK_MS,
 	type WorkerPanelOptions,
 } from "./orchestrator-lib/orchestrator-ui.ts";
@@ -114,16 +115,21 @@ import {
 	recordWorkerOutcome,
 	recordWorkerSteer,
 	statsSummary,
+	workerDurationEstimate,
 	updateWorkerRunStatus,
+	type StatsLedger,
 	type TaskCategory,
 	type TaskComplexity,
 	type WorkerRunStatus,
 } from "./orchestrator-lib/orchestrator-stats.ts";
 import {
+	anchorScrollUp,
 	isDownKey,
+	isEndKey,
 	isEnterKey,
 	isEscapeKey,
 	isPageDownKey,
+	isHomeKey,
 	isPageUpKey,
 	isUpKey,
 	moveSelection,
@@ -138,36 +144,16 @@ export function shouldReapHeadlessSession(): boolean {
 	return process.env.MI_COORDINATOR_MODE !== "1";
 }
 
+// One correction steer is allowed for a failed attempt. A separate retry uses
+// a new worker and its retryOf lineage, so it gets its own correction budget.
+const correctionSteerCounts = new Map<string, number>();
+
 export function createWorkerSchema(catalog: WorkerCatalog) {
 	return Type.Union(workerNames(catalog).map((name) => Type.Literal(name, { description: workerDescription(name, catalog[name]!) })));
 }
 
-export const DELEGATED_WORKER_PR_RULE = "Delegated workers must never merge, close, or otherwise finalize a pull request. Only the coordinator may merge, and only after the user explicitly authorizes the merge.";
-
 export function coordinatorInstructions(catalog: WorkerCatalog, statsText?: string): string {
-	const names = catalogText(catalog);
-	const stats = statsText
-		? `\n\nPast worker outcomes (all sessions, averages per task):\n${statsText}\nWeigh this record alongside the worker descriptions: prefer the cheapest tier whose track record fits the task, and escalate a tier when a cheaper one has been failing or needing repeated steers on similar work.\n`
-		: "";
-	return `You are the orchestration lead. You investigate, think, and plan yourself, then hand implementation to workers; you never mutate anything.
-
-Before delegating, use your read-only tools to inspect the relevant files, locate the root cause, and decide the approach. Then delegate with orchestrator_delegate, choosing one of: ${names}. Give a precise implementation brief: files to change, the change and why, edge cases, and validation. Workers implement your plan — do not send them off to investigate what you could determine yourself. Configured names are intentional: natural requests such as ${workerNames(catalog).map((name) => `“ask ${name}”`).join(", ")} select that worker and always win.
-
-For every unqualified new task, start with Luna unless the scope you already inspected demonstrably requires Sol or Terra. Escalate only when substantial complexity is known up front or Luna's cheaper attempt cannot complete the task. Each distinct new task gets a new delegate; orchestrator_steer is only for continuation or correction of the same task, never as a substitute for a new delegation. For a separately delegated retry of prior work, pass retryOf with that prior root task ID so its lineage is joined; otherwise it is a new root.
-
-Worker tiers, cheapest first, with what each is for:
-${workerNames(catalog).map((name) => `- ${workerDescription(name, catalog[name]!)}`).join("\n")}
-Default to Luna for unqualified new work, then use the cheapest tier that the inspected scope demonstrably requires; escalate only when the task's difficulty is known or a cheaper attempt has not completed it.${stats}
-
-Workers are persistent: use orchestrator_steer for corrections or follow-up instructions. Completed worker results arrive as follow-up messages; review them and steer or delegate fixes. Mark each steer kind: correction means the reported attempt needs rework; continuation means its result is accepted and work continues on the same root task. When a working Pi worker is actively doing the wrong thing (wrong file, wrong approach, unsafe action), steer with interrupt: true to abort its in-flight run before your correction lands rather than letting the wrong work finish. Do not use /end or request an end-of-task summary.
-
-Never steer a worker just to ask how it is doing: status-report steers interrupt the work and waste its context. Healthy passive checks are silently retained for your next real turn and need no acknowledgement. Only suspicious passive checks wake you; review their concrete signals and steer only to correct actual drift.
-
-Workers run concurrently, and parallel delegation is your default: before delegating, always decompose the task into independent workstreams (different files or subsystems with no ordering dependency). Two or more independent workstreams MUST each go to a different worker in the same assistant turn — emit the orchestrator_delegate calls together; never delegate one piece, wait for its result, then delegate the next when they were independent all along. Give each worker a disjoint set of files to change so they never edit the same file. Keep it to two or three concurrent workers, and sequence genuinely dependent work through steering instead. This applies regardless of how earlier tasks in this session were delegated.
-
-Write progress updates and reviews as plain sentences that lead with the content itself. Never open with a label prefix such as "Checkpoint:", "Update:", "Status:", or similar.
-
-Workers may use the restricted PR broker only when the user explicitly requested a PR create/update. Never delegate a merge: merge only after an explicit user request, normally by taking over the task yourself.\n\nIf the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request.`;
+	return buildCoordinatorInstructions(catalog, statsText);
 }
 
 function workerWidgetLines(now = Date.now(), width = 80, options: WorkerPanelOptions = {}): string[] | undefined {
@@ -176,10 +162,10 @@ function workerWidgetLines(now = Date.now(), width = 80, options: WorkerPanelOpt
 
 
 const TAKEOVER_SYSTEM_INSTRUCTIONS = (reason: string) => `
-The user explicitly requested a one-task Sol takeover (${reason}). Implement
-this task yourself using the available normal implementation tools. Do not
-delegate or use orchestrator worker controls. Complete the work and validation
-directly; orchestration resumes after this task settles.`.trim();
+Sol takeover is active for one task (${reason}). Implement this task yourself
+using the available normal implementation tools. Do not delegate or use
+orchestrator worker controls. Complete the work and validation directly;
+orchestration resumes after this task settles.`.trim();
 
 function workerSummary(worker: Worker): string {
 	const age = Math.max(0, Math.floor((Date.now() - worker.startedAt.getTime()) / 1000));
@@ -206,6 +192,36 @@ function getText(message: unknown): string | undefined {
 	return text || undefined;
 }
 
+/** Text from any RPC message role, used only for strict extension protocol markers. */
+function rpcMessageText(message: unknown): string {
+	if (!message || typeof message !== "object") return "";
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type?: unknown; text?: unknown } => !!part && typeof part === "object")
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text as string)
+		.join("\n");
+}
+
+function recordBackgroundJobEvents(worker: Worker, message: unknown): void {
+	const role = message && typeof message === "object" ? (message as { role?: unknown }).role : undefined;
+	for (const event of parseBackgroundJobMarkers(rpcMessageText(message))) {
+		// Start markers can only come from a tool result; completion markers can
+		// only come from the extension's follow-up user message. This avoids using
+		// an assistant's ordinary prose as lifecycle control data.
+		if ((event.kind === "started" && role !== "toolResult") || (event.kind === "completed" && role !== "user")) continue;
+		const change = trackBackgroundJobEvent(worker, event);
+		if (change === "started" && event.kind === "started") {
+			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Background job ${event.name} (${event.jobId}) started; waiting for its completion.` });
+		} else if (change === "completed" && event.kind === "completed") {
+			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Background job ${event.jobId} finished with exit status ${event.exitCode ?? "none"}${event.signal ? ` (${event.signal})` : ""}; completion follow-up received.` });
+		} else if (change === "already-completed") {
+			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Background job ${event.jobId} finished before its start marker was received.` });
+		}
+	}
+}
 
 function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 	mergeTranscriptEntry(worker.transcript ??= [], entry);
@@ -218,6 +234,23 @@ function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
 		worker.healthStreak = 0;
 		worker.runTokensBase = worker.tokens ?? 0;
 		worker.runCostBase = worker.costUsd ?? 0;
+		applyRunEstimate(worker);
+	}
+}
+
+/**
+ * The footer row's `~20m` reference, resolved once per run because the row
+ * repaints every couple of seconds and must never read the ledger per frame.
+ */
+function applyRunEstimate(worker: Worker): void {
+	try {
+		const estimate = workerDurationEstimate(loadStats(), worker.name, { category: worker.category, complexity: worker.complexity });
+		worker.estimateMs = estimate?.p50DurationMs;
+		worker.estimateWidened = estimate ? estimate.basis !== "class" : undefined;
+	} catch {
+		// An unreadable ledger only costs the estimate, never the delegation.
+		worker.estimateMs = undefined;
+		worker.estimateWidened = undefined;
 	}
 }
 
@@ -244,6 +277,8 @@ function recordRunOutcome(worker: Worker, status: WorkerRunStatus): void {
 
 function failWorker(worker: Worker, message: string, status: WorkerRunStatus = "failed"): void {
 	if (worker.state === "stopped" || worker.state === "failed") return;
+	clearBackgroundJobs(worker);
+	worker.backgroundSettlementHeldRun = undefined;
 	worker.state = "failed";
 	worker.settledAt ??= new Date();
 	worker.lastError = message;
@@ -417,6 +452,7 @@ function handleRpcLine(worker: Worker, line: string): void {
 	}
 
 	for (const entry of transcriptFromRpcEvent(event)) recordWorkerActivity(worker, entry);
+	if (event.type === "message_end") recordBackgroundJobEvents(worker, event.message);
 
 	if (event.type === "response" && typeof event.id === "string") {
 		const pending = worker.rpcPending.get(event.id);
@@ -430,7 +466,9 @@ function handleRpcLine(worker: Worker, line: string): void {
 
 	switch (event.type) {
 		case "agent_start":
-			if (worker.state !== "stopped" && worker.state !== "failed") worker.state = "working";
+			// A background completion follow-up resumes this same generation. It is
+			// no longer a held idle boundary, so a later real interrupt may abort it.
+			markWorkerRunActive(worker);
 			break;
 		case "message_end":
 		case "turn_end": {
@@ -447,6 +485,17 @@ function handleRpcLine(worker: Worker, line: string): void {
 			break;
 		}
 		case "agent_settled":
+			// An initial completion is deliberately held while a worker-owned
+			// background job is still in its process tree. Its completion extension
+			// follow-up starts the final callback-driven run; only that later settled
+			// boundary may report this worker to the coordinator.
+			if (shouldHoldWorkerSettlement(worker)) {
+				if (worker.backgroundSettlementHeldRun !== worker.run) {
+					worker.backgroundSettlementHeldRun = worker.run;
+					recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Waiting for ${worker.pendingBackgroundJobIds!.size} background job${worker.pendingBackgroundJobIds!.size === 1 ? "" : "s"} before reporting this run.` });
+				}
+				break;
+			}
 			// An interrupt steer aborted this exact run: swallow its settlement so
 			// the partial result is neither reported nor allowed to settle the
 			// follow-up generation. Keyed by run number, so a stale flag from an
@@ -497,140 +546,55 @@ function drainClaudeWorkerOutput(worker: Worker, config: OrchestratorConfig): vo
 	handleClaudeEvents(worker, parsed.events, config);
 }
 
-/** A sandbox-policy rejection: the worker process was never spawned. */
-class WorkerLaunchRejected extends Error {}
-
-export function brokerSafeWorkerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/**
+ * Workers inherit the coordinator's environment minus every GitHub, SSH, and
+ * Git credential vector. Model-provider auth is preserved exactly. This is not
+ * containment — a worker still reads ~/.config/gh and ~/.ssh from disk — it
+ * only keeps ambient tokens out of a delegated process that never needs them.
+ */
+export function workerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const safe: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(env)) {
-		// Preserve model-provider auth exactly while removing every inherited
-		// worker-side GitHub, SSH, and Git credential/command/path vector.
 		if (["GH_", "GITHUB_", "SSH_", "GIT_"].some((prefix) => key.startsWith(prefix))) continue;
 		safe[key] = value;
 	}
 	return safe;
 }
 
-type SpawnedWorkerChild = {
-	child: Worker["process"];
-	sandboxed: boolean;
-	warning?: string;
-	prBroker?: PullRequestBroker;
-};
-
 /**
  * Single spawn path for every worker process (initial Pi RPC, initial Claude,
- * and Claude failover respawns) so sandbox policy cannot be bypassed by one
- * call site. Throws WorkerLaunchRejected when the policy fails closed.
+ * and Claude failover respawns). Workers run on the host in the coordinator's
+ * repository; each becomes its own process group so a stop, a failover, or
+ * coordinator exit can signal the whole tree and no grandchild survives as an
+ * orphan.
  */
 function spawnWorkerChild(
-	workerKey: string,
 	command: string,
 	args: string[],
 	cwd: string,
 	envOverrides: Record<string, string>,
-	config: OrchestratorConfig,
 	hostEnv: NodeJS.ProcessEnv,
-	paths: Pick<WorkerLaunchRequest, "sandboxEnvOverrides" | "readOnlyTryPaths" | "fileMountsReadOnlyTry" | "fileMountsReadOnly" | "readWritePaths"> & { gatewayPiModel?: string } = {},
-	sandboxOptOut = false,
-): SpawnedWorkerChild {
-	// A gateway network exists precisely so no worker launch can carry host
-	// credentials; a per-worker opt-out must be rejected loudly, never honored
-	// silently as either a host launch or an unexpected sandboxed one.
-	if (sandboxOptOut && config.sandbox.network === "gateway") {
-		throw new WorkerLaunchRejected('This worker opts out of the sandbox ("sandbox": "off"), but network "gateway" never permits a credential-bearing host launch; remove the worker\'s opt-out or use a host/none sandbox network');
-	}
-	const sandbox = sandboxConfigForWorker(config.sandbox, sandboxOptOut);
-	const homeDir = workerHomeDirPath(workerKey);
-	let relay: ReturnType<typeof startGatewayRelay> | undefined;
-	if (sandbox.network === "gateway") {
-		if (!sandbox.gateway) throw new WorkerLaunchRejected("Gateway configuration is unavailable.");
-		createWorkerHomeDir(homeDir);
-		try {
-			if (paths.gatewayPiModel) writeGatewayPiModels(homeDir, paths.gatewayPiModel);
-			relay = startGatewayRelay(workerKey, sandbox.gateway, undefined, sandbox.command);
-		}
-		catch { cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected("Gateway relay failed its readiness check."); }
-	}
-	const node = relay ? resolveWorkerCommand(relay.nodePath, process.env) : undefined;
-	const request = { command, args, cwd, envOverrides, homeDir, ...paths,
-		...(relay && node ? { gateway: { relayDirectory: relay.directory, nodePath: relay.nodePath, nodeRoot: node.readOnlyRoots[0]!, bootstrapPath: relay.bootstrapPath, entrypointPath: relay.entrypointPath } } : {}),
-	};
-	// Broker env stripping exists to make /pr the only PR path for sandboxed
-	// workers. An explicit host worker never receives a broker, and it can read
-	// every credential file on the host anyway, so stripping would only break
-	// its Git/SSH tooling without containing anything.
-	const workerEnv = config.pullRequests && !sandboxOptOut ? brokerSafeWorkerEnv(hostEnv) : hostEnv;
-	let launch = resolveWorkerLaunch(sandbox, request, workerEnv);
-	if (!launch.ok) { if (relay) void relay.cleanup().catch(() => {}); cleanupWorkerHomeDir(homeDir); throw new WorkerLaunchRejected(launch.error); }
-	// The broker is intentionally unavailable to direct/legacy workers: only a
-	// sandbox can expose its fixed /pr mount without exposing host credentials.
-	let prBroker: PullRequestBroker | undefined;
-	if (launch.sandboxed && config.pullRequests) {
-		const target = pinPullRequestTargetSync(cwd, config.pullRequests);
-		if (target) {
-			try {
-				prBroker = startPullRequestBroker(target, config.pullRequests);
-				// Add only /pr. Existing narrow Pi/Claude provider-auth/config mounts
-				// are required for model access and remain exactly as configured.
-				const brokerLaunch = resolveWorkerLaunch(sandbox, { ...request, prBrokerDirectory: prBroker.directory }, workerEnv);
-				if (brokerLaunch.ok) launch = brokerLaunch;
-				else { void prBroker.cleanup(); prBroker = undefined; }
-			} catch {
-				// A broker setup failure removes authority rather than preventing a
-				// normal delegation to an unlisted/unavailable repository.
-				if (prBroker) void prBroker.cleanup(); prBroker = undefined;
-			}
-		}
-	}
-	if (launch.sandboxed) createWorkerHomeDir(homeDir);
-	let child: Worker["process"];
-	try {
-		// Unsandboxed workers become their own process group so a stop can
-		// signal the whole tree; sandboxed trees already die with bwrap.
-		child = spawn(launch.spec.command, launch.spec.args, { cwd, env: launch.spec.env, stdio: ["pipe", "pipe", "pipe"] as const, detached: !launch.sandboxed });
-	} catch (error) {
-		if (relay) void relay.cleanup().catch(() => {});
-		if (prBroker) void prBroker.cleanup();
-		if (launch.sandboxed) cleanupWorkerHomeDir(homeDir);
-		throw error;
-	}
-	if (launch.sandboxed) {
-		const clean = () => { if (relay) void relay.cleanup().catch(() => {}); if (prBroker) void prBroker.cleanup(); cleanupWorkerHomeDir(homeDir); };
-		child.once("exit", clean);
-		child.once("error", clean);
-	}
-	return { child, sandboxed: launch.sandboxed, ...(launch.warning ? { warning: launch.warning } : {}), ...(prBroker ? { prBroker } : {}) };
+): Worker["process"] {
+	return spawn(command, args, {
+		cwd,
+		env: { ...workerEnv(hostEnv), ...envOverrides },
+		stdio: ["pipe", "pipe", "pipe"] as const,
+		detached: true,
+	});
 }
 
-function spawnClaudeChild(profile: ClaudeCodeWorkerProfile, cwd: string, config: OrchestratorConfig, workerKey: string, accountDir?: string, resumeSessionId?: string, effort?: DelegationEffort): SpawnedWorkerChild {
+function spawnClaudeChild(profile: ClaudeCodeWorkerProfile, cwd: string, config: OrchestratorConfig, accountDir?: string, resumeSessionId?: string): Worker["process"] {
 	// An inherited CLAUDE_CONFIG_DIR (e.g. pi launched from a shell that set
 	// one) must not pin every worker to a single account: account choice
 	// belongs to the orchestrator's rotation, or to the launcher's own.
 	const hostEnv: NodeJS.ProcessEnv = { ...process.env };
 	delete hostEnv.CLAUDE_CONFIG_DIR;
-	// A sandboxed worker's isolated HOME has no ~/.claude, so the selected
-	// account directory (or the host default when no rotation is configured) is
-	// mounted and pinned explicitly — sandbox-only, so unsandboxed launches
-	// keep exact legacy behavior. That directory's credentials remain visible
-	// to that worker until a gateway-based auth relay replaces them.
-	const sandboxAccountDir = accountDir ?? resolve(homedir(), ".claude");
-	const gateway = config.sandbox.network === "gateway";
 	return spawnWorkerChild(
-		workerKey,
 		config.commands.claude,
-		[...claudeCodeArgs(effectiveWorkerModel(profile.model, config.sandbox.gateway), effort), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
+		[...claudeCodeArgs(profile.model, profile.thinking), ...(resumeSessionId ? ["--resume", resumeSessionId] : [])],
 		cwd,
-		gateway
-			? claudeGatewayEnv(resolve(workerHomeDirPath(workerKey), ".claude-gateway"))
-			: { PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
-		config,
+		{ PI_ORCHESTRATOR_WORKER: "1", ...(accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {}) },
 		hostEnv,
-		gateway ? {} : {
-			...(accountDir ? {} : { sandboxEnvOverrides: { CLAUDE_CONFIG_DIR: sandboxAccountDir } }),
-			readWritePaths: [sandboxAccountDir],
-		},
-		profile.sandbox === "off",
 	);
 }
 
@@ -685,7 +649,7 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
  */
 function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitText: string): boolean {
 	const accounts = config.claudeAccounts;
-	if (!accounts || worker.profile.backend !== "claude-code" || config.sandbox.network === "gateway") return false;
+	if (!accounts || worker.profile.backend !== "claude-code") return false;
 	if (worker.claudeAccount) {
 		markClaudeAccountLimited(accounts, worker.claudeAccount, parseUsageLimitReset(limitText));
 	}
@@ -693,18 +657,13 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	if (!pick) return false;
 	// killWorkerProcessTree tolerates an already-gone limited process.
 	killWorkerProcessTree(worker.process);
-	let spawned: SpawnedWorkerChild;
+	let child: Worker["process"];
 	try {
-		spawned = spawnClaudeChild(worker.profile, worker.cwd, config, worker.id, pick.configDir, worker.claudeSessionId, worker.effort);
+		child = spawnClaudeChild(worker.profile, worker.cwd, config, pick.configDir, worker.claudeSessionId);
 	} catch (error) {
-		if (error instanceof WorkerLaunchRejected) {
-			failWorker(worker, `Account failover was rejected: ${error.message}`, "unavailable");
-			return true; // Handled: the worker is already failed, no double-report.
-		}
-		throw error;
+		failWorker(worker, `Account failover could not start a replacement worker: ${error instanceof Error ? error.message : String(error)}`, "unavailable");
+		return true; // Handled: the worker is already failed, no double-report.
 	}
-	const child = spawned.child;
-	if (spawned.warning) recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
 	worker.process = child;
 	worker.buffer = "";
 	worker.pendingTurns = 0;
@@ -725,22 +684,16 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	return true;
 }
 
-function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }, effort?: DelegationEffort): Worker {
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
-	const account = profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" ? pickClaudeAccount(config.claudeAccounts) : undefined;
-	const gateway = config.sandbox.network === "gateway";
-	const spawned = profile.backend === "pi-rpc"
-		? spawnWorkerChild(id, config.commands.pi, piRpcWorkerArgs(gateway ? { ...profile, model: gatewayPiModel(effectiveWorkerModel(profile.model, config.sandbox.gateway)) } : profile, effort), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, config, process.env, {
-			...piWorkerSandboxPlan(workerHomeDirPath(id), homedir(), gateway),
-			...(gateway ? { gatewayPiModel: config.sandbox.gateway!.model } : {}),
-		}, profile.sandbox === "off")
-		: spawnClaudeChild(profile, cwd, config, id, account?.configDir, undefined, effort);
-	const child = spawned.child;
+	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
+	const child = profile.backend === "pi-rpc"
+		? spawnWorkerChild(config.commands.pi, piRpcWorkerArgs(profile), cwd, { PI_ORCHESTRATOR_WORKER: "1" }, process.env)
+		: spawnClaudeChild(profile, cwd, config, account?.configDir);
 	const worker: Worker = {
 		id,
 		name,
 		profile,
-		...(effort ? { effort } : {}),
 		task,
 		rootTaskId: lineage.rootTaskId,
 		runId: `${id}:run-1`,
@@ -761,27 +714,14 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 	wireWorkerChild(worker, child, config);
-	if (spawned.warning) {
-		worker.sandboxWarning = spawned.warning;
-		recordWorkerActivity(worker, { at: Date.now(), role: "system", text: spawned.warning });
-	}
-	if (profile.backend === "claude-code" && config.claudeAccounts && config.sandbox.network !== "gateway" && !account) {
+	if (profile.backend === "claude-code" && config.claudeAccounts && !account) {
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Every Claude account is in usage-limit cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
 		killWorkerProcessTree(child);
 		return worker;
 	}
 
-	const prInstructions = spawned.prBroker
-		? `\n\nA credential-free PR broker is available only for this delegated branch at /pr/pio-pr. Use it only when the task explicitly requests creating or updating a PR, after committing all work and ensuring the worktree (including untracked files) is clean: /pr/pio-pr status, then /pr/pio-pr publish "title" "body" (or /pr/pio-pr publish --base <configured-branch> "title" "body"). It can only publish this pinned branch and create/update its open PR against its default base or an explicitly configured base; do not seek GitHub, SSH, token, remote, merge, close, or review access.`
-		: "";
-	const prompt = `You are ${name}, an implementation worker. Work directly in ${cwd}.
-
-${DELEGATED_WORKER_PR_RULE}
-
-${task}${prInstructions}
-
-Inspect the repository, implement the task, and run the relevant validation. You own actual implementation: do not delegate and do not merely propose a patch. Keep your final response concise and include changed files, validation run, and any blocker. Write it as plain sentences leading with the content — never open with a label prefix such as "Checkpoint:" or "Status:". Sol receives your final response directly and may send follow-up instructions while you work.`;
+	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend });
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -793,7 +733,6 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const config = loadOrchestratorConfig();
 	const catalog = config.workers;
 	const catalogNames = catalogText(catalog);
-	const hostWorkerNames = workerNames(catalog).filter((name) => catalog[name]!.sandbox === "off");
 	const delegateWorkerSchema = createWorkerSchema(catalog);
 	// First recover the narrowly scoped stale-v2 overwrite mode, then normalize
 	// any remaining legacy shape. Both paths snapshot before writing.
@@ -814,12 +753,21 @@ export default function orchestrator(pi: ExtensionAPI) {
 	const startCheckInTimer = () => {
 		if (checkInIntervalMs <= 0 || runtime.checkInTimer !== undefined || runtime.generation !== generation) return;
 		const checkInTimer = setInterval(() => {
-			if (runtime.generation !== generation || runtime.reportsHeld || !runtime.api) return;
+			if (runtime.generation !== generation || isWorkerReportDeliveryHeld(runtime) || !runtime.api) return;
+			// Read the ledger at most once per tick, and only when a check is
+			// actually due, so idle ticks stay free of file IO.
+			let ledger: StatsLedger | undefined;
 			for (const worker of runtime.workers.values()) {
 				if (!isCheckInDue(worker, checkInIntervalMs)) continue;
 				const checkedAt = Date.now();
 				const assessment = assessWorkerCheckIn(worker, checkInIntervalMs, checkedAt);
-				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment);
+				try {
+					ledger ??= loadStats(undefined, workerNames(catalog));
+				} catch {
+					// A missing or unreadable ledger only costs the estimate.
+				}
+				const estimate = ledger ? workerDurationEstimate(ledger, worker.name, { category: worker.category, complexity: worker.complexity }, checkedAt) : undefined;
+				const digest = buildCheckInDigest(worker, checkInIntervalMs, checkedAt, assessment, estimate);
 				try {
 					const wake = shouldWakeForCheckIn(worker, assessment);
 					if (assessment.status === "healthy") deliverCheckIn(runtime.api, digest, assessment);
@@ -991,6 +939,11 @@ export default function orchestrator(pi: ExtensionAPI) {
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
 						let scrollUp = 0;
+						// Anchoring state: a scrolled viewport must keep showing the same
+						// lines when the worker appends new output below them.
+						let lastBodyLength = 0;
+						let lastWidth = 0;
+						let pageSize = 10;
 						let cachedKey = "";
 						let cachedBody: string[] = [];
 						// Live view: poll local state only, and only redraw when the
@@ -1063,17 +1016,26 @@ export default function orchestrator(pi: ExtensionAPI) {
 								const worker = runtime.workers.get(workerId);
 								if (!worker) return [theme.fg("dim", "Worker is gone.")];
 								const height = Math.max(12, process.stdout.rows ?? 30);
-								const title = `${worker.name} · ${worker.state} · ${worker.id}`;
+								const title = workerSessionTitle(worker.name, worker.state, worker.id);
 								// Workers launched before this version predate the transcript field.
-								const view = renderSessionScreen(title, buildBody(worker, width), width, height, scrollUp, theme);
+								const body = buildBody(worker, width);
+								// A resize rewraps every line, so its length change is not new output.
+								if (width !== lastWidth) { lastBodyLength = body.length; lastWidth = width; }
+								scrollUp = anchorScrollUp(scrollUp, lastBodyLength, body.length);
+								const view = renderSessionScreen(title, body, width, height, scrollUp, theme);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
+								lastBodyLength = view.bodyLength;
+								pageSize = Math.max(1, view.viewport - 1);
 								return view.lines;
 							},
 							handleInput: (data: string) => {
 								if (isUpKey(data)) scrollUp += 1;
 								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
-								else if (isPageUpKey(data)) scrollUp += 10;
-								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - 10);
+								else if (isPageUpKey(data)) scrollUp += pageSize;
+								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - pageSize);
+								// Home reaches the oldest captured output; end resumes following.
+								else if (isHomeKey(data)) scrollUp = Number.MAX_SAFE_INTEGER;
+								else if (isEndKey(data)) scrollUp = 0;
 								else if (isEscapeKey(data) || data === "q") {
 									done(undefined);
 									return;
@@ -1152,11 +1114,32 @@ export default function orchestrator(pi: ExtensionAPI) {
 		releaseOrchestratorSession(runtime, generation);
 	});
 
+	pi.on("agent_end", () => {
+		if (runtime.generation === generation) holdWorkerReportDelivery(runtime, "settling");
+	});
+
+	pi.on("session_before_compact", () => {
+		if (runtime.generation === generation) holdWorkerReportDelivery(runtime, "compaction");
+	});
+
+	pi.on("session_compact", () => {
+		// Pi emits this while its compaction call stack is still active. Releasing
+		// on the next macrotask prevents sendUserMessage() from entering that stack.
+		scheduleWorkerReportDelivery(runtime, generation, ["compaction"], flushDeferredWorkerReports);
+	});
+
 	pi.on("input", async (event, ctx) => {
 		// Worker-result follow-ups are extension messages, not a user asking Sol
-		// to take over. Only an explicit user/RPC request can enable this escape
-		// hatch, and agent_settled restores orchestration afterward.
+		// to take over. Explicit solo prompts and the inspected fast path use the
+		// same one-task escape hatch; agent_settled restores orchestration afterward.
 		if (event.source === "extension") return { action: "continue" };
+		// A cancelled/failed compaction may emit no session_compact (and an
+		// aborted turn may emit no settled event). Only idle real input proves Pi
+		// accepted a new safe boundary: streaming steer/follow-up input must retain
+		// the settlement guard. Flush after this callback, never reentrantly in it.
+		if (runtime.generation === generation) {
+			scheduleIdleWorkerReportRecovery(runtime, generation, ctx.isIdle(), flushDeferredWorkerReports);
+		}
 		// agent_settled never fires for a takeover turn the user aborted (esc),
 		// which used to leave takeover stuck on. A fresh user prompt while the
 		// agent is idle means that task is over: restore orchestration first,
@@ -1194,19 +1177,37 @@ export default function orchestrator(pi: ExtensionAPI) {
 		if (restrictedTools) pi.setActiveTools(restrictedTools);
 		// agent_settled is Pi's safe boundary: unlike agent_end, no automatic
 		// retry, compaction retry, or queued follow-up remains active.
+		let rolloverStarted = false;
 		if (runtime.generation === generation && isOutcomeRolloverEligible("agent_settled", runtime.workers.values(), runtime, ctx.getContextUsage(), config.rolloverContextPercent)) {
 			const version = beginOutcomeRollover(runtime);
 			if (version !== undefined) {
+				rolloverStarted = true;
+				// Close the gap before ctx.compact synchronously emits its before event.
+				holdWorkerReportDelivery(runtime, "compaction");
+				releaseWorkerReportDelivery(runtime, "settling");
 				try {
 					ctx.compact({
 						customInstructions: OUTCOME_ROLLOVER_INSTRUCTIONS,
-						onComplete: () => completeOutcomeRollover(runtime, version),
-						onError: () => failOutcomeRollover(runtime, version),
+						onComplete: () => {
+							completeOutcomeRollover(runtime, version);
+							scheduleWorkerReportDelivery(runtime, generation, ["compaction"], flushDeferredWorkerReports);
+						},
+						onError: () => {
+							failOutcomeRollover(runtime, version);
+							scheduleWorkerReportDelivery(runtime, generation, ["compaction"], flushDeferredWorkerReports);
+						},
 					});
 				} catch {
 					failOutcomeRollover(runtime, version);
+					scheduleWorkerReportDelivery(runtime, generation, ["compaction"], flushDeferredWorkerReports);
 				}
 			}
+		}
+		if (!rolloverStarted && runtime.generation === generation) {
+			releaseWorkerReportDelivery(runtime, "settling");
+			// This safe boundary also recovers a cancelled/failed compaction that
+			// emitted no session_compact event.
+			scheduleWorkerReportDelivery(runtime, generation, ["compaction"], flushDeferredWorkerReports);
 		}
 		// Do not let a stale generation reap workers after a reload. At the
 		// current generation's safe review boundary, stop every delivered run
@@ -1228,9 +1229,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_takeover",
 		label: "Take over implementation",
-		description: "Call once, exactly when the user has explicitly asked Sol to implement a task directly instead of delegating (any phrasing — 'do it yourself', 'fix it yourself', 'without delegating', etc). Judge intent yourself; do not wait for a fixed phrase. Enables normal implementation tools for exactly one task and starts a follow-up turn to do the work; orchestration resumes automatically once that task settles. Do not call this for routine implementation requests — those go through orchestrator_delegate.",
+		description: "Call once for a one-task Sol takeover after read-only inspection. Use it without an explicit solo request only when the root cause and exact change are known, the change is small and local (normally one file or a few tightly related files), risk is low, and validation is short and focused. Never use that fast path for security or auth work, destructive actions, data or schema migrations, deploys, broad refactors, public API changes, or ambiguous work. An explicit user request to work without delegation always selects takeover, whatever its wording. Enables normal implementation tools for exactly one task and starts a follow-up turn; orchestration resumes when that task settles. Use orchestrator_delegate for other work.",
 		parameters: Type.Object({
-			reason: Type.String({ description: "Short paraphrase of the user's explicit request to skip delegation." }),
+			reason: Type.String({ description: "Short reason: quote the explicit solo request, or name the inspected root cause, small local change, low risk, and focused validation that qualify for the fast path." }),
 		}),
 		execute: async (_toolCallId, params) => {
 			takeoverReason = params.reason;
@@ -1246,16 +1247,15 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Independent workstreams may be delegated to different workers in one turn; they run in parallel. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high. Optionally choose effort (low, medium, or high) independently for this worker/model; it overrides Pi thinking or sets Claude's effort for this delegation.${config.sandbox.mode !== "off" ? ` Sandboxed workers require a workspace: pass cwd as the exact repository directory, which must be inside a configured sandbox workspace root${config.sandbox.workspaceRoots.length ? ` (${config.sandbox.workspaceRoots.join(", ")})` : " (none are currently configured, so delegation will be rejected until one is added)"}. cwd is REQUIRED whenever this session's own cwd is outside those roots (e.g. a coordinator started in the home directory).${hostWorkerNames.length ? ` Exception: ${hostWorkerNames.join(", ")} run(s) directly on the host without sandbox containment — delegate host-level work (host processes, services, systemd, files outside the workspace roots) there instead of reporting it impossible; for such workers cwd may be any accessible directory and is optional.` : ""}` : ""}`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
 		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
-			task: Type.String({ description: "Implementation brief built from YOUR OWN investigation: state the root cause or design you already determined, the exact files and changes to make, edge cases, and the validation to run. Never ask the worker to 'diagnose', 'investigate', or 'find' something you already read — hand it your conclusions and acceptance criteria." }),
-			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. With the sandbox enabled it must be equal to or inside a configured sandbox workspace root; only this directory is mounted read-write. Required when the coordinator session cwd is outside the configured roots." })),
+			task: Type.String({ description: "Complete worker brief. Start directly with coordinator investigation, facts, conclusions, and constraints. Carry forward exact paths, stable symbols or line ranges when useful, concrete root cause, planned changes, edge cases, acceptance criteria, and exact focused validation commands when discoverable. Do not begin with a Requested outcome heading, a request paraphrase, a command, an implementation summary, or any similar restatement of what the user wants. Do not require broad rediscovery, brittle line numbers, or large code dumps. End with a separately labeled verbatim user operative request; only when the request is too large, use a clearly labeled faithful excerpt. Nothing may follow that final user-request section. Never ask the worker to diagnose something you already determined, and never silently replace the user's request with your inferred plan." }),
+			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. Defaults to the coordinator's session directory." })),
 			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
 			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
-			effort: Type.Optional(Type.Union(DELEGATION_EFFORTS.map((value) => Type.Literal(value)), { description: "Per-delegation effort override: low, medium, or high. Defaults to the worker profile for Pi and Claude's normal default." })),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const name = params.worker as string;
@@ -1266,40 +1266,34 @@ export default function orchestrator(pi: ExtensionAPI) {
 			const fallback = classifyTask(params.task);
 			const suppliedCategory: unknown = params.category;
 			const suppliedComplexity: unknown = params.complexity;
-			const effort = typeof params.effort === "string" && DELEGATION_EFFORTS.includes(params.effort as DelegationEffort) ? params.effort as DelegationEffort : undefined;
 			const profile = catalog[name];
 			if (!profile) return content(`Delegation rejected: ${name} is not a configured worker.`);
-			// Fail closed before any spawn: a cwd that is (or contains) the host
-			// home or falls outside the configured workspace roots must never be
-			// mounted; the coordinator is told exactly what to pass instead. A
-			// worker with an explicit sandbox opt-out follows mode-"off" workspace
-			// rules instead (any accessible directory, including the session cwd).
-			const workspace = resolveWorkerWorkspace(sandboxConfigForWorker(config.sandbox, profile.sandbox === "off"), typeof params.cwd === "string" ? params.cwd : undefined, ctx.cwd);
-			if (!workspace.ok) return content(`Delegation rejected: ${workspace.error}`);
+			const cwd = resolve(typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : ctx.cwd);
+			let workerTask: string;
+			try {
+				workerTask = withOrchestratorDelegationContract(params.task, rootTaskId);
+			} catch (error) {
+				return content(`Delegation rejected: ${error instanceof Error ? error.message : String(error)}`);
+			}
 			let worker: Worker;
 			try {
-				worker = launchWorker(name, profile, params.task, workspace.cwd, config, {
+				worker = launchWorker(name, profile, workerTask, cwd, config, {
 					rootTaskId,
 					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
 					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
 					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
-				}, effort);
+				});
 			} catch (error) {
-				// Fail closed and visibly: a required-sandbox rejection never spawns
-				// an unsandboxed worker and never silently degrades.
-				if (error instanceof WorkerLaunchRejected) return content(`Delegation rejected: ${error.message}`);
-				throw error;
+				return content(`Delegation rejected: the worker process could not be started (${error instanceof Error ? error.message : String(error)}).`);
 			}
-			const sandboxNote = worker.sandboxWarning ? ` WARNING: ${worker.sandboxWarning}` : "";
-			const hostNote = profile.sandbox === "off" && config.sandbox.mode !== "off" ? ` ${worker.name} runs directly on the host without sandbox containment.` : "";
-			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.${sandboxNote}${hostNote}`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
+			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
 		},
 	});
 
 	pi.registerTool({
 		name: "orchestrator_steer",
 		label: "Steer worker",
-		description: `Send immediate follow-up instructions to a live configured worker (${catalogNames}). Set kind to correction when the preceding completed result needs rework, or continuation when it is accepted and work continues on the same root. Omitted kind conservatively means correction. Set interrupt true only when the worker's in-flight run is actively heading the wrong way and must not continue: a Pi worker's current run is aborted before the instructions are delivered (its partial result is discarded); a Claude worker cannot be aborted mid-turn, so the instructions queue for its next turn boundary instead.`,
+		description: `Send real continuation or correction instructions to a live configured worker (${catalogNames}), including a Pi worker waiting for its own background job. Do not use this for status-only check-ins. Set kind to correction when the preceding completed result needs rework, or continuation when it is accepted and work continues on the same root. Allow at most one silent correction steer for the same failed attempt; if it still fails, do not loop silently — delegate one concrete retry with retryOf or report/ask about the blocker. Continuation steers for accepted work remain allowed. Omitted kind conservatively means correction. Set interrupt true only when the worker has an in-flight run that is actively heading the wrong way and must not continue: a Pi worker's current run is aborted before the instructions are delivered (its partial result is discarded). A Pi worker that already settled and is waiting for a background job has no active turn to abort, so its useful follow-up is sent without an abort. A Claude worker cannot be aborted mid-turn, so the instructions queue for its next turn boundary instead.`,
 		parameters: Type.Object({
 			workerId: Type.String({ description: "Worker ID returned by orchestrator_delegate." }),
 			instructions: Type.String({ description: "Concrete follow-up instructions for the worker." }),
@@ -1313,9 +1307,14 @@ export default function orchestrator(pi: ExtensionAPI) {
 				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
 			}
 			const kind = params.kind === "continuation" ? "continuation" : "correction";
+			const completedAttempt = worker.state === "idle" && worker.reportedRun === worker.run;
+			const correctionBudgetKey = `${worker.id}:${worker.rootTaskId}`;
+			if (kind === "correction" && completedAttempt && (correctionSteerCounts.get(correctionBudgetKey) ?? 0) >= 1) {
+				return content(`Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.rootTaskId}, or report/ask about the blocker.`);
+			}
 			let interruptNote = "";
 			if (params.interrupt === true) {
-				if (worker.profile.backend === "pi-rpc" && worker.state === "working") {
+				if (worker.profile.backend === "pi-rpc" && shouldAbortPiWorkerRun(worker)) {
 					// Flag before aborting: the aborted run's agent_settled must be
 					// swallowed (see handleRpcLine) rather than reported as a result.
 					worker.interruptedRun = worker.run;
@@ -1331,6 +1330,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 					interruptNote = aborted
 						? " Its in-flight run was aborted first; the partial result was discarded."
 						: " The abort did not confirm in time; the instructions were delivered anyway.";
+				} else if (worker.profile.backend === "pi-rpc") {
+					interruptNote = " Its prior turn had already settled while waiting for a background job, so no abort was sent.";
 				} else if (worker.profile.backend === "claude-code") {
 					interruptNote = " Claude workers cannot be aborted mid-turn; the instructions are queued for the next turn boundary.";
 				}
@@ -1352,6 +1353,8 @@ export default function orchestrator(pi: ExtensionAPI) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
 				return content(`${worker.id} could not accept follow-up instructions.`);
 			}
+			if (kind === "correction" && completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
+			else if (kind === "continuation" && completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
 			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
 			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}`);

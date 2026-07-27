@@ -1,3 +1,5 @@
+import type { TranscriptEntry } from "./orchestrator-transcript.ts";
+
 export type WorkerPanelState = "starting" | "working" | "idle" | "failed" | "stopped";
 
 export type WorkerPanelItem = {
@@ -9,6 +11,11 @@ export type WorkerPanelItem = {
 	lastActivityAt?: Date;
 	settledAt?: Date;
 	tokens?: number;
+	transcript?: readonly TranscriptEntry[];
+	/** Ledger p50 for this worker's reference class, fixed when the run starts. */
+	estimateMs?: number;
+	/** True when the p50 came from a widened class, shown with a trailing asterisk. */
+	estimateWidened?: boolean;
 };
 
 /** Low-frequency local redraw: enough for elapsed time without wasting VPS CPU. */
@@ -31,26 +38,39 @@ function elapsed(worker: WorkerPanelItem, now: number): string {
 	// Time since the worker was last steered, not total runtime; frozen once settled.
 	const start = worker.lastActivityAt?.getTime() ?? worker.startedAt.getTime();
 	const end = worker.settledAt?.getTime() ?? now;
+	// Whole minutes past the first one: the row is glanced at, not stopwatched.
 	const seconds = Math.max(0, Math.floor((end - start) / 1_000));
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	const remainder = seconds % 60;
-	return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
-}
-
-function formatTokens(tokens: number): string {
-	if (tokens < 1_000) return `${Math.max(0, Math.round(tokens))}`;
-	if (tokens < 1_000_000) {
-		const value = tokens / 1_000;
-		return `${value >= 10 ? value.toFixed(1) : value.toFixed(1)}k`;
-	}
-	return `${(tokens / 1_000_000).toFixed(1)}m`;
+	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m`;
 }
 
 function conciseActivity(task: string): string {
 	const firstLine = task.trim().split(/\r?\n/, 1)[0] ?? "";
 	const firstSentence = firstLine.match(/^.*?[.!?](?:\s|$)/)?.[0]?.trim();
 	return firstSentence || firstLine || "Working";
+}
+
+function usefulTranscriptActivity(transcript: readonly TranscriptEntry[] | undefined): string | undefined {
+	if (!transcript) return undefined;
+	for (let index = transcript.length - 1; index >= 0; index -= 1) {
+		const entry = transcript[index]!;
+		if (entry.thinking || entry.role === "user") continue;
+		if (entry.role === "tool" && entry.tool?.name?.trim() && entry.text.trim()) {
+			return entry.text.trim().split(/\r?\n/, 1)[0]?.trim() || undefined;
+		}
+		if (entry.role !== "assistant" && entry.role !== "system") continue;
+		const text = entry.text.trim().split(/\r?\n/, 1)[0]?.trim() ?? "";
+		if (!text || /^(?:still\s+working|i(?:'m| am)\s+(?:still\s+)?working|done|completed|finished|final(?:ly)?|summary|here(?:'s| is)\s+(?:the|a)\s+(?:summary|result))/i.test(text)) continue;
+		return conciseActivity(text);
+	}
+	return undefined;
+}
+
+function workerActivity(worker: WorkerPanelItem): string {
+	// Finished rows describe their state; an old tool call must not look active.
+	if (worker.state === "starting" || worker.state === "working") {
+		return usefulTranscriptActivity(worker.transcript) ?? conciseActivity(worker.task);
+	}
+	return conciseActivity(worker.task);
 }
 
 function textWidth(text: string): number {
@@ -80,14 +100,31 @@ function glyphFor(state: WorkerPanelState): string {
 	}
 }
 
+function formatEstimate(ms: number): string {
+	const seconds = Math.round(ms / 1_000);
+	return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+}
+
+/**
+ * Space-separated glanceable fields: `23m ~20m`. Elapsed and the estimate
+ * measure the same thing — time since the last instruction — because the
+ * ledger records run durations from that same anchor, so an overrun reads
+ * honestly. A trailing asterisk marks a p50 drawn from a widened class.
+ *
+ * Token totals are deliberately absent: providers report usage only at the end
+ * of a turn, so a live row could show nothing at all for a single-turn run and
+ * a stale carried-over total for the rest.
+ */
 function statusFor(worker: WorkerPanelItem, now: number): string {
-	const duration = elapsed(worker, now);
-	if (worker.state === "failed") return `${duration} · failed`;
-	if (worker.state === "stopped") return `${duration} · stopped`;
-	if (worker.tokens !== undefined && worker.tokens > 0) {
-		return `${duration} · ↑ ${formatTokens(worker.tokens)} tokens`;
+	const fields = [elapsed(worker, now)];
+	const estimate = worker.estimateMs;
+	const live = worker.state === "starting" || worker.state === "working";
+	if (live && estimate !== undefined && Number.isFinite(estimate) && estimate > 0) {
+		fields.push(`~${formatEstimate(estimate)}${worker.estimateWidened ? "*" : ""}`);
 	}
-	return duration;
+	if (worker.state === "failed") fields.push("failed");
+	else if (worker.state === "stopped") fields.push("stopped");
+	return fields.join(" ");
 }
 
 export type WorkerPanelOptions = {
@@ -96,6 +133,11 @@ export type WorkerPanelOptions = {
 	/** Include settled workers so finished sessions stay enterable while selecting. */
 	includeSettled?: boolean;
 };
+
+/** The session view must show the configured worker label without shortening it. */
+export function workerSessionTitle(name: string, state: WorkerPanelState, id: string): string {
+	return `${name} · ${state} · ${id}`;
+}
 
 /**
  * Workers shown by the panel, in stable row order, for selection to walk.
@@ -127,7 +169,7 @@ export function isExpiredWorker(
 
 /**
  * Claude-style one-line subagent rows:
- *   ○ Terra  Inspect the repository                         2s · ↑ 21.7k tokens
+ *   ○ Terra  Inspect the repository                                   23m ~20m
  *
  * `width` comes from Pi's Component.render(width), allowing the trailing
  * status to be genuinely right-aligned rather than padded for one terminal.
@@ -148,10 +190,10 @@ export function renderWorkerPanel(
 		const status = statusFor(worker, now);
 		const minimumGap = 2;
 		const available = Math.max(1, width - textWidth(prefix) - textWidth(status) - minimumGap);
-		const activity = truncate(conciseActivity(worker.task), available);
+		const activity = truncate(workerActivity(worker), available);
 		const gap = " ".repeat(Math.max(minimumGap, width - textWidth(prefix) - textWidth(activity) - textWidth(status)));
 
-		return `${prefix}${activity}${gap}${status}`;
+		return truncate(`${prefix}${activity}${gap}${status}`, width);
 	});
 }
 

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assessWorkerCheckIn, buildCheckInDigest, checkInCadenceMs, deliverCheckIn, isCheckInDue, shouldWakeForCheckIn } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
+import { assessWorkerCheckIn, buildCheckInDigest, buildPaceLine, checkInCadenceMs, deliverCheckIn, isCheckInDue, shouldWakeForCheckIn } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
+import type { DurationEstimate } from "../extensions/orchestrator-lib/orchestrator-stats.ts";
 import type { TranscriptEntry } from "../extensions/orchestrator-lib/orchestrator-transcript.ts";
 
 const startedAt = new Date("2026-07-15T12:00:00.000Z"); const MIN = 60_000;
@@ -16,6 +17,23 @@ test("initial base assessment is due at 15 minutes and healthy checks back off t
 	const silentAfterHealthy = worker({ lastCheckinAt: new Date(at + 15 * MIN), healthStreak: 1, transcript: [{ at: at + 15 * MIN, role: "assistant", text: "Still working." }] });
 	assert.equal(isCheckInDue(silentAfterHealthy, base, at + 29 * MIN), false);
 	assert.equal(isCheckInDue(silentAfterHealthy, base, at + 30 * MIN), true, "silence returns to the 15-minute base cadence rather than waiting 30 minutes");
+});
+
+test("the passive check estimates completion and names the class it drew from", () => {
+	const at = startedAt.getTime(); const base = 15 * MIN;
+	const estimate = (overrides: Partial<DurationEstimate> = {}): DurationEstimate =>
+		({ basis: "class", label: "code/medium", samples: 9, p50DurationMs: 20 * MIN, p95DurationMs: 45 * MIN, ...overrides });
+
+	assert.match(buildPaceLine(8 * MIN, estimate()), /running 8m; its 7d code\/medium finish at p50 20m, p95 45m over 9 samples — about 12m to p50\./);
+	assert.match(buildPaceLine(30 * MIN, estimate()), /past p50, about 15m to p95\./);
+	assert.match(buildPaceLine(60 * MIN, estimate()), /15m past p95, so it is an outlier for this class\./);
+
+	// A widened basis must be disclosed, not passed off as an exact class match.
+	assert.match(buildPaceLine(8 * MIN, estimate({ basis: "worker", label: "all recent runs", samples: 31 })), /its 7d all recent runs finish at p50 20m/);
+	assert.match(buildPaceLine(8 * MIN), /running 8m; too few comparable recent runs to estimate completion\./);
+
+	const digest = buildCheckInDigest(worker(), base, at + 8 * MIN, undefined, estimate());
+	assert.match(digest, /^\[Luna passive progress check — luna-1\]\nTask: .*\nPace: running 8m;/);
 });
 
 test("assessment deterministically identifies stalls, blocking language, and repeated activity", () => {

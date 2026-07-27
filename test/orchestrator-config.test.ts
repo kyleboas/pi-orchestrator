@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DEFAULT_ROLLOVER_CONTEXT_PERCENT, DEFAULT_WORKERS, loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
-import { catalogText, piRpcWorkerArgs, workerDescription, workerNames } from "../extensions/orchestrator-lib/orchestrator-core.ts";
+import { BACKGROUND_JOB_WORKER_EXTENSION_PATH, catalogText, piRpcWorkerArgs, workerDescription, workerNames } from "../extensions/orchestrator-lib/orchestrator-core.ts";
 import { claudeCodeArgs } from "../extensions/orchestrator-lib/orchestrator-claude.ts";
 import { coordinatorInstructions, createWorkerSchema } from "../extensions/orchestrator.ts";
 
@@ -14,17 +14,15 @@ function remove(file: string) { rmSync(join(file, ".."), { recursive: true, forc
 
 const EXPECTED_DEFAULT_WORKERS = DEFAULT_WORKERS;
 
-test("default catalog uses eight explicit individual worker profiles", () => {
+test("default catalog uses nine explicit individual worker profiles", () => {
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "absent-config") });
 	assert.deepEqual(workerNames(config.workers), Object.keys(EXPECTED_DEFAULT_WORKERS));
 	assert.deepEqual(config.workers, EXPECTED_DEFAULT_WORKERS);
 	assert.deepEqual(DEFAULT_WORKERS, EXPECTED_DEFAULT_WORKERS);
 	assert.deepEqual(config.coordinator, { thinking: "high" });
-	assert.equal(config.workers["GPT-5.6 Terra xHigh"]!.thinking, "xhigh");
-	const terra = config.workers["GPT-5.6 Terra High"]!;
+	const terra = config.workers.Terra!;
 	assert.equal(terra.backend, "pi-rpc");
-	assert.deepEqual(piRpcWorkerArgs(terra), ["--mode", "rpc", "--no-session", "--no-extensions", "--tools", "read,bash,edit,write", "--model", "openai-codex/gpt-5.6-terra", "--thinking", "high"]);
-	assert.equal(piRpcWorkerArgs(terra, "low").at(-1), "low");
+	assert.deepEqual(piRpcWorkerArgs(terra), ["--mode", "rpc", "--no-session", "--no-extensions", "--extension", BACKGROUND_JOB_WORKER_EXTENSION_PATH, "--tools", "read,bash,edit,write,background_job", "--model", "openai-codex/gpt-5.6-terra", "--thinking", "high"]);
 	assert.equal(config.commands.pi, "pi"); assert.equal(config.commands.claude, "claude");
 	assert.equal(config.checkInMinutes, DEFAULT_CHECKIN_MINUTES);
 	assert.equal(config.rolloverContextPercent, DEFAULT_ROLLOVER_CONTEXT_PERCENT);
@@ -69,9 +67,8 @@ test("configured map generates dynamic names, explicit Pi metadata, commands, an
 		assert.match(schema.anyOf[0]!.description, /example\/worker/);
 		assert.match(schema.anyOf[1]!.description, /fable-placeholder/);
 		assert.match(coordinatorInstructions(config.workers), /ask Fable/);
-		assert.match(coordinatorInstructions(config.workers), /unqualified new task, start with Luna/);
-		assert.match(coordinatorInstructions(config.workers), /Each distinct new task gets a new delegate/);
-		assert.match(coordinatorInstructions(config.workers), /Never delegate a merge/);
+		assert.match(coordinatorInstructions(config.workers), /Route by task shape/);
+		assert.match(coordinatorInstructions(config.workers), /orchestrator_takeover/);
 		assert.equal(config.commands.pi, "pi-env"); assert.equal(config.commands.claude, "claude-auto");
 		const fable = config.workers.Fable!;
 		assert.equal(fable.backend, "claude-code");
@@ -95,19 +92,6 @@ test("configured list is accepted and malformed, missing-model, empty, or duplic
 	}
 });
 
-test("pull request broker config is opt-in and malformed policy fails closed", () => {
-	const absent = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "absent-pr-broker-config") });
-	assert.equal(absent.pullRequests, undefined);
-	const valid = configFile({ pullRequests: { repositories: ["Owner/Repository"], branchPrefixes: ["feat/"], baseBranches: ["staging"] } });
-	const invalid = configFile({ pullRequests: { repositories: ["owner/repository"], branchPrefixes: ["feat/", "feat/"] } });
-	try {
-		assert.deepEqual(loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: valid }).pullRequests, { repositories: ["owner/repository"], branchPrefixes: ["feat/"], baseBranches: ["staging"] });
-		const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: invalid });
-		assert.equal(config.pullRequests, undefined);
-		assert.match(config.warning ?? "", /Pull request broker configuration was invalid/);
-	} finally { remove(valid); remove(invalid); }
-});
-
 test("environment command overrides are portable even when config is unavailable", () => {
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "missing"), PI_ORCHESTRATOR_PI_BIN: "my-pi", PI_ORCHESTRATOR_CLAUDE_BIN: "claude-auto" });
 	assert.deepEqual(config.commands, { pi: "my-pi", claude: "claude-auto" });
@@ -128,31 +112,3 @@ test("worker descriptions are accepted, sanitized, and surfaced", () => {
 	assert.equal(config.workers.Builder!.description, "Line one line two end");
 });
 
-test("worker sandbox opt-out parses only the literal off and rejects the catalog otherwise", () => {
-	const accepted = configFile({ workers: {
-		Ops: { backend: "pi-rpc", model: "provider/ops-model", thinking: "medium", sandbox: "off", description: "Host operations." },
-		Host: { backend: "claude-code", model: "sonnet", sandbox: "off" },
-		Boxed: { backend: "claude-code", model: "haiku" },
-	} });
-	try {
-		const workers = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: accepted }).workers;
-		assert.equal(workers.Ops!.sandbox, "off");
-		assert.equal(workers.Host!.sandbox, "off");
-		assert.equal(workers.Boxed!.sandbox, undefined);
-		assert.match(workerDescription("Ops", workers.Ops!), /UNSANDBOXED HOST WORKER/);
-		assert.match(workerDescription("Ops", workers.Ops!), /Host operations\.$/);
-		assert.doesNotMatch(workerDescription("Boxed", workers.Boxed!), /UNSANDBOXED/);
-	} finally { remove(accepted); }
-	// A catalog that tries to express a containment override with any other
-	// value must never load with a different meaning: the file falls back to
-	// the default catalog (with a warning) rather than silently sandboxing or
-	// silently unsandboxing the worker.
-	for (const bad of [true, false, "on", "required", "OFF", " off", 1, null]) {
-		const file = configFile({ workers: { Ops: { backend: "claude-code", model: "sonnet", sandbox: bad } } });
-		try {
-			const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
-			assert.deepEqual(config.workers, DEFAULT_WORKERS, JSON.stringify(bad));
-			assert.match(config.warning ?? "", /invalid/);
-		} finally { remove(file); }
-	}
-});

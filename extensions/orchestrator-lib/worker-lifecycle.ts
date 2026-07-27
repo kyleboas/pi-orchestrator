@@ -1,6 +1,8 @@
+import { clearBackgroundJobs, type BackgroundJobTracking } from "./background-job.ts";
+
 export type WorkerState = "starting" | "working" | "idle" | "failed" | "stopped";
 
-export type WorkerLifecycle = {
+export type WorkerLifecycle = BackgroundJobTracking & {
 	state: WorkerState;
 	run: number;
 	settlingRun?: number;
@@ -11,6 +13,8 @@ export type WorkerLifecycle = {
 	settledAt?: Date;
 	/** Claude Code emits one result event per user turn; only the last outstanding turn settles the worker. */
 	pendingTurns?: number;
+	/** A Pi turn that has settled and is waiting for its background jobs. */
+	backgroundSettlementHeldRun?: number;
 };
 
 /** Record that one more user turn was written to a Claude Code worker. */
@@ -44,9 +48,19 @@ function isTerminal(state: WorkerState): boolean {
 export function beginWorkerRun(worker: WorkerLifecycle): void {
 	worker.run += 1;
 	worker.settlingRun = undefined;
+	// This marker belongs to the settled prior turn. Pending job IDs deliberately
+	// remain: useful steered work can continue while those jobs run.
+	worker.backgroundSettlementHeldRun = undefined;
 	worker.reportingRun = undefined;
 	worker.settledAt = undefined;
 	worker.state = "working";
+}
+
+/** A follow-up can resume the same generation after its held idle boundary. */
+export function markWorkerRunActive(worker: WorkerLifecycle): void {
+	if (isTerminal(worker.state)) return;
+	worker.state = "working";
+	if (worker.backgroundSettlementHeldRun === worker.run) worker.backgroundSettlementHeldRun = undefined;
 }
 
 /**
@@ -64,6 +78,7 @@ export function beginWorkerSettlement(worker: WorkerLifecycle): number | undefin
 export function finishWorkerSettlement(worker: WorkerLifecycle, run: number): boolean {
 	if (worker.settlingRun !== run || worker.run !== run || isTerminal(worker.state)) return false;
 	worker.settlingRun = undefined;
+	worker.backgroundSettlementHeldRun = undefined;
 	worker.state = "idle";
 	worker.settledAt ??= new Date();
 	return true;
@@ -77,6 +92,16 @@ export function claimWorkerReport(worker: WorkerLifecycle): boolean {
 }
 
 /** A delivered terminal run is safe to reap only if steering has not started a newer run. */
+/** A Pi worker's first idle boundary must wait for its own background jobs. */
+export function shouldHoldWorkerSettlement(worker: WorkerLifecycle): boolean {
+	return !isTerminal(worker.state) && (worker.pendingBackgroundJobIds?.size ?? 0) > 0;
+}
+
+/** A held boundary has no active Pi turn to abort, even if its jobs just finished. */
+export function shouldAbortPiWorkerRun(worker: WorkerLifecycle): boolean {
+	return worker.state === "working" && worker.backgroundSettlementHeldRun !== worker.run;
+}
+
 export function shouldAutoStopReportedWorker(worker: WorkerLifecycle): boolean {
 	return (worker.state === "idle" || worker.state === "failed") &&
 		worker.reportedRun === worker.run && worker.settlingRun === undefined;
@@ -86,6 +111,8 @@ export function shouldAutoStopReportedWorker(worker: WorkerLifecycle): boolean {
 export function stopWorker(worker: WorkerLifecycle): void {
 	worker.state = "stopped";
 	worker.settlingRun = undefined;
+	worker.backgroundSettlementHeldRun = undefined;
+	clearBackgroundJobs(worker);
 	worker.reportingRun = undefined;
 	worker.settledAt ??= new Date();
 }

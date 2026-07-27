@@ -8,18 +8,8 @@
     "pi": "pi",
     "claude": "claude-auto"
   },
-  "sandbox": {
-    "mode": "off",
-    "network": "host",
-    "env": "allowlist"
-  },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,
-  "pullRequests": {
-    "repositories": ["example-owner/example-repository"],
-    "branchPrefixes": ["feat/", "fix/"],
-    "baseBranches": ["staging"]
-  },
   "workers": {
     "Builder": {
       "backend": "pi-rpc",

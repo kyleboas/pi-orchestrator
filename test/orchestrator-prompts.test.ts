@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DELEGATED_WORKER_PR_RULE } from "../extensions/orchestrator.ts";
+import { buildWorkerPrompt } from "../extensions/orchestrator-lib/orchestrator-core.ts";
 
-test("delegated worker prompt forbids PR finalization and reserves merges for authorized coordinator", () => {
-	assert.match(DELEGATED_WORKER_PR_RULE, /must never merge, close, or otherwise finalize a pull request/);
-	assert.match(DELEGATED_WORKER_PR_RULE, /Only the coordinator may merge/);
-	assert.match(DELEGATED_WORKER_PR_RULE, /user explicitly authorizes/);
+test("delegated worker prompt reserves merges for the coordinator after explicit user authorization", () => {
+	const prompt = buildWorkerPrompt({ worker: "Luna", task: "Fix the parser.", cwd: "/repo", backend: "pi-rpc" });
+	assert.match(prompt, /Delegated workers must never merge pull requests/);
+	assert.match(prompt, /coordinator-only after explicit user authorization/);
 });

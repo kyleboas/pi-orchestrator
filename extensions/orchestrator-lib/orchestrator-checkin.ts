@@ -1,3 +1,4 @@
+import { formatDuration, type DurationEstimate } from "./orchestrator-stats.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 
 /** Base interval for passive worker assessment; healthy workers extend to 2x. */
@@ -18,6 +19,25 @@ export type CheckInWorkerView = {
 	healthStreak?: number;
 	pendingBackgroundJobIds?: ReadonlySet<string>;
 };
+
+/**
+ * A completion estimate built only from the outcome ledger, never from the
+ * worker: asking a running worker where it stands would mean an RPC round trip,
+ * which the passive check exists to avoid.
+ */
+export function buildPaceLine(elapsedMs: number, estimate?: DurationEstimate): string {
+	const elapsed = `running ${formatDuration(Math.max(0, elapsedMs))}`;
+	if (!estimate) return `Pace: ${elapsed}; too few comparable recent runs to estimate completion.`;
+	const { p50DurationMs: p50, p95DurationMs: p95 } = estimate;
+	// Name the reference class so a widened basis is never read as an exact match.
+	const reference = `its 7d ${estimate.label} finish at p50 ${formatDuration(p50)}, p95 ${formatDuration(p95)} over ${estimate.samples} samples`;
+	const verdict = elapsedMs < p50
+		? `about ${formatDuration(p50 - elapsedMs)} to p50`
+		: elapsedMs <= p95
+			? `past p50, about ${formatDuration(p95 - elapsedMs)} to p95`
+			: `${formatDuration(elapsedMs - p95)} past p95, so it is an outlier for this class`;
+	return `Pace: ${elapsed}; ${reference} — ${verdict}.`;
+}
 
 export type CheckInAssessment = {
 	status: "healthy" | "suspicious";
@@ -90,7 +110,7 @@ export function assessWorkerCheckIn(worker: CheckInWorkerView, baseIntervalMs: n
 }
 
 /** A compact factual digest from already-captured worker state only. */
-export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, now = Date.now(), assessment = assessWorkerCheckIn(worker, sinceMs, now)): string {
+export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, now = Date.now(), assessment = assessWorkerCheckIn(worker, sinceMs, now), estimate?: DurationEstimate): string {
 	const since = Math.max(worker.lastCheckinAt?.getTime() ?? 0, now - sinceMs);
 	const recent = (worker.transcript ?? []).filter((entry) => entry.at >= since);
 	const signals = recent
@@ -101,6 +121,7 @@ export function buildCheckInDigest(worker: CheckInWorkerView, sinceMs: number, n
 	const lines = [
 		`[${worker.name} passive progress check — ${worker.id}]`,
 		`Task: ${clip(worker.task, 140)}`,
+		buildPaceLine(now - worker.startedAt.getTime(), estimate),
 		...(signals.length ? [`Recent: ${signals.join(" | ")}`] : ["Recent: no captured assistant or tool activity."]),
 		...(pendingBackgroundJobCount > 0 ? [`Background: waiting for ${pendingBackgroundJobCount} tracked background job${pendingBackgroundJobCount === 1 ? "" : "s"}.`] : []),
 	];

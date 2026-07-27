@@ -4,21 +4,15 @@ import { resolve } from "node:path";
 import type { ClaudeAccountsConfig } from "./orchestrator-accounts.ts";
 import { defaultClaudeAccountStatePath } from "./orchestrator-accounts.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "./orchestrator-checkin.ts";
-import type { PiThinkingLevel, WorkerProfile } from "./orchestrator-core.ts";
-import { DEFAULT_SANDBOX_CONFIG, INVALID_SANDBOX_CONFIG, parseSandboxConfig, type SandboxConfig } from "./orchestrator-sandbox.ts";
-import { parsePullRequestsConfig, type PullRequestsConfig } from "./orchestrator-pr-broker.ts";
+import { CLAUDE_EFFORTS, PI_THINKING_LEVELS, type ClaudeEffort, type PiThinkingLevel, type WorkerProfile } from "./orchestrator-core.ts";
 
 export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
 export type OrchestratorConfig = {
 	coordinator: CoordinatorConfig;
 	commands: { pi: string; claude: string };
 	workers: Record<string, WorkerProfile>;
-	/** Worker process containment policy; defaults to off for backward compatibility. */
-	sandbox: SandboxConfig;
 	/** When set, Claude workers rotate across these accounts and fail over on usage limits. */
 	claudeAccounts?: ClaudeAccountsConfig;
-	/** Opt-in exact GitHub repository/branch policy for the sandbox-only PR broker. */
-	pullRequests?: PullRequestsConfig;
 	/** Initial/base passive assessment interval in minutes; 0 disables. Healthy workers back off to 2x. */
 	checkInMinutes: number;
 	/** Context-use percentage for outcome-boundary rollover; 0 disables. */
@@ -27,28 +21,27 @@ export type OrchestratorConfig = {
 };
 
 type Json = Record<string, unknown>;
-const NAME = /^[A-Za-z][A-Za-z0-9 -]{0,48}$/;
-const THINKING = new Set<PiThinkingLevel>(["low", "medium", "high", "xhigh"]);
-
+// Dots are allowed because model tiers are routinely versioned ("GPT-5.6 Luna
+// Low"); the built-in default catalog uses them, so a user catalog that names
+// its workers the same way must not be rejected.
+const NAME = /^[A-Za-z][A-Za-z0-9 .\-]{0,48}$/;
+const THINKING = new Set<PiThinkingLevel>(PI_THINKING_LEVELS);
+const CLAUDE_EFFORT = new Set<ClaudeEffort>(CLAUDE_EFFORTS);
+const SOL_MODEL = "openai-codex/gpt-5.6-sol";
+const SOL_THINKING = new Set<PiThinkingLevel>(["low", "medium", "high"]);
+function supportsThinking(model: string, thinking: PiThinkingLevel): boolean {
+	return model === SOL_MODEL ? SOL_THINKING.has(thinking) : THINKING.has(thinking);
+}
 export const DEFAULT_WORKERS: Record<string, WorkerProfile> = {
-	"Opus 5 Medium": { backend: "claude-code", model: "claude-opus-5", thinking: "medium", description: "Opus 5 at medium effort; use for multi-step changes, edge cases, harder implementation, and design-sensitive work." },
-	"Opus 5 Low": { backend: "claude-code", model: "claude-opus-5", thinking: "low", description: "Opus 5 at low effort; good for routine bounded work, small edits, config changes, and verification runs." },
-	"GPT-5.6 Terra xHigh": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "xhigh", description: "Heavy tier at maximum thinking; reserve for the hardest multi-file work and design-sensitive changes." },
-	"GPT-5.6 Terra High": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier at high thinking; for genuinely hard multi-file work and tricky debugging." },
-	"GPT-5.6 Terra Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "medium", description: "Heavy tier at medium thinking; for moderately complex multi-file changes." },
-	"GPT-5.6 Terra Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "low", description: "Heavy tier at low thinking; for simpler tasks that still benefit from Terra's capability." },
-	"GPT-5.6 Luna xHigh": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "xhigh", description: "Fast tier at maximum thinking; for tasks needing Luna's speed with deep reasoning." },
-	"GPT-5.6 Luna High": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "high", description: "Fast tier at high thinking; for moderate tasks needing more reasoning than the default." },
-	"GPT-5.6 Luna Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "medium", description: "Fast tier at medium thinking; for bounded work with some edge cases." },
-	"GPT-5.6 Luna Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
-	"GPT-5.6 Sol Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
-	"GPT-5.6 Sol Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation." },
-	"Sonnet High": { backend: "claude-code", model: "sonnet", thinking: "high", description: "Mid Claude worker at high effort; for harder implementation tasks." },
-	"Sonnet Medium": { backend: "claude-code", model: "sonnet", thinking: "medium", description: "Mid Claude worker at medium effort; for ordinary implementation." },
-	"Sonnet Low": { backend: "claude-code", model: "sonnet", thinking: "low", description: "Mid Claude worker at low effort; for small self-contained tasks." },
-	"Haiku High": { backend: "claude-code", model: "haiku", thinking: "high", description: "Cheap Claude worker at high effort; for moderate tasks on a budget." },
-	"Haiku Medium": { backend: "claude-code", model: "haiku", thinking: "medium", description: "Cheap Claude worker at medium effort; for bounded tasks on a budget." },
-	"Haiku Low": { backend: "claude-code", model: "haiku", thinking: "low", description: "Cheapest Claude worker; for the smallest self-contained tasks." },
+	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
+	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation when Luna would be out of its depth." },
+	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
+	"Sol-High": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "high", description: "Use only when a task or skill specifically asks for Sol-High; do not choose it for normal worker routing." },
+	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier; reserve for genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
+	Opus: { backend: "claude-code", model: "claude-opus-5", description: "Strong Claude Opus 5 worker for hard implementation; also good for UI work." },
+	Sonnet: { backend: "claude-code", model: "sonnet" },
+	Haiku: { backend: "claude-code", model: "haiku" },
+	Fable: { backend: "claude-code", model: "fable" },
 };
 
 function nonempty(value: unknown): value is string {
@@ -71,25 +64,17 @@ function description(value: unknown): { description?: string } {
 	const cleaned = value.replace(/\s+/g, " ").trim().slice(0, 300);
 	return cleaned ? { description: cleaned } : {};
 }
-/**
- * Per-worker sandbox opt-out. Only the exact literal "off" opts a worker out
- * of containment; any other present value rejects the profile (and with it the
- * whole catalog) rather than being silently ignored — a config that tries to
- * express a containment override must never load with a different meaning.
- */
-function workerSandbox(value: unknown): { ok: true; sandbox?: { sandbox: "off" } } | { ok: false } {
-	if (value === undefined) return { ok: true };
-	return value === "off" ? { ok: true, sandbox: { sandbox: "off" } } : { ok: false };
-}
 function profile(value: unknown): WorkerProfile | undefined {
 	if (!object(value)) return undefined;
-	const sandbox = workerSandbox(value.sandbox);
-	if (!sandbox.ok) return undefined;
 	if (value.backend === "pi-rpc") {
-		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model)) return undefined;
-		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description), ...sandbox.sandbox };
+		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model) || !supportsThinking(value.model.trim(), value.thinking as PiThinkingLevel)) return undefined;
+		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description) };
 	}
-	if (value.backend === "claude-code" && nonempty(value.model) && (value.thinking === undefined || THINKING.has(value.thinking as PiThinkingLevel))) return { backend: "claude-code", model: value.model.trim(), ...(value.thinking === undefined ? {} : { thinking: value.thinking as PiThinkingLevel }), ...description(value.description), ...sandbox.sandbox };
+	if (value.backend === "claude-code" && nonempty(value.model)) {
+		if (value.thinking !== undefined && !CLAUDE_EFFORT.has(value.thinking as ClaudeEffort)) return undefined;
+		const thinking = value.thinking === undefined ? {} : { thinking: value.thinking as ClaudeEffort };
+		return { backend: "claude-code", model: value.model.trim(), ...thinking, ...description(value.description) };
+	}
 	return undefined;
 }
 function workers(value: unknown): Record<string, WorkerProfile> | undefined {
@@ -130,29 +115,12 @@ function rolloverContextPercent(value: unknown): number {
 	if (value === undefined) return DEFAULT_ROLLOVER_CONTEXT_PERCENT;
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : DEFAULT_ROLLOVER_CONTEXT_PERCENT;
 }
-const SANDBOX_INVALID_WARNING = "Sandbox configuration was invalid; worker delegation is disabled until it is corrected.";
-/**
- * Sandbox parsing is fail-closed and independent of the generic
- * invalid-config-uses-defaults recovery: a present-but-malformed sandbox block
- * must never quietly become "off", even when the rest of the file is rejected.
- */
-function sandboxFrom(raw: unknown): { sandbox: SandboxConfig; warning?: string } {
-	if (!object(raw) || raw.sandbox === undefined) return { sandbox: { ...DEFAULT_SANDBOX_CONFIG } };
-	const parsed = parseSandboxConfig(raw.sandbox);
-	return parsed ? { sandbox: parsed } : { sandbox: { ...INVALID_SANDBOX_CONFIG }, warning: SANDBOX_INVALID_WARNING };
-}
-const PULL_REQUESTS_INVALID_WARNING = "Pull request broker configuration was invalid; the broker is disabled.";
-function pullRequestsFrom(raw: unknown): { pullRequests?: PullRequestsConfig; warning?: string } {
-	if (!object(raw) || raw.pullRequests === undefined) return {};
-	const pullRequests = parsePullRequestsConfig(raw.pullRequests);
-	return pullRequests ? { pullRequests } : { warning: PULL_REQUESTS_INVALID_WARNING };
-}
 function joinWarnings(...warnings: (string | undefined)[]): string | undefined {
 	const present = warnings.filter(nonempty);
 	return present.length ? present.join(" ") : undefined;
 }
-function defaults(env: NodeJS.ProcessEnv, warning?: string, sandbox: SandboxConfig = { ...DEFAULT_SANDBOX_CONFIG }): OrchestratorConfig {
-	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, sandbox, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, ...(warning ? { warning } : {}) };
+function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, ...(warning ? { warning } : {}) };
 }
 
 /** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
@@ -170,25 +138,19 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 	try {
 		raw = JSON.parse(text);
 	} catch {
-		// Unparseable JSON that mentions a sandbox block still fails closed: the
-		// requested containment intent is unreadable, so delegation stays disabled.
-		const wantedSandbox = /"sandbox"/.test(text);
-		return defaults(
-			env,
-			joinWarnings("Orchestrator configuration was invalid; using defaults.", wantedSandbox ? SANDBOX_INVALID_WARNING : undefined),
-			wantedSandbox ? { ...INVALID_SANDBOX_CONFIG } : undefined,
-		);
+		return defaults(env, "Orchestrator configuration was invalid; using defaults.");
 	}
-	const { sandbox, warning: sandboxWarning } = sandboxFrom(raw);
-	const { pullRequests, warning: pullRequestsWarning } = pullRequestsFrom(raw);
-	const invalid = () => defaults(env, joinWarnings("Orchestrator configuration was invalid; using defaults.", sandboxWarning, pullRequestsWarning), sandbox);
+	const invalid = () => defaults(env, "Orchestrator configuration was invalid; using defaults.");
 	if (!object(raw)) return invalid();
 	// A config without a workers key keeps its coordinator/commands and the
 	// default catalog; only a present-but-invalid catalog rejects the file.
 	const configuredWorkers = raw.workers === undefined ? { ...DEFAULT_WORKERS } : workers(raw.workers);
 	if (!configuredWorkers) return invalid();
 	const coordinatorRaw = raw.coordinator === undefined ? {} : raw.coordinator;
-	if (!object(coordinatorRaw) || !THINKING.has((coordinatorRaw.thinking ?? "high") as PiThinkingLevel) ||
+	const coordinatorThinking = (coordinatorRaw && object(coordinatorRaw) ? coordinatorRaw.thinking : undefined) ?? "high";
+	const explicitSolCoordinator = object(coordinatorRaw) && coordinatorRaw.provider === "openai-codex" && coordinatorRaw.id === "gpt-5.6-sol";
+	if (!object(coordinatorRaw) || !THINKING.has(coordinatorThinking as PiThinkingLevel) ||
+		(explicitSolCoordinator && !SOL_THINKING.has(coordinatorThinking as PiThinkingLevel)) ||
 		(coordinatorRaw.provider !== undefined && !nonempty(coordinatorRaw.provider)) ||
 		(coordinatorRaw.id !== undefined && !nonempty(coordinatorRaw.id))) return invalid();
 	const commandsRaw = raw.commands === undefined ? {} : raw.commands;
@@ -197,17 +159,14 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 		coordinator: {
 			...(nonempty(coordinatorRaw.provider) ? { provider: coordinatorRaw.provider.trim() } : {}),
 			...(nonempty(coordinatorRaw.id) ? { id: coordinatorRaw.id.trim() } : {}),
-			thinking: (coordinatorRaw.thinking ?? "high") as PiThinkingLevel,
+			thinking: coordinatorThinking as PiThinkingLevel,
 		},
 		commands: {
 			pi: command(env.PI_ORCHESTRATOR_PI_BIN, command(commandsRaw.pi, "pi")),
 			claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, command(commandsRaw.claude, "claude")),
 		}, workers: configuredWorkers,
-		sandbox,
 		checkInMinutes: checkInMinutes(raw.checkInMinutes),
 		rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
-		...(sandboxWarning || pullRequestsWarning ? { warning: joinWarnings(sandboxWarning, pullRequestsWarning) } : {}),
-		...(pullRequests ? { pullRequests } : {}),
 		...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 	};
 }
