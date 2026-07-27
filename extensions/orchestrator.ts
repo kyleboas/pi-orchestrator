@@ -123,10 +123,13 @@ import {
 	type WorkerRunStatus,
 } from "./orchestrator-lib/orchestrator-stats.ts";
 import {
+	anchorScrollUp,
 	isDownKey,
+	isEndKey,
 	isEnterKey,
 	isEscapeKey,
 	isPageDownKey,
+	isHomeKey,
 	isPageUpKey,
 	isUpKey,
 	moveSelection,
@@ -936,6 +939,11 @@ export default function orchestrator(pi: ExtensionAPI) {
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
 						let scrollUp = 0;
+						// Anchoring state: a scrolled viewport must keep showing the same
+						// lines when the worker appends new output below them.
+						let lastBodyLength = 0;
+						let lastWidth = 0;
+						let pageSize = 10;
 						let cachedKey = "";
 						let cachedBody: string[] = [];
 						// Live view: poll local state only, and only redraw when the
@@ -1010,15 +1018,24 @@ export default function orchestrator(pi: ExtensionAPI) {
 								const height = Math.max(12, process.stdout.rows ?? 30);
 								const title = workerSessionTitle(worker.name, worker.state, worker.id);
 								// Workers launched before this version predate the transcript field.
-								const view = renderSessionScreen(title, buildBody(worker, width), width, height, scrollUp, theme);
+								const body = buildBody(worker, width);
+								// A resize rewraps every line, so its length change is not new output.
+								if (width !== lastWidth) { lastBodyLength = body.length; lastWidth = width; }
+								scrollUp = anchorScrollUp(scrollUp, lastBodyLength, body.length);
+								const view = renderSessionScreen(title, body, width, height, scrollUp, theme);
 								scrollUp = Math.min(scrollUp, view.maxScrollUp);
+								lastBodyLength = view.bodyLength;
+								pageSize = Math.max(1, view.viewport - 1);
 								return view.lines;
 							},
 							handleInput: (data: string) => {
 								if (isUpKey(data)) scrollUp += 1;
 								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
-								else if (isPageUpKey(data)) scrollUp += 10;
-								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - 10);
+								else if (isPageUpKey(data)) scrollUp += pageSize;
+								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - pageSize);
+								// Home reaches the oldest captured output; end resumes following.
+								else if (isHomeKey(data)) scrollUp = Number.MAX_SAFE_INTEGER;
+								else if (isEndKey(data)) scrollUp = 0;
 								else if (isEscapeKey(data) || data === "q") {
 									done(undefined);
 									return;

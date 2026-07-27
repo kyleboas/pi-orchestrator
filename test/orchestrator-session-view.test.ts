@@ -6,6 +6,7 @@ import {
 	isEscapeKey,
 	isUpKey,
 	moveSelection,
+	anchorScrollUp,
 	renderSessionScreen,
 	wrapPlainText,
 } from "../extensions/orchestrator-lib/orchestrator-session-view.ts";
@@ -55,6 +56,30 @@ test("renderSessionScreen shows title, body tail, scrolls, and stays full-size",
 	const scrolled = renderSessionScreen("Terra · working · terra-1", body, 60, 12, followed.maxScrollUp, theme);
 	assert.ok(scrolled.lines.some((line) => line.includes("line 0")));
 	assert.ok(!scrolled.lines.some((line) => line.includes("line 29")));
+});
+
+test("a scrolled view keeps its place when the worker appends new output", () => {
+	const body = Array.from({ length: 30 }, (_value, index) => `line ${index}`);
+	const view = renderSessionScreen("Terra · working · terra-1", body, 60, 12, 0, theme);
+	// Read 12 lines up from the bottom, then the worker emits 5 more lines.
+	const held = anchorScrollUp(12, view.bodyLength, body.length + 5);
+	assert.equal(held, 17, "the offset grows with the appended lines so the same content stays on screen");
+	const grown = [...body, ...Array.from({ length: 5 }, (_v, i) => `new ${i}`)];
+	const before = renderSessionScreen("t", body, 60, 12, 12, theme).lines;
+	const after = renderSessionScreen("t", grown, 60, 12, held, theme).lines;
+	assert.deepEqual(after.slice(2, -1), before.slice(2, -1), "the visible body is unchanged by output arriving below it");
+
+	// A following viewport keeps following, and a resize is not new output.
+	assert.equal(anchorScrollUp(0, 30, 35), 0);
+	assert.equal(anchorScrollUp(12, 30, 24), 12, "entries trimmed off the front need no adjustment");
+});
+
+test("the hint line says whether the view is following or paused", () => {
+	const body = Array.from({ length: 30 }, (_value, index) => `line ${index}`);
+	assert.match(renderSessionScreen("t", body, 60, 12, 0, theme).lines.at(-1)!, /following live/);
+	const paused = renderSessionScreen("t", body, 60, 12, 12, theme).lines.at(-1)!;
+	assert.match(paused, /12 lines back, paused/);
+	assert.match(paused, /end to follow/);
 });
 
 test("renderSessionScreen handles an empty body", () => {
