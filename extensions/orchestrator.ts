@@ -222,9 +222,9 @@ function recordBackgroundJobEvents(worker: Worker, message: unknown): void {
 		// an assistant's ordinary prose as lifecycle control data.
 		if ((event.kind === "started" && role !== "toolResult") || (event.kind === "completed" && role !== "user")) continue;
 		const change = trackBackgroundJobEvent(worker, event);
-		if (change === "started") {
+		if (change === "started" && event.kind === "started") {
 			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Background job ${event.name} (${event.jobId}) started; waiting for its completion.` });
-		} else if (change === "completed") {
+		} else if (change === "completed" && event.kind === "completed") {
 			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Background job ${event.jobId} finished with exit status ${event.exitCode ?? "none"}${event.signal ? ` (${event.signal})` : ""}; completion follow-up received.` });
 		} else if (change === "already-completed") {
 			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: `Background job ${event.jobId} finished before its start marker was received.` });
