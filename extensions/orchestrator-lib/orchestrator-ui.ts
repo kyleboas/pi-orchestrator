@@ -36,11 +36,9 @@ function elapsed(worker: WorkerPanelItem, now: number): string {
 	// Time since the worker was last steered, not total runtime; frozen once settled.
 	const start = worker.lastActivityAt?.getTime() ?? worker.startedAt.getTime();
 	const end = worker.settledAt?.getTime() ?? now;
+	// Whole minutes past the first one: the row is glanced at, not stopwatched.
 	const seconds = Math.max(0, Math.floor((end - start) / 1_000));
-	if (seconds < 60) return `${seconds}s`;
-	const minutes = Math.floor(seconds / 60);
-	const remainder = seconds % 60;
-	return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
+	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m`;
 }
 
 function formatTokens(tokens: number): string {
@@ -109,32 +107,26 @@ function glyphFor(state: WorkerPanelState): string {
 	}
 }
 
-/**
- * Elapsed against the estimate, as `23m 14s / ~20m`. Both sides measure the
- * same thing — time since the last instruction — because the ledger records
- * run durations from that same anchor, so an overrun reads honestly.
- */
-function durationFor(worker: WorkerPanelItem, now: number): string {
-	const duration = elapsed(worker, now);
-	const estimate = worker.estimateMs;
-	if (estimate === undefined || !Number.isFinite(estimate) || estimate <= 0) return duration;
-	if (worker.state !== "starting" && worker.state !== "working") return duration;
-	return `${duration} / ~${formatEstimate(estimate)}`;
-}
-
 function formatEstimate(ms: number): string {
 	const seconds = Math.round(ms / 1_000);
 	return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
 }
 
+/**
+ * Space-separated glanceable fields: `23m ~20m ↑21.7k`. Elapsed and the
+ * estimate measure the same thing — time since the last instruction — because
+ * the ledger records run durations from that same anchor, so an overrun reads
+ * honestly.
+ */
 function statusFor(worker: WorkerPanelItem, now: number): string {
-	const duration = durationFor(worker, now);
-	if (worker.state === "failed") return `${duration} · failed`;
-	if (worker.state === "stopped") return `${duration} · stopped`;
-	if (worker.tokens !== undefined && worker.tokens > 0) {
-		return `${duration} · ↑ ${formatTokens(worker.tokens)} tokens`;
-	}
-	return duration;
+	const fields = [elapsed(worker, now)];
+	const estimate = worker.estimateMs;
+	const live = worker.state === "starting" || worker.state === "working";
+	if (live && estimate !== undefined && Number.isFinite(estimate) && estimate > 0) fields.push(`~${formatEstimate(estimate)}`);
+	if (worker.state === "failed") fields.push("failed");
+	else if (worker.state === "stopped") fields.push("stopped");
+	else if (worker.tokens !== undefined && worker.tokens > 0) fields.push(`↑${formatTokens(worker.tokens)}`);
+	return fields.join(" ");
 }
 
 export type WorkerPanelOptions = {
@@ -179,7 +171,7 @@ export function isExpiredWorker(
 
 /**
  * Claude-style one-line subagent rows:
- *   ○ Terra  Inspect the repository                         2s · ↑ 21.7k tokens
+ *   ○ Terra  Inspect the repository                            23m ~20m ↑21.7k
  *
  * `width` comes from Pi's Component.render(width), allowing the trailing
  * status to be genuinely right-aligned rather than padded for one terminal.
