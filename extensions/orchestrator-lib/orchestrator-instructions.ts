@@ -1,4 +1,6 @@
-import { advisorWorkerName, catalogText, nameList, selfPlanningWorkerNames, workerDescription, workerNames, type WorkerCatalog } from "./orchestrator-core.ts";
+import { WORKER_PROFILES, advisorWorkerName, catalogText, nameList, selfPlanningWorkerNames, workerDescription, workerNames, type WorkerCatalog } from "./orchestrator-core.ts";
+
+const ROOT_LINEAGE_POLICY = `Review/fix budgets belong to the original root task lineage, not an attempt or worker. By default, after implementation there may be at most one independent acceptance review and at most one bounded correction/fix pass for its findings. Every continuation, replacement, correction, or retry delegation must explicitly declare that relationship and carry retryOf with the prior worker's root identity. Omission is rejected; it must never be used to reset a budget. A linked replacement worker, retryOf delegation, or model change never resets either budget. After the fix, validate final files and accept/report from that evidence; do not automatically delegate a second reviewer or another fixer. If the one fix pass fails or validation still exposes a blocker, report the blocker and ask the user rather than silently continuing. Extra reviews/fixes require an explicit user request.`;
 
 /** Resolve the cheapest default worker name from the catalog. */
 function defaultWorkerName(catalog: WorkerCatalog): string {
@@ -57,5 +59,8 @@ Validation must match risk and changed surface: run focused tests or checks for 
 
 Write progress updates and reviews as plain sentences that lead with the content itself. Never open with a label prefix such as "Checkpoint:", "Update:", "Status:", or similar.
 
-Workers may use the restricted PR broker only when the user explicitly requested a PR create/update. Never delegate a merge: merge only after an explicit user request, normally by taking over the task yourself.\n\nIf the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request or the qualifying inspected fast path above.`;
+Workers may use the restricted PR broker only when the user explicitly requested a PR create/update. Never delegate a merge: merge only after an explicit user request, normally by taking over the task yourself.\n\n${ROOT_LINEAGE_POLICY}\n\nIf the user explicitly asks you to do a task yourself without delegating, call orchestrator_takeover once with a short reason. That enables direct implementation tools for exactly this task; orchestration resumes automatically afterward. Only use it for an explicit takeover request or the qualifying inspected fast path above.`;
 }
+
+/** Compatibility prompt for callers that use the canonical built-in catalog. */
+export const ORCHESTRATOR_INSTRUCTIONS = buildCoordinatorInstructions(WORKER_PROFILES);

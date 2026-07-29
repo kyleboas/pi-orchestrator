@@ -36,6 +36,8 @@ import {
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
 import { buildCoordinatorInstructions } from "./orchestrator-lib/orchestrator-instructions.ts";
 import { withOrchestratorDelegationContract } from "./orchestrator-lib/orchestrator-delegation-contract.ts";
+import { AUTONOMOUS_LINEAGE_ENTRY, validateScope, type AutonomousScope } from "./orchestrator-lib/autonomous-run-capability.js";
+import { consumeRootCorrection, rootCorrectionAvailable, validateDelegationRelationship } from "./orchestrator-lib/root-lineage-policy.js";
 import {
 	earliestAccountReset,
 	isClaudeAuthFailureText,
@@ -546,7 +548,10 @@ function handleRpcLine(worker: Worker, line: string): void {
 			}
 			break;
 		}
+		case "agent_end":
 		case "agent_settled":
+			// Pi 0.80.x emits agent_end; agent_settled remains accepted for
+			// compatibility with runtimes that expose the later idle boundary.
 			// An initial completion is deliberately held while a worker-owned
 			// background job is still in its process tree. Its completion extension
 			// follow-up starts the final callback-driven run; only that later settled
@@ -688,9 +693,14 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 		}
 	});
 	child.stderr.on("data", (chunk: Buffer) => {
-		// Do not retain stderr: it can include local auth/config details. Exit and
-		// stdin paths below report a safe, actionable status instead.
-		if (worker.process === child && chunk.length && worker.state !== "stopped") worker.lastError ??= `${worker.profile.backend === "claude-code" ? "Claude Code" : "Pi RPC"} worker reported stderr.`;
+		// Do not retain stderr: it can include local auth/config details. Pi and
+		// Claude also emit harmless startup warnings there while their structured
+		// stdout protocol remains healthy. Process error/exit handlers still fail
+		// workers that actually terminate, so stderr must never override a real
+		// assistant result or API error from the structured protocol.
+		if (worker.process === child && chunk.length && worker.state !== "stopped") {
+			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: "Worker process wrote diagnostic output to stderr." });
+		}
 	});
 	child.on("error", () => {
 		if (worker.process !== child) return;
@@ -1349,18 +1359,48 @@ export default function orchestrator(pi: ExtensionAPI) {
 			worker: delegateWorkerSchema,
 			task: Type.String({ description: "Complete worker brief. Start directly with coordinator investigation, facts, conclusions, and constraints. Carry forward exact paths, stable symbols or line ranges when useful, concrete root cause, planned changes, edge cases, acceptance criteria, and exact focused validation commands when discoverable. Do not begin with a Requested outcome heading, a request paraphrase, a command, an implementation summary, or any similar restatement of what the user wants. Do not require broad rediscovery, brittle line numbers, or large code dumps. End with a separately labeled verbatim user operative request; only when the request is too large, use a clearly labeled faithful excerpt. Nothing may follow that final user-request section. Never ask the worker to diagnose something you already determined, and never silently replace the user's request with your inferred plan." }),
 			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. Defaults to the coordinator's session directory." })),
-			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
+			relationship: Type.Union([
+				Type.Literal("new"), Type.Literal("continuation"), Type.Literal("replacement"), Type.Literal("correction"), Type.Literal("retry"),
+			], { description: "Declare new only for genuinely distinct work. Every continuation, replacement, correction, or retry must carry retryOf with the prior worker ID; omission must never reset lineage budgets." }),
+			retryOf: Type.Optional(Type.String({ description: "Prior worker ID for a linked continuation, replacement, correction, or retry. Omit only for a genuinely distinct new task or when autonomousScope supplies source-authorized lineage." })),
 			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
 			selfPlan: Type.Optional(Type.Boolean({ description: "True when this brief states a goal and leaves the approach to the worker; false when it carries a plan for the worker to execute. Set it explicitly whenever the user says in plain English who should plan. Omit to use the worker's configured default." })),
 			planOnly: Type.Optional(Type.Boolean({ description: "True when the plan itself is the deliverable: the worker investigates and reports an approach, changing nothing. Set it whenever the user asked for a plan, approach, or options without asking for the work to be done. The plan returns to you for the user to approve; implementing it is a separate delegation." })),
+			autonomousScope: Type.Optional(Type.Object({
+				capabilityId: Type.String(),
+				runId: Type.String(),
+				projectId: Type.String(),
+				workItemId: Type.String(),
+				dispatchId: Type.String(),
+				generation: Type.Integer({ minimum: 0 }),
+				role: Type.Union([Type.Literal("implementation"), Type.Literal("review"), Type.Literal("fix"), Type.Literal("replacement"), Type.Literal("continuation")]),
+			})),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const name = params.worker as string;
-			const requestedRetry = typeof params.retryOf === "string" ? params.retryOf.trim() : "";
-			const activeMatch = [...runtime.workers.values()].find((candidate) => candidate.rootTaskId === requestedRetry || candidate.id === requestedRetry || candidate.runId === requestedRetry);
-			const storedMatch = requestedRetry ? loadStats(undefined, workerNames(catalog)).recentRuns.find((run) => run.rootTaskId === requestedRetry || run.runId === requestedRetry) : undefined;
-			const rootTaskId = activeMatch?.rootTaskId ?? storedMatch?.rootTaskId ?? `task-${randomUUID()}`;
+			const scope = params.autonomousScope as AutonomousScope | undefined;
+			const authorization = validateScope(ctx.sessionManager.getEntries() as any[], scope);
+			if (!authorization.ok && (authorization.active || scope)) {
+				return content(`Delegation rejected: ${authorization.error}`, { rejected: true });
+			}
+			const binding = authorization.ok ? authorization.binding : undefined;
+			const requestedRetry = typeof params.retryOf === "string" ? params.retryOf.trim() : undefined;
+			const prior = requestedRetry ? runtime.workers.get(requestedRetry) : undefined;
+			let rootTaskId: string;
+			let retryOf: string | undefined;
+			if (authorization.ok) {
+				if (requestedRetry && (!prior || (binding && prior.rootTaskId !== binding.rootTaskId))) {
+					return content("Delegation rejected: retryOf conflicts with the source-authorized autonomous root.", { rejected: true });
+				}
+				rootTaskId = binding?.rootTaskId ?? prior?.rootTaskId ?? `task-${randomUUID()}`;
+				retryOf = prior?.id;
+			} else {
+				const relationship = validateDelegationRelationship(params.relationship, requestedRetry, Boolean(prior));
+				if (!relationship.ok) return content(`Delegation rejected: ${relationship.error}`, { rejected: true });
+				rootTaskId = prior?.rootTaskId ?? `task-${randomUUID()}`;
+				retryOf = prior?.id;
+			}
 			const fallback = classifyTask(params.task);
 			const suppliedCategory: unknown = params.category;
 			const suppliedComplexity: unknown = params.complexity;
@@ -1385,7 +1425,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			try {
 				worker = launchWorker(name, profile, workerTask, cwd, config, {
 					rootTaskId,
-					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
+					...(retryOf ? { retryOf } : {}),
 					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
 					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
 					// An explicit per-task choice wins; the profile default applies only when the coordinator did not choose.
@@ -1394,6 +1434,19 @@ export default function orchestrator(pi: ExtensionAPI) {
 				});
 			} catch (error) {
 				return content(`Delegation rejected: the worker process could not be started (${error instanceof Error ? error.message : String(error)}).`);
+			}
+			if (authorization.ok && !authorization.binding && scope) {
+				pi.appendEntry(AUTONOMOUS_LINEAGE_ENTRY, {
+					version: 1,
+					kind: "bind",
+					capabilityId: scope.capabilityId,
+					runId: scope.runId,
+					projectId: scope.projectId,
+					workItemId: scope.workItemId,
+					rootTaskId: worker.rootTaskId,
+					workerId: worker.id,
+					at: Date.now(),
+				});
 			}
 			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
 		},
@@ -1417,10 +1470,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
 			}
 			const kind = params.kind === "continuation" ? "continuation" : "correction";
+			if (kind === "correction" && !rootCorrectionAvailable(worker.rootTaskId)) {
+				return content(`Correction not sent for ${worker.id}: the root task's one correction has already been used. Delegate one concrete retry with retryOf ${worker.id}.`, { rejected: true, rootTaskId: worker.rootTaskId });
+			}
 			const completedAttempt = worker.state === "idle" && worker.reportedRun === worker.run;
 			const correctionBudgetKey = `${worker.id}:${worker.rootTaskId}`;
 			if (kind === "correction" && completedAttempt && (correctionSteerCounts.get(correctionBudgetKey) ?? 0) >= 1) {
-				return content(`Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.rootTaskId}, or report/ask about the blocker.`);
+				return content(`Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.id}, or report/ask about the blocker.`);
 			}
 			let interruptNote = "";
 			if (params.interrupt === true) {
@@ -1471,8 +1527,10 @@ export default function orchestrator(pi: ExtensionAPI) {
 				return content(`${worker.id} could not accept follow-up instructions.`);
 			}
 			const modeNote = modeChanged ? ` It switched to ${requestedMode ? "planning only, keeping any work already on disk" : "implementing"}.` : "";
-			if (kind === "correction" && completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
-			else if (kind === "continuation" && completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
+			if (kind === "correction") {
+				consumeRootCorrection(worker.rootTaskId);
+				if (completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
+			} else if (completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
 			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
 			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}`);

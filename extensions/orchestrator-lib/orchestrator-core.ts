@@ -16,6 +16,38 @@ export type ClaudeCodeWorkerProfile = { backend: "claude-code"; model: string; t
 export type WorkerProfile = PiRpcWorkerProfile | ClaudeCodeWorkerProfile;
 export type WorkerCatalog = Record<string, WorkerProfile>;
 
+/** Worker result text is bounded before it is retained or delivered. */
+export const MAX_WORKER_RESULT_BYTES = 64_000;
+export type BoundedWorkerText = { text: string; truncated: boolean; error?: "result-too-large" };
+export function appendBoundedWorkerText(current: BoundedWorkerText, value: string, limit = MAX_WORKER_RESULT_BYTES): BoundedWorkerText {
+	if (current.truncated) return current;
+	const bytes = Buffer.from(value, "utf8");
+	const remaining = Math.max(0, limit - Buffer.byteLength(current.text, "utf8"));
+	if (bytes.byteLength <= remaining) return { ...current, text: current.text + value };
+	let clippedBytes = bytes.subarray(0, remaining);
+	let clipped = clippedBytes.toString("utf8");
+	while (clipped.endsWith("\uFFFD") && clippedBytes.byteLength > 0) {
+		clippedBytes = clippedBytes.subarray(0, clippedBytes.byteLength - 1);
+		clipped = clippedBytes.toString("utf8");
+	}
+	return { text: current.text + clipped, truncated: true, error: "result-too-large" };
+}
+
+/** Compatibility catalog used by installed-Pi checks and extensions that import the canonical worker set. */
+export const OPUS_5_MEDIUM_WORKER = "Opus 5 Medium";
+export const OPUS_5_MEDIUM_MODEL = "anthropic/claude-opus-5-medium";
+export const WORKER_PROFILES = {
+	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", selfPlanning: true },
+	[OPUS_5_MEDIUM_WORKER]: { backend: "pi-rpc", model: OPUS_5_MEDIUM_MODEL, thinking: "medium", selfPlanning: true },
+	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
+	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low" },
+	Opus: { backend: "claude-code", model: "opus" },
+	Sonnet: { backend: "claude-code", model: "sonnet" },
+	Haiku: { backend: "claude-code", model: "haiku" },
+	Fable: { backend: "claude-code", model: "fable" },
+} as const satisfies WorkerCatalog;
+export type WorkerName = keyof typeof WORKER_PROFILES;
+
 export function isPiRpcWorkerProfile(profile: WorkerProfile): profile is PiRpcWorkerProfile { return profile.backend === "pi-rpc"; }
 export function workerNames(catalog: WorkerCatalog): string[] { return Object.keys(catalog); }
 export function selfPlanningWorkerNames(catalog: WorkerCatalog): string[] { return workerNames(catalog).filter((name) => catalog[name]?.selfPlanning === true); }
@@ -70,7 +102,7 @@ export function buildWorkerPrompt({ worker, task, cwd, backend, selfPlan, planOn
 		: "You own actual implementation: do not delegate and do not merely propose a patch. Delegated workers must never merge pull requests; pull request merging remains coordinator-only after explicit user authorization. Ask only when interpretations materially conflict, an action is destructive, or user-only input is required.";
 	const finalResponse = planOnly
 		? "include the concrete change you propose, the files it touches, edge cases, how it should be validated, and any blocker"
-		: "include changed files, validation run, and any blocker";
+		: "include changed files, validation run, any blocker, and any point where you departed from the brief's plan and why";
 	const guidance = `You are ${worker}, ${role}. Work directly in ${cwd}.
 
 ${briefGuidance}
@@ -93,7 +125,7 @@ Sol receives your final response directly and may send follow-up instructions wh
 export function buildModeChangeDirective(planOnly: boolean): string {
 	return planOnly
 		? "Mode change: stop implementing this task. Make no further edits, commits, or other changes. Do not revert or clean up what you have already changed. The plan is now the deliverable: report exactly what you already changed, then the remaining approach you propose, the files it would touch, edge cases, and how it should be validated."
-		: "Mode change: implementation is now authorized for this task. Carry out the approach you reported, adjusting it only where the source proves it wrong. You own actual implementation: do not delegate and do not merely propose a patch. Delegated workers must never merge pull requests; pull request merging remains coordinator-only after explicit user authorization. Your final response should include changed files, validation run, and any blocker.";
+		: "Mode change: implementation is now authorized for this task. Carry out the approach you reported, adjusting it only where the source proves it wrong. You own actual implementation: do not delegate and do not merely propose a patch. Delegated workers must never merge pull requests; pull request merging remains coordinator-only after explicit user authorization. Your final response should include changed files, validation run, any blocker, and any point where you departed from the approach you reported and why.";
 }
 
 export const SOL_PLANNING_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
@@ -110,7 +142,7 @@ export function implementationToolNames(activeTools: readonly string[], allTools
 export class SolToolMode {
 	#normalTools: string[] | undefined; #allTools: string[] = []; #takeoverActive = false;
 	get takeoverActive(): boolean { return this.#takeoverActive; }
-	activate(activeTools: readonly string[], allTools: readonly string[]): string[] { this.#normalTools ??= [...activeTools]; this.#allTools = [...allTools]; this.#takeoverActive = false; return solRestrictedTools(this.#allTools); }
+	activate(activeTools: readonly string[], allTools: readonly string[] = activeTools): string[] { this.#normalTools ??= [...activeTools]; this.#allTools = [...allTools]; this.#takeoverActive = false; return solRestrictedTools(this.#allTools); }
 	beginTakeover(prompt: string, currentTools: readonly string[], allTools: readonly string[]): string[] | undefined { return isSoloTakeoverPrompt(prompt) ? this.beginTakeoverTool(currentTools, allTools) : undefined; }
 	beginTakeoverTool(currentTools: readonly string[], allTools: readonly string[]): string[] { this.#takeoverActive = true; return implementationToolNames(this.#normalTools ?? currentTools, allTools); }
 	settle(): string[] | undefined { if (!this.#takeoverActive) return undefined; this.#takeoverActive = false; return solRestrictedTools(this.#allTools); }
