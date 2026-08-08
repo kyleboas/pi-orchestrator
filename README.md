@@ -78,7 +78,7 @@ A takeover interrupted with esc no longer sticks: the next user prompt while the
 ## Maintenance
 
 ```sh
-pi update @kyleboas/pi-orchestrator
+pi update --extensions
 pi remove @kyleboas/pi-orchestrator
 ```
 
