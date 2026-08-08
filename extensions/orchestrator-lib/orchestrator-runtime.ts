@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { WorkerProfile } from "./orchestrator-core.ts";
+import type { WorkerProfile, WorkerPromptMetrics } from "./orchestrator-core.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
 import { stopWorker, type WorkerLifecycle } from "./worker-lifecycle.ts";
 
@@ -27,6 +27,21 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	cwd: string;
 	/** Current delivery mode: true while the plan is the deliverable. Steering may flip this mid-task. */
 	planOnly?: boolean;
+	/** The user explicitly asked this worker to create or update a pull request. */
+	prCreationRequested?: boolean;
+	/** The worker has received the detailed PR-creation rules. */
+	prCreationGuidanceSent?: boolean;
+	/** The worker has received the implementation-only worktree rules. */
+	implementationPolicySent?: boolean;
+	needsWorktree?: boolean;
+	needsHeavyWork?: boolean;
+	needsBrowser?: boolean;
+	needsSecrets?: boolean;
+	heavyGuidanceSent?: boolean;
+	browserGuidanceSent?: boolean;
+	secretsGuidanceSent?: boolean;
+	/** UTF-8 prompt-size metrics captured before the initial dispatch. */
+	promptMetrics?: WorkerPromptMetrics;
 	process: ChildProcessWithoutNullStreams;
 	startedAt: Date;
 	/** Last delegate/steer instruction; the footer row timer counts from here. */

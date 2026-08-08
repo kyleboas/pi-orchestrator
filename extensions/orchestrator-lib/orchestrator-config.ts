@@ -35,11 +35,18 @@ function supportsThinking(model: string, thinking: PiThinkingLevel): boolean {
 	return model === SOL_MODEL ? SOL_THINKING.has(thinking) : THINKING.has(thinking);
 }
 export const DEFAULT_WORKERS: Record<string, WorkerProfile> = {
-	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap; the default for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
+	Luna: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-luna", thinking: "low", description: "Fast and cheap for routine bounded work: narrow searches, small mechanical edits, config changes, verification runs." },
+	"GPT-5.5 Off": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "off", description: "GPT-5.5 with thinking off; use for simple bounded work when this version is explicitly requested." },
+	"GPT-5.5 Minimal": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "minimal", description: "GPT-5.5 at minimal thinking; use for straightforward bounded work when this version is explicitly requested." },
+	"GPT-5.5 Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "low", description: "GPT-5.5 at low thinking; use for routine bounded work when this version is explicitly requested." },
+	"GPT-5.5 Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "medium", description: "GPT-5.5 at medium thinking; use for bounded multi-step work when this version is explicitly requested." },
+	"GPT-5.5 High": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "high", description: "GPT-5.5 at high thinking; use for harder work when this version is explicitly requested." },
+	"GPT-5.5 xHigh": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "xhigh", description: "GPT-5.5 at maximum thinking; reserve for difficult work when this version is explicitly requested." },
+	"GPT-5.5 Max": { backend: "pi-rpc", model: "openai-codex/gpt-5.5", thinking: "max", description: "GPT-5.5 at maximum effort; reserve for the most difficult work when this version is explicitly requested." },
 	"Sol-Low": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "low", description: "Mid tier for ordinary single-file implementation when Luna would be out of its depth." },
 	"Sol-Medium": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "medium", description: "Mid tier with more thinking for multi-step changes with edge cases." },
 	"Sol-High": { backend: "pi-rpc", model: "openai-codex/gpt-5.6-sol", thinking: "high", description: "Use only when a task or skill specifically asks for Sol-High; do not choose it for normal worker routing." },
-	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier; reserve for genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
+	Terra: { backend: "pi-rpc", model: "openai-codex/gpt-5.6-terra", thinking: "high", description: "Heavy tier and configured default worker; use for ordinary delegated work that benefits from higher reliability, genuinely hard multi-file work, tricky debugging, or design-sensitive changes." },
 	Opus: { backend: "claude-code", model: "claude-opus-5", description: "Strong Claude Opus 5 worker for hard implementation; also good for UI work." },
 	Sonnet: { backend: "claude-code", model: "sonnet" },
 	Haiku: { backend: "claude-code", model: "haiku" },
