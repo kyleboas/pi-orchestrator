@@ -25,6 +25,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	category: import("./orchestrator-stats.ts").TaskCategory;
 	complexity: import("./orchestrator-stats.ts").TaskComplexity;
 	cwd: string;
+	/** Current delivery mode: true while the plan is the deliverable. Steering may flip this mid-task. */
+	planOnly?: boolean;
 	process: ChildProcessWithoutNullStreams;
 	startedAt: Date;
 	/** Last delegate/steer instruction; the footer row timer counts from here. */
@@ -34,6 +36,8 @@ export type OrchestratorWorker = WorkerLifecycle & {
 	claudeSessionId?: string;
 	/** Account name (claude-select state key) this Claude worker is running on. */
 	claudeAccount?: string;
+	/** This account's credentials failed during the current turn; the result event rotates instead of failing. */
+	claudeAuthFailed?: boolean;
 	/** Latest instruction sent; resent after a usage-limit account failover. */
 	lastInstruction?: string;
 	tokens?: number;

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
 	DEFAULT_LIMIT_COOLDOWN_SECONDS,
 	earliestAccountReset,
+	isClaudeAuthFailureText,
 	isUsageLimitText,
 	markClaudeAccountLimited,
 	parseUsageLimitReset,
@@ -73,4 +74,22 @@ test("usage-limit text detection and reset parsing", () => {
 	assert.equal(parseUsageLimitReset("usage limit reached|1751234567890", now), 1_751_234_567.89);
 	assert.equal(parseUsageLimitReset("usage limit reached", now), undefined);
 	assert.equal(parseUsageLimitReset("usage limit reached|1000", now), undefined);
+});
+
+test("credential failures are recognized across Claude Code's wordings", () => {
+	assert.equal(isClaudeAuthFailureText("Not logged in \u00b7 Please run /login"), true);
+	assert.equal(isClaudeAuthFailureText("Invalid API key \u00b7 Please run /login"), true);
+	assert.equal(isClaudeAuthFailureText("OAuth token has expired"), true);
+	assert.equal(isClaudeAuthFailureText("authentication_failed"), true);
+	assert.equal(isClaudeAuthFailureText(undefined), false);
+	assert.equal(isClaudeAuthFailureText("Claude AI usage limit reached|1785168600"), false, "a usage limit takes the cooldown path, not the login path");
+	assert.equal(isClaudeAuthFailureText("The tests failed: expected 200, got 401 Unauthorized"), false, "a task's own auth error must not rotate the worker's account");
+});
+
+test("a logged-out account cools down on the default window with no reset to parse", () => {
+	const cfg = config();
+	const now = 2_000_000;
+	markClaudeAccountLimited(cfg, "a1", undefined, now);
+	assert.equal(earliestAccountReset(cfg, now), now + DEFAULT_LIMIT_COOLDOWN_SECONDS);
+	assert.equal(pickClaudeAccount(cfg, now)!.name, "a2", "rotation must skip the account needing /login");
 });

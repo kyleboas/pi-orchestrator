@@ -17,6 +17,8 @@ export type OrchestratorConfig = {
 	checkInMinutes: number;
 	/** Context-use percentage for outcome-boundary rollover; 0 disables. */
 	rolloverContextPercent: number;
+	/** Most workers that may hold a live process at once; 0 disables the cap. */
+	maxConcurrentWorkers: number;
 	warning?: string;
 };
 
@@ -64,16 +66,22 @@ function description(value: unknown): { description?: string } {
 	const cleaned = value.replace(/\s+/g, " ").trim().slice(0, 300);
 	return cleaned ? { description: cleaned } : {};
 }
+// Only an exact `true` grants the exemption, and anything else is ignored
+// rather than rejected: a typo here must not invalidate the whole catalog and
+// silently drop every worker back to the defaults.
+function selfPlanning(value: unknown): { selfPlanning?: boolean } {
+	return value === true ? { selfPlanning: true } : {};
+}
 function profile(value: unknown): WorkerProfile | undefined {
 	if (!object(value)) return undefined;
 	if (value.backend === "pi-rpc") {
 		if (!THINKING.has(value.thinking as PiThinkingLevel) || !piModel(value.model) || !supportsThinking(value.model.trim(), value.thinking as PiThinkingLevel)) return undefined;
-		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description) };
+		return { backend: "pi-rpc", model: value.model.trim(), thinking: value.thinking as PiThinkingLevel, ...description(value.description), ...selfPlanning(value.selfPlanning) };
 	}
 	if (value.backend === "claude-code" && nonempty(value.model)) {
 		if (value.thinking !== undefined && !CLAUDE_EFFORT.has(value.thinking as ClaudeEffort)) return undefined;
 		const thinking = value.thinking === undefined ? {} : { thinking: value.thinking as ClaudeEffort };
-		return { backend: "claude-code", model: value.model.trim(), ...thinking, ...description(value.description) };
+		return { backend: "claude-code", model: value.model.trim(), ...thinking, ...description(value.description), ...selfPlanning(value.selfPlanning) };
 	}
 	return undefined;
 }
@@ -115,12 +123,20 @@ function rolloverContextPercent(value: unknown): number {
 	if (value === undefined) return DEFAULT_ROLLOVER_CONTEXT_PERCENT;
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : DEFAULT_ROLLOVER_CONTEXT_PERCENT;
 }
+// Every live worker is a full model runtime holding hundreds of megabytes, so
+// on a small host the concurrent worker count, not the chosen model tier, is
+// what exhausts memory and drives the whole box into swap.
+export const DEFAULT_MAX_CONCURRENT_WORKERS = 3;
+function maxConcurrentWorkers(value: unknown): number {
+	if (value === undefined) return DEFAULT_MAX_CONCURRENT_WORKERS;
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : DEFAULT_MAX_CONCURRENT_WORKERS;
+}
 function joinWarnings(...warnings: (string | undefined)[]): string | undefined {
 	const present = warnings.filter(nonempty);
 	return present.length ? present.join(" ") : undefined;
 }
 function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
-	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, ...(warning ? { warning } : {}) };
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, maxConcurrentWorkers: DEFAULT_MAX_CONCURRENT_WORKERS, ...(warning ? { warning } : {}) };
 }
 
 /** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
@@ -167,6 +183,7 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 		}, workers: configuredWorkers,
 		checkInMinutes: checkInMinutes(raw.checkInMinutes),
 		rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
+		maxConcurrentWorkers: maxConcurrentWorkers(raw.maxConcurrentWorkers),
 		...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 	};
 }

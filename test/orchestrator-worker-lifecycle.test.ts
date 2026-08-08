@@ -3,7 +3,9 @@ import test from "node:test";
 import {
 	beginWorkerRun,
 	completeClaudeTurn,
+	mergeOutstandingClaudeTurns,
 	queueClaudeTurn,
+	startClaudeTurn,
 	beginWorkerSettlement,
 	canSteerWorker,
 	claimWorkerReport,
@@ -81,12 +83,45 @@ test("auto-stop selects only current reported terminal runs outside settlement",
 test("only the last outstanding Claude turn settles a steered worker", () => {
 	const worker = { state: "working" as const, run: 1 };
 	queueClaudeTurn(worker);
+	startClaudeTurn(worker);
 	queueClaudeTurn(worker); // steer while the first turn is still streaming
-	assert.equal(completeClaudeTurn(worker), false); // first turn's result must not settle
-	assert.equal(completeClaudeTurn(worker), true); // steered turn's result settles
+	startClaudeTurn(worker); // Claude began the steered turn as its own
+	assert.equal(completeClaudeTurn(worker), "earlier-turn"); // first turn's result must not settle
+	assert.equal(completeClaudeTurn(worker), "settles"); // steered turn's result settles
 });
 
-test("workers from before the counter existed settle on their first result", () => {
+test("a result answering an unstarted instruction awaits the merge verdict", () => {
 	const worker = { state: "working" as const, run: 1 };
-	assert.equal(completeClaudeTurn(worker), true);
+	queueClaudeTurn(worker);
+	startClaudeTurn(worker);
+	queueClaudeTurn(worker); // steer Claude may merge into the streaming turn
+	// The steered turn has not started, so this result may be the only one.
+	assert.equal(completeClaudeTurn(worker), "unstarted");
+});
+
+test("merged instructions settle on the result of the turn that absorbed them", () => {
+	const worker = { state: "working" as const, run: 1, pendingTurns: 1, startedTurns: 0 };
+	mergeOutstandingClaudeTurns(worker);
+	assert.equal(worker.pendingTurns, 0);
+	assert.equal(worker.startedTurns, 0);
+});
+
+test("workers from before the counters existed settle on their first result", () => {
+	const worker = { state: "working" as const, run: 1 };
+	assert.equal(completeClaudeTurn(worker), "settles");
+});
+
+test("stopping a worker drops an armed merge verdict", () => {
+	let cleared = false;
+	const worker: WorkerLifecycle = {
+		state: "working",
+		run: 1,
+		claudeMergeGraceTimer: setTimeout(() => {
+			cleared = false;
+		}, 60_000),
+	};
+	cleared = true;
+	stopWorker(worker);
+	assert.equal(worker.claudeMergeGraceTimer, undefined);
+	assert.equal(cleared, true);
 });

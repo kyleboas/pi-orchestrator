@@ -115,6 +115,26 @@ export function isUsageLimitText(text: string | undefined): boolean {
 	return USAGE_LIMIT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+const AUTH_FAILURE_PATTERNS = [
+	/please run \/login/i,
+	/\bnot logged in\b/i,
+	/\blogged out\b/i,
+	/invalid api key/i,
+	/authentication[ _]failed/i,
+	/(?:oauth|access|refresh) token (?:has )?expired/i,
+	/session (?:has )?expired/i,
+];
+
+/**
+ * True when a Claude worker error text is this account's credentials failing,
+ * not a task failure. The account cannot serve any work until it is logged in
+ * again, so the orchestrator rotates instead of reporting a dead worker.
+ */
+export function isClaudeAuthFailureText(text: string | undefined): boolean {
+	if (!text) return false;
+	return AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 /**
  * Claude Code's classic limit format is "Claude AI usage limit reached|<epoch>".
  * Returns epoch seconds when present and plausible.

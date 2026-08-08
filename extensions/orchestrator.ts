@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	SolToolMode,
+	buildModeChangeDirective,
 	buildWorkerPrompt,
 	catalogText,
 	workerDescription,
@@ -21,19 +22,25 @@ import {
 	type WorkerProfile,
 } from "./orchestrator-lib/orchestrator-core.ts";
 import {
+	claudeApiErrorEvent,
 	claudeAssistantText,
 	claudeCodeArgs,
 	drainClaudeStreamBuffer,
 	claudeResultSettlement,
 	claudeUsageTokenTotal,
 	claudeUserEvent,
+	isClaudeTurnStart,
 	parseClaudeStreamLine,
+	type ClaudeResultSettlement,
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
 import { buildCoordinatorInstructions } from "./orchestrator-lib/orchestrator-instructions.ts";
 import { withOrchestratorDelegationContract } from "./orchestrator-lib/orchestrator-delegation-contract.ts";
+import { AUTONOMOUS_LINEAGE_ENTRY, validateScope, type AutonomousScope } from "./orchestrator-lib/autonomous-run-capability.js";
+import { consumeRootCorrection, rootCorrectionAvailable, validateDelegationRelationship } from "./orchestrator-lib/root-lineage-policy.js";
 import {
 	earliestAccountReset,
+	isClaudeAuthFailureText,
 	isUsageLimitText,
 	markClaudeAccountLimited,
 	parseUsageLimitReset,
@@ -43,10 +50,13 @@ import {
 	beginWorkerRun,
 	beginWorkerSettlement,
 	canSteerWorker,
+	clearClaudeMergeGrace,
 	completeClaudeTurn,
 	finishWorkerSettlement,
 	markWorkerRunActive,
+	mergeOutstandingClaudeTurns,
 	queueClaudeTurn,
+	startClaudeTurn,
 	selectFinalWorkerText,
 	shouldAbortPiWorkerRun,
 	shouldAutoStopReportedWorker,
@@ -130,10 +140,14 @@ import {
 	isEscapeKey,
 	isPageDownKey,
 	isHomeKey,
+	MOUSE_TRACKING_OFF,
+	MOUSE_TRACKING_ON,
 	isPageUpKey,
 	isUpKey,
 	moveSelection,
 	renderSessionScreen,
+	wheelDirection,
+	WHEEL_SCROLL_LINES,
 	wrapPlainText,
 } from "./orchestrator-lib/orchestrator-session-view.ts";
 
@@ -305,6 +319,9 @@ function sendClaudeInstruction(worker: Worker, instructions: string): boolean {
 		worker.process.stdin.write(`${JSON.stringify(claudeUserEvent(instructions))}\n`, (error) => {
 			if (error) failWorker(worker, "Claude Code worker stdin failed.", "unavailable");
 		});
+		// New instructions invalidate any held merge verdict: its result belongs
+		// to a turn this write supersedes.
+		clearClaudeMergeGrace(worker);
 		queueClaudeTurn(worker);
 		worker.lastInstruction = instructions;
 		// Unlike Pi RPC's agent_start event, Claude's stream-json protocol has
@@ -393,6 +410,60 @@ async function settleWorker(worker: Worker): Promise<void> {
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
+/**
+ * How long a result waits for a turn-start event before its outstanding
+ * instructions are treated as merged into the turn that just ended. Claude
+ * Code starts a genuinely queued turn within milliseconds of the prior result,
+ * so this only delays the merged case, and only by the window itself.
+ */
+const CLAUDE_MERGED_TURN_GRACE_MS = 3_000;
+
+/**
+ * A result answered the current turn while an instruction is still outstanding.
+ * Claude Code either starts that instruction's own turn in a moment (its result
+ * settles the worker) or already merged it into the turn that just ended, in
+ * which case no further result will ever arrive and the worker would hang in
+ * "working" holding the finished text. Wait one window for a turn-start event
+ * to decide, then settle on this result if none came.
+ */
+function holdClaudeMergeVerdict(worker: Worker, settlement: ClaudeResultSettlement): void {
+	clearClaudeMergeGrace(worker);
+	const run = worker.run;
+	const timer = setTimeout(() => {
+		worker.claudeMergeGraceTimer = undefined;
+		if (worker.run !== run || worker.state === "stopped" || worker.state === "failed") return;
+		mergeOutstandingClaudeTurns(worker);
+		applyClaudeSettlement(worker, settlement);
+		notifyOrchestratorStateChange(getOrchestratorRuntime());
+	}, CLAUDE_MERGED_TURN_GRACE_MS);
+	timer.unref?.();
+	worker.claudeMergeGraceTimer = timer;
+}
+
+/** Settle or fail the worker on a result that owns the last outstanding turn. */
+function applyClaudeSettlement(worker: Worker, settlement: ClaudeResultSettlement): void {
+	const run = beginWorkerSettlement(worker);
+	if (run === undefined) return;
+	// Some Claude Code result events omit result even though the last assistant
+	// event already contained the final text. That is a successful terminal
+	// turn, not a reason to leave the reusable worker working or fail it.
+	const finalText = selectFinalWorkerText(worker.lastResult, settlement.result);
+	if (settlement.isError || !finalText) {
+		worker.settlingRun = undefined;
+		worker.state = "failed";
+		worker.settledAt ??= new Date();
+		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
+		recordRunOutcome(worker, "failed");
+		reportWorkerResult(worker);
+		return;
+	}
+	worker.lastResult = finalText;
+	if (finishWorkerSettlement(worker, run)) {
+		recordRunOutcome(worker, "completed");
+		reportWorkerResult(worker);
+	}
+}
+
 function settleClaudeResult(worker: Worker, event: Record<string, unknown>, config?: OrchestratorConfig): void {
 	const settlement = claudeResultSettlement(event);
 	if (!settlement) return;
@@ -407,38 +478,31 @@ function settleClaudeResult(worker: Worker, event: Record<string, unknown>, conf
 	// A usage-limit result is an account problem, not a task outcome: fail
 	// over to the next available account instead of settling or failing.
 	if (settlement.isError && isUsageLimitText(settlement.result) && config?.claudeAccounts) {
-		if (failoverClaudeWorker(worker, config, settlement.result ?? "")) return;
+		if (failoverClaudeWorker(worker, config, "usage-limit", settlement.result ?? "")) return;
 		const reset = earliestAccountReset(config.claudeAccounts);
 		failWorker(worker, `Usage limit reached and every Claude account is in cooldown${reset ? ` (earliest reset ${new Date(reset * 1_000).toLocaleTimeString()})` : ""}. Use a Pi worker or retry later.`, "unavailable");
+		return;
+	}
+	// Expired credentials are the same class of problem: this account cannot
+	// serve any work, but the session (and everything the worker has already
+	// done in it) survives on the next account. Never report a /login
+	// instruction as a task result.
+	if (settlement.isError && (worker.claudeAuthFailed === true || isClaudeAuthFailureText(settlement.result)) && config?.claudeAccounts) {
+		const loggedOut = worker.claudeAccount;
+		if (failoverClaudeWorker(worker, config, "auth", settlement.result ?? "")) return;
+		failWorker(
+			worker,
+			`Claude account ${loggedOut ?? "(unknown)"} needs re-authentication (run claude /login for it) and no other account is available.${worker.claudeSessionId ? ` Its work is preserved in session ${worker.claudeSessionId}; a worker resumed on that session continues where it stopped.` : ""}`,
+			"unavailable",
+		);
 		return;
 	}
 	// A result for an earlier turn (one that was already streaming when a
 	// steer queued another) must not settle the steered run: the worker is
 	// still working on the follow-up instructions.
-	if (!completeClaudeTurn(worker)) {
-		notifyOrchestratorStateChange(getOrchestratorRuntime());
-		return;
-	}
-	const run = beginWorkerSettlement(worker);
-	if (run === undefined) return;
-	// Some Claude Code result events omit result even though the last assistant
-	// event already contained the final text. That is a successful terminal
-	// turn, not a reason to leave the reusable worker working or fail it.
-	const finalText = selectFinalWorkerText(worker.lastResult, settlement.result);
-	if (settlement.isError || !finalText) {
-		worker.settlingRun = undefined;
-		worker.state = "failed";
-		worker.settledAt ??= new Date();
-		worker.lastError = settlement.result ?? "Claude Code returned a result event without final text.";
-		recordRunOutcome(worker, "failed");
-		reportWorkerResult(worker);
-	} else {
-		worker.lastResult = finalText;
-		if (finishWorkerSettlement(worker, run)) {
-			recordRunOutcome(worker, "completed");
-			reportWorkerResult(worker);
-		}
-	}
+	const completion = completeClaudeTurn(worker);
+	if (completion === "unstarted") holdClaudeMergeVerdict(worker, settlement);
+	else if (completion === "settles") applyClaudeSettlement(worker, settlement);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
 }
 
@@ -484,7 +548,10 @@ function handleRpcLine(worker: Worker, line: string): void {
 			}
 			break;
 		}
+		case "agent_end":
 		case "agent_settled":
+			// Pi 0.80.x emits agent_end; agent_settled remains accepted for
+			// compatibility with runtimes that expose the later idle boundary.
 			// An initial completion is deliberately held while a worker-owned
 			// background job is still in its process tree. Its completion extension
 			// follow-up starts the final callback-driven run; only that later settled
@@ -517,9 +584,20 @@ function handleRpcLine(worker: Worker, line: string): void {
 function handleClaudeEvents(worker: Worker, events: Record<string, unknown>[], config?: OrchestratorConfig): void {
 	for (const event of events) {
 		for (const entry of transcriptFromClaudeEvent(event)) recordWorkerActivity(worker, entry);
+		// A turn that actually started proves its instructions were not merged
+		// into the previous one, so a held result must not settle the worker.
+		if (isClaudeTurnStart(event)) {
+			clearClaudeMergeGrace(worker);
+			startClaudeTurn(worker);
+		}
+		// An API-level failure is not model output: "Please run /login" must never
+		// survive as this worker's final result, and an auth failure arms the
+		// account rotation its result event performs.
+		const apiError = claudeApiErrorEvent(event);
+		if (apiError?.authenticationFailed || isClaudeAuthFailureText(apiError?.text)) worker.claudeAuthFailed = true;
 		// A successful result can omit its direct result text. Preserve the last
 		// complete assistant message as the safe fallback for that terminal event.
-		const text = claudeAssistantText(event);
+		const text = apiError ? undefined : claudeAssistantText(event);
 		if (text) worker.lastResult = text;
 		settleClaudeResult(worker, event, config);
 		notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -615,9 +693,14 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 		}
 	});
 	child.stderr.on("data", (chunk: Buffer) => {
-		// Do not retain stderr: it can include local auth/config details. Exit and
-		// stdin paths below report a safe, actionable status instead.
-		if (worker.process === child && chunk.length && worker.state !== "stopped") worker.lastError ??= `${worker.profile.backend === "claude-code" ? "Claude Code" : "Pi RPC"} worker reported stderr.`;
+		// Do not retain stderr: it can include local auth/config details. Pi and
+		// Claude also emit harmless startup warnings there while their structured
+		// stdout protocol remains healthy. Process error/exit handlers still fail
+		// workers that actually terminate, so stderr must never override a real
+		// assistant result or API error from the structured protocol.
+		if (worker.process === child && chunk.length && worker.state !== "stopped") {
+			recordWorkerActivity(worker, { at: Date.now(), role: "system", text: "Worker process wrote diagnostic output to stderr." });
+		}
 	});
 	child.on("error", () => {
 		if (worker.process !== child) return;
@@ -641,17 +724,22 @@ function wireWorkerChild(worker: Worker, child: Worker["process"], config: Orche
 }
 
 /**
- * A Claude worker hit its account's usage limit: put that account in cooldown
- * (claude-select/claude-auto honor the same state file) and restart the
- * worker on the next available account, resuming the same Claude session and
- * resending the interrupted instruction. Returns false when no account is
- * available, in which case the caller fails the worker.
+ * A Claude worker's account became unusable — its usage limit was reached, or
+ * its credentials expired ("Please run /login"). Both are account problems
+ * rather than task outcomes: put that account in cooldown (claude-select and
+ * claude-auto honor the same state file) and restart the worker on the next
+ * available account, resuming the same Claude session so everything the worker
+ * has already done is carried over, then resend the interrupted instruction.
+ * Returns false when no account is available, in which case the caller fails
+ * the worker.
  */
-function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitText: string): boolean {
+function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, reason: "usage-limit" | "auth", errorText: string): boolean {
 	const accounts = config.claudeAccounts;
 	if (!accounts || worker.profile.backend !== "claude-code") return false;
 	if (worker.claudeAccount) {
-		markClaudeAccountLimited(accounts, worker.claudeAccount, parseUsageLimitReset(limitText));
+		// A logged-out account has no reset time to parse; the default cooldown
+		// keeps rotation off it until it is re-authenticated.
+		markClaudeAccountLimited(accounts, worker.claudeAccount, reason === "auth" ? undefined : parseUsageLimitReset(errorText));
 	}
 	const pick = pickClaudeAccount(accounts);
 	if (!pick) return false;
@@ -666,14 +754,19 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	}
 	worker.process = child;
 	worker.buffer = "";
-	worker.pendingTurns = 0;
+	clearClaudeMergeGrace(worker);
+	mergeOutstandingClaudeTurns(worker);
+	const failedAccount = worker.claudeAccount;
 	worker.claudeAccount = pick.name;
+	worker.claudeAuthFailed = undefined;
 	worker.state = "working";
 	wireWorkerChild(worker, child, config);
 	recordWorkerActivity(worker, {
 		at: Date.now(),
 		role: "system",
-		text: `Usage limit reached; switched to account ${pick.name} and resumed.`,
+		text: reason === "auth"
+			? `Account ${failedAccount ?? "(unknown)"} needs re-authentication; switched to account ${pick.name} and resumed this session.`
+			: `Usage limit reached; switched to account ${pick.name} and resumed.`,
 	});
 	const instruction = worker.lastInstruction ?? worker.task;
 	if (!sendWorkerInstruction(worker, instruction, true)) {
@@ -684,7 +777,7 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, limitT
 	return true;
 }
 
-function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity }): Worker {
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity; selfPlan?: boolean; planOnly?: boolean }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const child = profile.backend === "pi-rpc"
@@ -710,6 +803,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		rpcNextId: 0,
 		rpcPending: new Map(),
 		...(account ? { claudeAccount: account.name } : {}),
+		...(lineage.planOnly ? { planOnly: true } : {}),
 	};
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -721,7 +815,7 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		return worker;
 	}
 
-	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend });
+	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend, selfPlan: lineage.selfPlan ?? profile.selfPlanning === true, ...(lineage.planOnly ? { planOnly: true } : {}) });
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -938,6 +1032,12 @@ export default function orchestrator(pi: ExtensionAPI) {
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, _keybindings, done) => {
+						// Wheel events only reach the extension while tracking is on, and the
+						// terminal must be put back the way it was found on the way out.
+						const writeRaw = (sequence: string) => { try { process.stdout.write(sequence); } catch { /* a closed stdout is not worth failing the view over */ } };
+						writeRaw(MOUSE_TRACKING_ON);
+						const restoreMouse = () => writeRaw(MOUSE_TRACKING_OFF);
+						process.once("exit", restoreMouse);
 						let scrollUp = 0;
 						// Anchoring state: a scrolled viewport must keep showing the same
 						// lines when the worker appends new output below them.
@@ -1029,7 +1129,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 								return view.lines;
 							},
 							handleInput: (data: string) => {
-								if (isUpKey(data)) scrollUp += 1;
+								const wheel = wheelDirection(data);
+								if (wheel) scrollUp = Math.max(0, scrollUp + (wheel === "up" ? WHEEL_SCROLL_LINES : -WHEEL_SCROLL_LINES));
+								else if (isUpKey(data)) scrollUp += 1;
 								else if (isDownKey(data)) scrollUp = Math.max(0, scrollUp - 1);
 								else if (isPageUpKey(data)) scrollUp += pageSize;
 								else if (isPageDownKey(data)) scrollUp = Math.max(0, scrollUp - pageSize);
@@ -1043,7 +1145,11 @@ export default function orchestrator(pi: ExtensionAPI) {
 								tui.requestRender();
 							},
 							invalidate: () => {},
-							dispose: () => clearInterval(tick),
+							dispose: () => {
+							clearInterval(tick);
+							process.off("exit", restoreMouse);
+							restoreMouse();
+						},
 						};
 					},
 					// Full-terminal takeover: extensions cannot swap pi's core chat
@@ -1247,22 +1353,54 @@ export default function orchestrator(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "orchestrator_delegate",
 		label: "Delegate to worker",
-		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count. For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
+		description: `Start a persistent ${catalogNames} implementation worker. Its final result is delivered to the coordinator. Delegate only work that should not use the qualifying takeover fast path. Independent workstreams may be delegated to different workers in one turn only when they are truly independent; do not split tiny work just to meet a worker count.${config.maxConcurrentWorkers > 0 ? ` At most ${config.maxConcurrentWorkers} workers may be live at once; delegation beyond that is rejected until one settles, so plan fan-out within that limit.` : ""} For a separately delegated retry, pass retryOf as the original root task ID returned in tool details; it joins that root only when resolvable. Category is one of ${TASK_CATEGORIES.join(", ")}; complexity is low, medium, or high.`,
 		executionMode: "parallel",
 		parameters: Type.Object({
 			worker: delegateWorkerSchema,
 			task: Type.String({ description: "Complete worker brief. Start directly with coordinator investigation, facts, conclusions, and constraints. Carry forward exact paths, stable symbols or line ranges when useful, concrete root cause, planned changes, edge cases, acceptance criteria, and exact focused validation commands when discoverable. Do not begin with a Requested outcome heading, a request paraphrase, a command, an implementation summary, or any similar restatement of what the user wants. Do not require broad rediscovery, brittle line numbers, or large code dumps. End with a separately labeled verbatim user operative request; only when the request is too large, use a clearly labeled faithful excerpt. Nothing may follow that final user-request section. Never ask the worker to diagnose something you already determined, and never silently replace the user's request with your inferred plan." }),
 			cwd: Type.Optional(Type.String({ description: "Absolute repository directory the worker runs in. Defaults to the coordinator's session directory." })),
-			retryOf: Type.Optional(Type.String({ description: "Original root task ID for a separately delegated retry. Omit for a distinct new task." })),
+			relationship: Type.Union([
+				Type.Literal("new"), Type.Literal("continuation"), Type.Literal("replacement"), Type.Literal("correction"), Type.Literal("retry"),
+			], { description: "Declare new only for genuinely distinct work. Every continuation, replacement, correction, or retry must carry retryOf with the prior worker ID; omission must never reset lineage budgets." }),
+			retryOf: Type.Optional(Type.String({ description: "Prior worker ID for a linked continuation, replacement, correction, or retry. Omit only for a genuinely distinct new task or when autonomousScope supplies source-authorized lineage." })),
 			category: Type.Optional(Type.Union(TASK_CATEGORIES.map((value) => Type.Literal(value)))),
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
+			selfPlan: Type.Optional(Type.Boolean({ description: "True when this brief states a goal and leaves the approach to the worker; false when it carries a plan for the worker to execute. Set it explicitly whenever the user says in plain English who should plan. Omit to use the worker's configured default." })),
+			planOnly: Type.Optional(Type.Boolean({ description: "True when the plan itself is the deliverable: the worker investigates and reports an approach, changing nothing. Set it whenever the user asked for a plan, approach, or options without asking for the work to be done. The plan returns to you for the user to approve; implementing it is a separate delegation." })),
+			autonomousScope: Type.Optional(Type.Object({
+				capabilityId: Type.String(),
+				runId: Type.String(),
+				projectId: Type.String(),
+				workItemId: Type.String(),
+				dispatchId: Type.String(),
+				generation: Type.Integer({ minimum: 0 }),
+				role: Type.Union([Type.Literal("implementation"), Type.Literal("review"), Type.Literal("fix"), Type.Literal("replacement"), Type.Literal("continuation")]),
+			})),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 			const name = params.worker as string;
-			const requestedRetry = typeof params.retryOf === "string" ? params.retryOf.trim() : "";
-			const activeMatch = [...runtime.workers.values()].find((candidate) => candidate.rootTaskId === requestedRetry || candidate.id === requestedRetry || candidate.runId === requestedRetry);
-			const storedMatch = requestedRetry ? loadStats(undefined, workerNames(catalog)).recentRuns.find((run) => run.rootTaskId === requestedRetry || run.runId === requestedRetry) : undefined;
-			const rootTaskId = activeMatch?.rootTaskId ?? storedMatch?.rootTaskId ?? `task-${randomUUID()}`;
+			const scope = params.autonomousScope as AutonomousScope | undefined;
+			const authorization = validateScope(ctx.sessionManager.getEntries() as any[], scope);
+			if (!authorization.ok && (authorization.active || scope)) {
+				return content(`Delegation rejected: ${authorization.error}`, { rejected: true });
+			}
+			const binding = authorization.ok ? authorization.binding : undefined;
+			const requestedRetry = typeof params.retryOf === "string" ? params.retryOf.trim() : undefined;
+			const prior = requestedRetry ? runtime.workers.get(requestedRetry) : undefined;
+			let rootTaskId: string;
+			let retryOf: string | undefined;
+			if (authorization.ok) {
+				if (requestedRetry && (!prior || (binding && prior.rootTaskId !== binding.rootTaskId))) {
+					return content("Delegation rejected: retryOf conflicts with the source-authorized autonomous root.", { rejected: true });
+				}
+				rootTaskId = binding?.rootTaskId ?? prior?.rootTaskId ?? `task-${randomUUID()}`;
+				retryOf = prior?.id;
+			} else {
+				const relationship = validateDelegationRelationship(params.relationship, requestedRetry, Boolean(prior));
+				if (!relationship.ok) return content(`Delegation rejected: ${relationship.error}`, { rejected: true });
+				rootTaskId = prior?.rootTaskId ?? `task-${randomUUID()}`;
+				retryOf = prior?.id;
+			}
 			const fallback = classifyTask(params.task);
 			const suppliedCategory: unknown = params.category;
 			const suppliedComplexity: unknown = params.complexity;
@@ -1275,16 +1413,40 @@ export default function orchestrator(pi: ExtensionAPI) {
 			} catch (error) {
 				return content(`Delegation rejected: ${error instanceof Error ? error.message : String(error)}`);
 			}
+			// Settled workers stay in the map until a later render prunes them, so
+			// admission counts live processes: those are what actually hold memory.
+			// This check and the launch stay in one synchronous block because
+			// delegation runs in parallel mode and two calls must not both pass.
+			const live = [...runtime.workers.values()].filter((candidate) => isWorkerProcessLive(candidate.process));
+			if (config.maxConcurrentWorkers > 0 && live.length >= config.maxConcurrentWorkers) {
+				return content(`Delegation rejected: ${live.length} of ${config.maxConcurrentWorkers} allowed workers are already live (${live.map((candidate) => candidate.id).join(", ")}). Wait for one to settle, or stop one, before delegating again.`);
+			}
 			let worker: Worker;
 			try {
 				worker = launchWorker(name, profile, workerTask, cwd, config, {
 					rootTaskId,
-					...(requestedRetry && (activeMatch || storedMatch) ? { retryOf: rootTaskId } : {}),
+					...(retryOf ? { retryOf } : {}),
 					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
 					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
+					// An explicit per-task choice wins; the profile default applies only when the coordinator did not choose.
+					selfPlan: typeof params.selfPlan === "boolean" ? params.selfPlan : profile.selfPlanning === true,
+					...(params.planOnly === true ? { planOnly: true } : {}),
 				});
 			} catch (error) {
 				return content(`Delegation rejected: the worker process could not be started (${error instanceof Error ? error.message : String(error)}).`);
+			}
+			if (authorization.ok && !authorization.binding && scope) {
+				pi.appendEntry(AUTONOMOUS_LINEAGE_ENTRY, {
+					version: 1,
+					kind: "bind",
+					capabilityId: scope.capabilityId,
+					runId: scope.runId,
+					projectId: scope.projectId,
+					workItemId: scope.workItemId,
+					rootTaskId: worker.rootTaskId,
+					workerId: worker.id,
+					at: Date.now(),
+				});
 			}
 			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
 		},
@@ -1299,6 +1461,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 			instructions: Type.String({ description: "Concrete follow-up instructions for the worker." }),
 			kind: Type.Optional(Type.Union([Type.Literal("correction"), Type.Literal("continuation")])),
 			interrupt: Type.Optional(Type.Boolean({ description: "Abort the in-flight run before delivering the instructions (Pi workers only; discards the aborted run's partial result). Use only to stop active wrong-direction work, never for routine follow-ups." })),
+			planOnly: Type.Optional(Type.Boolean({ description: "Switch this live worker's mode. False authorizes it to implement the plan it reported; true stops it implementing and makes the plan the deliverable, keeping any work already on disk. Omit to leave the current mode unchanged." })),
 		}),
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
@@ -1307,10 +1470,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
 			}
 			const kind = params.kind === "continuation" ? "continuation" : "correction";
+			if (kind === "correction" && !rootCorrectionAvailable(worker.rootTaskId)) {
+				return content(`Correction not sent for ${worker.id}: the root task's one correction has already been used. Delegate one concrete retry with retryOf ${worker.id}.`, { rejected: true, rootTaskId: worker.rootTaskId });
+			}
 			const completedAttempt = worker.state === "idle" && worker.reportedRun === worker.run;
 			const correctionBudgetKey = `${worker.id}:${worker.rootTaskId}`;
 			if (kind === "correction" && completedAttempt && (correctionSteerCounts.get(correctionBudgetKey) ?? 0) >= 1) {
-				return content(`Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.rootTaskId}, or report/ask about the blocker.`);
+				return content(`Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.id}, or report/ask about the blocker.`);
 			}
 			let interruptNote = "";
 			if (params.interrupt === true) {
@@ -1348,16 +1514,26 @@ export default function orchestrator(pi: ExtensionAPI) {
 			worker.runId = `${worker.id}:run-${worker.run}`;
 			worker.lastResult = undefined;
 			worker.lastError = undefined;
-			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: params.instructions });
-			if (!sendWorkerInstruction(worker, params.instructions, true)) {
+			worker.claudeAuthFailed = undefined;
+			// The launch prompt issued the opposite standing order, so a mode switch
+			// must lead the instructions rather than trail them.
+			const requestedMode = typeof params.planOnly === "boolean" ? params.planOnly : undefined;
+			const modeChanged = requestedMode !== undefined && requestedMode !== (worker.planOnly === true);
+			const instructions = modeChanged ? `${buildModeChangeDirective(requestedMode!)}\n\n${params.instructions}` : params.instructions;
+			if (modeChanged) worker.planOnly = requestedMode;
+			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: instructions });
+			if (!sendWorkerInstruction(worker, instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
 				return content(`${worker.id} could not accept follow-up instructions.`);
 			}
-			if (kind === "correction" && completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
-			else if (kind === "continuation" && completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
+			const modeNote = modeChanged ? ` It switched to ${requestedMode ? "planning only, keeping any work already on disk" : "implementing"}.` : "";
+			if (kind === "correction") {
+				consumeRootCorrection(worker.rootTaskId);
+				if (completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
+			} else if (completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
 			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
-			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}`);
+			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}`);
 		},
 	});
 

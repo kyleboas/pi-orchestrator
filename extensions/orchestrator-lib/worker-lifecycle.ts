@@ -11,11 +11,18 @@ export type WorkerLifecycle = BackgroundJobTracking & {
 	reportingRun?: number;
 	/** When the worker last left the live states; freezes the row timer and ages it out of selection. */
 	settledAt?: Date;
-	/** Claude Code emits one result event per user turn; only the last outstanding turn settles the worker. */
+	/** Claude Code instructions written but not yet answered by a result event. */
 	pendingTurns?: number;
+	/** Turns Claude Code actually started (one system/init each) and has not yet ended with a result. */
+	startedTurns?: number;
+	/** Armed while a written instruction has not started its own turn and may have been merged into the finished one. */
+	claudeMergeGraceTimer?: ReturnType<typeof setTimeout>;
 	/** A Pi turn that has settled and is waiting for its background jobs. */
 	backgroundSettlementHeldRun?: number;
 };
+
+/** One outstanding Claude turn's result: settles, belongs to an earlier turn, or awaits a merge verdict. */
+export type ClaudeTurnCompletion = "settles" | "earlier-turn" | "unstarted";
 
 /** Record that one more user turn was written to a Claude Code worker. */
 export function queueClaudeTurn(worker: WorkerLifecycle): void {
@@ -23,14 +30,41 @@ export function queueClaudeTurn(worker: WorkerLifecycle): void {
 }
 
 /**
- * Record one Claude Code result event. Returns true when it belongs to the
- * last outstanding turn and may settle the worker; earlier results (a turn
- * that was already streaming when a steer queued another) must not settle
- * the steered run.
+ * Record that Claude Code actually began a turn. Instructions written while a
+ * turn is streaming are often merged into it instead of starting their own, so
+ * a write alone never proves another result event is coming.
  */
-export function completeClaudeTurn(worker: WorkerLifecycle): boolean {
+export function startClaudeTurn(worker: WorkerLifecycle): void {
+	worker.startedTurns = (worker.startedTurns ?? 0) + 1;
+}
+
+/**
+ * Record one Claude Code result event. "settles" means it answered the last
+ * outstanding instruction. "earlier-turn" means a later turn is already
+ * running, so this result (a turn that was still streaming when a steer queued
+ * another) must not settle the steered run. "unstarted" means an instruction
+ * is outstanding that Claude has not begun a turn for: it either starts one
+ * shortly or was merged into the turn that just ended, and only the absence of
+ * a later turn-start event distinguishes the two.
+ */
+export function completeClaudeTurn(worker: WorkerLifecycle): ClaudeTurnCompletion {
 	worker.pendingTurns = Math.max(0, (worker.pendingTurns ?? 1) - 1);
-	return worker.pendingTurns === 0;
+	worker.startedTurns = Math.max(0, (worker.startedTurns ?? 1) - 1);
+	if (worker.pendingTurns === 0) return "settles";
+	return worker.startedTurns > 0 ? "earlier-turn" : "unstarted";
+}
+
+/** Treat every outstanding instruction as merged into the turn that just ended. */
+export function mergeOutstandingClaudeTurns(worker: WorkerLifecycle): void {
+	worker.pendingTurns = 0;
+	worker.startedTurns = 0;
+}
+
+/** Drop an armed merge verdict; a new instruction or a terminal state invalidates it. */
+export function clearClaudeMergeGrace(worker: WorkerLifecycle): void {
+	if (worker.claudeMergeGraceTimer === undefined) return;
+	clearTimeout(worker.claudeMergeGraceTimer);
+	worker.claudeMergeGraceTimer = undefined;
 }
 
 export type WorkerProcessState = {
@@ -110,6 +144,7 @@ export function shouldAutoStopReportedWorker(worker: WorkerLifecycle): boolean {
 /** Stop invalidates any in-flight settlement lookup before the child is killed. */
 export function stopWorker(worker: WorkerLifecycle): void {
 	worker.state = "stopped";
+	clearClaudeMergeGrace(worker);
 	worker.settlingRun = undefined;
 	worker.backgroundSettlementHeldRun = undefined;
 	clearBackgroundJobs(worker);
