@@ -11,9 +11,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	SolToolMode,
-	buildModeChangeDirective,
+	applyWorkerPolicyTransition,
 	buildWorkerPrompt,
+	buildWorkerPromptSections,
 	catalogText,
+	lintWorkerTaskPolicyDuplication,
+	measureWorkerPrompt,
 	workerDescription,
 	workerNames,
 	piRpcWorkerArgs,
@@ -34,7 +37,7 @@ import {
 	type ClaudeResultSettlement,
 } from "./orchestrator-lib/orchestrator-claude.ts";
 import { loadOrchestratorConfig, type OrchestratorConfig } from "./orchestrator-lib/orchestrator-config.ts";
-import { buildCoordinatorInstructions } from "./orchestrator-lib/orchestrator-instructions.ts";
+import { buildCoordinatorInstructions, subscriptionSensitiveWorkerSelectionGuidance } from "./orchestrator-lib/orchestrator-instructions.ts";
 import { withOrchestratorDelegationContract } from "./orchestrator-lib/orchestrator-delegation-contract.ts";
 import { AUTONOMOUS_LINEAGE_ENTRY, validateScope, type AutonomousScope } from "./orchestrator-lib/autonomous-run-capability.js";
 import { consumeRootCorrection, rootCorrectionAvailable, validateDelegationRelationship } from "./orchestrator-lib/root-lineage-policy.js";
@@ -166,8 +169,8 @@ export function createWorkerSchema(catalog: WorkerCatalog) {
 	return Type.Union(workerNames(catalog).map((name) => Type.Literal(name, { description: workerDescription(name, catalog[name]!) })));
 }
 
-export function coordinatorInstructions(catalog: WorkerCatalog, statsText?: string): string {
-	return buildCoordinatorInstructions(catalog, statsText);
+export function coordinatorInstructions(catalog: WorkerCatalog, statsText?: string, options: { subscriptionSensitive?: boolean } = {}): string {
+	return buildCoordinatorInstructions(catalog, statsText, options);
 }
 
 function workerWidgetLines(now = Date.now(), width = 80, options: WorkerPanelOptions = {}): string[] | undefined {
@@ -777,7 +780,7 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, reason
 	return true;
 }
 
-function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; complexity: TaskComplexity; selfPlan?: boolean; planOnly?: boolean }): Worker {
+function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: string, config: OrchestratorConfig, lineage: { rootTaskId: string; retryOf?: string; category: TaskCategory; promptCategory?: TaskCategory; complexity: TaskComplexity; selfPlan?: boolean; planOnly?: boolean; needsWorktree?: boolean; needsHeavyWork?: boolean; needsBrowser?: boolean; needsSecrets?: boolean; prCreationRequested?: boolean; validationCommands?: string[]; knownFacts?: string[] }): Worker {
 	const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomUUID().slice(0, 8)}`;
 	const account = profile.backend === "claude-code" && config.claudeAccounts ? pickClaudeAccount(config.claudeAccounts) : undefined;
 	const child = profile.backend === "pi-rpc"
@@ -804,6 +807,17 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		rpcPending: new Map(),
 		...(account ? { claudeAccount: account.name } : {}),
 		...(lineage.planOnly ? { planOnly: true } : {}),
+		...(lineage.needsWorktree !== undefined ? { needsWorktree: lineage.needsWorktree } : {}),
+		...(lineage.needsHeavyWork !== undefined ? { needsHeavyWork: lineage.needsHeavyWork } : {}),
+		...(lineage.needsBrowser !== undefined ? { needsBrowser: lineage.needsBrowser } : {}),
+		...(lineage.needsSecrets !== undefined ? { needsSecrets: lineage.needsSecrets } : {}),
+		...(lineage.prCreationRequested ? { prCreationRequested: true } : {}),
+		...(!lineage.planOnly ? { implementationPolicySent: lineage.needsWorktree !== false } : {}),
+		...(lineage.needsHeavyWork === true ? { heavyGuidanceSent: true } : {}),
+		...(lineage.needsBrowser === true ? { browserGuidanceSent: true } : {}),
+		...(lineage.needsSecrets === true ? { secretsGuidanceSent: true } : {}),
+		...(!lineage.planOnly && lineage.prCreationRequested ? { prCreationGuidanceSent: true } : {}),
+		...(lineage.needsHeavyWork === true && profile.backend === "pi-rpc" ? { backgroundGuidanceSent: true } : {}),
 	};
 	getOrchestratorRuntime().workers.set(id, worker);
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -815,7 +829,23 @@ function launchWorker(name: string, profile: WorkerProfile, task: string, cwd: s
 		return worker;
 	}
 
-	const prompt = buildWorkerPrompt({ worker: name, task, cwd, backend: profile.backend, selfPlan: lineage.selfPlan ?? profile.selfPlanning === true, ...(lineage.planOnly ? { planOnly: true } : {}) });
+	const prompt = buildWorkerPrompt({
+		worker: name,
+		task,
+		cwd,
+		backend: profile.backend,
+		selfPlan: lineage.selfPlan ?? profile.selfPlanning === true,
+		...(lineage.planOnly ? { planOnly: true } : {}),
+		...(lineage.promptCategory ? { category: lineage.promptCategory } : {}),
+		...(lineage.needsWorktree !== undefined ? { needsWorktree: lineage.needsWorktree } : {}),
+		...(lineage.needsHeavyWork !== undefined ? { needsHeavyWork: lineage.needsHeavyWork } : {}),
+		...(lineage.needsBrowser !== undefined ? { needsBrowser: lineage.needsBrowser } : {}),
+		...(lineage.needsSecrets !== undefined ? { needsSecrets: lineage.needsSecrets } : {}),
+		...(lineage.prCreationRequested ? { prCreationRequested: true } : {}),
+		...(lineage.validationCommands ? { validationCommands: lineage.validationCommands } : {}),
+		...(lineage.knownFacts ? { knownFacts: lineage.knownFacts } : {}),
+	});
+	worker.promptMetrics = measureWorkerPrompt(task, prompt);
 	recordWorkerActivity(worker, { at: Date.now(), role: "user", text: task });
 	if (!sendWorkerInstruction(worker, prompt)) failWorker(worker, "Worker stdin was unavailable at startup.", "unavailable");
 	notifyOrchestratorStateChange(getOrchestratorRuntime());
@@ -1342,11 +1372,7 @@ export default function orchestrator(pi: ExtensionAPI) {
 		execute: async (_toolCallId, params) => {
 			takeoverReason = params.reason;
 			pi.setActiveTools(solToolMode.beginTakeoverTool(pi.getActiveTools(), pi.getAllTools().map((tool) => tool.name)));
-			pi.sendUserMessage(
-				"Takeover enabled. Implement the task directly now with the available tools — do not delegate. Orchestration resumes automatically once this task settles.",
-				{ deliverAs: "followUp" },
-			);
-			return content(`Takeover enabled (${params.reason}). Continuing in a follow-up turn with direct implementation tools.`);
+			return content(`Direct mode enabled (${params.reason}).`);
 		},
 	});
 
@@ -1367,6 +1393,14 @@ export default function orchestrator(pi: ExtensionAPI) {
 			complexity: Type.Optional(Type.Union(TASK_COMPLEXITIES.map((value) => Type.Literal(value)))),
 			selfPlan: Type.Optional(Type.Boolean({ description: "True when this brief states a goal and leaves the approach to the worker; false when it carries a plan for the worker to execute. Set it explicitly whenever the user says in plain English who should plan. Omit to use the worker's configured default." })),
 			planOnly: Type.Optional(Type.Boolean({ description: "True when the plan itself is the deliverable: the worker investigates and reports an approach, changing nothing. Set it whenever the user asked for a plan, approach, or options without asking for the work to be done. The plan returns to you for the user to approve; implementing it is a separate delegation." })),
+			prCreationRequested: Type.Optional(Type.Boolean({ description: "Set true only when the user explicitly asked to create or update a pull request. Do not infer this from task text. A request to review a pull request does not qualify." })),
+			needsWorktree: Type.Optional(Type.Boolean({ description: "Set false only when this task does not need worktree lifecycle guidance, such as read-only research. Omit to preserve the implementation default." })),
+			needsHeavyWork: Type.Optional(Type.Boolean({ description: "Set true when the task needs heavy-command or resource guidance. Set false for concise read-only research or documentation unless heavy work is authorized and needed." })),
+			needsBrowser: Type.Optional(Type.Boolean({ description: "Set true when the worker needs browser guidance." })),
+			needsSecrets: Type.Optional(Type.Boolean({ description: "Set true only when the task needs secrets. This adds policy text only and never reads secrets." })),
+			validationCommands: Type.Optional(Type.Array(Type.String({ maxLength: 4000 }), { maxItems: 12 })),
+			knownFacts: Type.Optional(Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 12 })),
+			subscriptionSensitive: Type.Optional(Type.Boolean({ description: "Set true only when the user explicitly asks for subscription limits, quota-aware routing, or cost-effective subscription use. Do not infer it from ordinary task text. When true, prefer GPT-5.6 Luna Low or Medium for routine work, Luna High for moderate reasoning, and Luna xHigh for deep reasoning when they can avoid retries. Explicit user-selected models and advisor routing always win." })),
 			autonomousScope: Type.Optional(Type.Object({
 				capabilityId: Type.String(),
 				runId: Type.String(),
@@ -1404,12 +1438,29 @@ export default function orchestrator(pi: ExtensionAPI) {
 			const fallback = classifyTask(params.task);
 			const suppliedCategory: unknown = params.category;
 			const suppliedComplexity: unknown = params.complexity;
+			const promptCategory = typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : undefined;
+			const category = promptCategory ?? fallback.category;
+			const planOnly = params.planOnly === true;
+			// Conditional prompt policy uses explicit metadata only. The fallback classification remains stats metadata.
+			const researchLike = promptCategory === "research" || promptCategory === "documentation";
+			const needsWorktree = typeof params.needsWorktree === "boolean" ? params.needsWorktree : !planOnly && !researchLike;
+			const needsHeavyWork = typeof params.needsHeavyWork === "boolean" ? params.needsHeavyWork : !planOnly && !researchLike;
+			const needsBrowser = params.needsBrowser === true;
+			const needsSecrets = params.needsSecrets === true;
+			const validationCommands = Array.isArray(params.validationCommands) ? params.validationCommands.filter((command): command is string => typeof command === "string" && command.trim().length > 0) : undefined;
+			const knownFacts = Array.isArray(params.knownFacts) ? params.knownFacts.filter((fact): fact is string => typeof fact === "string" && fact.trim().length > 0) : undefined;
+			const policyWarnings = lintWorkerTaskPolicyDuplication(params.task);
+			const subscriptionGuidance = params.subscriptionSensitive === true ? subscriptionSensitiveWorkerSelectionGuidance(catalog) : undefined;
 			const profile = catalog[name];
 			if (!profile) return content(`Delegation rejected: ${name} is not a configured worker.`);
 			const cwd = resolve(typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : ctx.cwd);
 			let workerTask: string;
 			try {
-				workerTask = withOrchestratorDelegationContract(params.task, rootTaskId);
+				workerTask = withOrchestratorDelegationContract(params.task, rootTaskId, {
+					planOnly,
+					needsWorktree,
+					prCreationRequested: params.prCreationRequested === true,
+				});
 			} catch (error) {
 				return content(`Delegation rejected: ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -1426,11 +1477,19 @@ export default function orchestrator(pi: ExtensionAPI) {
 				worker = launchWorker(name, profile, workerTask, cwd, config, {
 					rootTaskId,
 					...(retryOf ? { retryOf } : {}),
-					category: typeof suppliedCategory === "string" && TASK_CATEGORIES.includes(suppliedCategory as TaskCategory) ? suppliedCategory as TaskCategory : fallback.category,
+					category,
+					...(promptCategory ? { promptCategory } : {}),
 					complexity: typeof suppliedComplexity === "string" && TASK_COMPLEXITIES.includes(suppliedComplexity as TaskComplexity) ? suppliedComplexity as TaskComplexity : fallback.complexity,
 					// An explicit per-task choice wins; the profile default applies only when the coordinator did not choose.
 					selfPlan: typeof params.selfPlan === "boolean" ? params.selfPlan : profile.selfPlanning === true,
-					...(params.planOnly === true ? { planOnly: true } : {}),
+					...(planOnly ? { planOnly: true } : {}),
+					needsWorktree,
+					needsHeavyWork,
+					needsBrowser,
+					needsSecrets,
+					...(params.prCreationRequested === true ? { prCreationRequested: true } : {}),
+					...(validationCommands ? { validationCommands } : {}),
+					...(knownFacts ? { knownFacts } : {}),
 				});
 			} catch (error) {
 				return content(`Delegation rejected: the worker process could not be started (${error instanceof Error ? error.message : String(error)}).`);
@@ -1448,7 +1507,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 					at: Date.now(),
 				});
 			}
-			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, { workerId: worker.id, rootTaskId: worker.rootTaskId, runId: worker.runId });
+			return content(`Started ${worker.name} as ${worker.id}. It can be steered while active; its result will return directly to you.`, {
+				workerId: worker.id,
+				rootTaskId: worker.rootTaskId,
+				runId: worker.runId,
+				...(policyWarnings.length ? { warnings: policyWarnings.map((warning) => warning.message) } : {}),
+				...(subscriptionGuidance ? { subscriptionGuidance } : {}),
+			});
 		},
 	});
 
@@ -1462,6 +1527,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 			kind: Type.Optional(Type.Union([Type.Literal("correction"), Type.Literal("continuation")])),
 			interrupt: Type.Optional(Type.Boolean({ description: "Abort the in-flight run before delivering the instructions (Pi workers only; discards the aborted run's partial result). Use only to stop active wrong-direction work, never for routine follow-ups." })),
 			planOnly: Type.Optional(Type.Boolean({ description: "Switch this live worker's mode. False authorizes it to implement the plan it reported; true stops it implementing and makes the plan the deliverable, keeping any work already on disk. Omit to leave the current mode unchanged." })),
+			prCreationRequested: Type.Optional(Type.Boolean({ description: "Set true only when this follow-up introduces an explicit user request to create or update a pull request. Do not set it for pull request review or infer it from instructions." })),
+			needsWorktree: Type.Optional(Type.Boolean({ description: "Set false only when this follow-up does not need worktree lifecycle guidance." })),
+			needsHeavyWork: Type.Optional(Type.Boolean({ description: "Set true when this follow-up needs heavy-command or resource guidance." })),
+			needsBrowser: Type.Optional(Type.Boolean({ description: "Set true when this follow-up needs browser guidance." })),
+			needsSecrets: Type.Optional(Type.Boolean({ description: "Set true only when this follow-up needs secrets. This adds policy text only and never reads secrets." })),
+			validationCommands: Type.Optional(Type.Array(Type.String({ maxLength: 4000 }), { maxItems: 12 })),
+			knownFacts: Type.Optional(Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 12 })),
 		}),
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
@@ -1517,10 +1589,22 @@ export default function orchestrator(pi: ExtensionAPI) {
 			worker.claudeAuthFailed = undefined;
 			// The launch prompt issued the opposite standing order, so a mode switch
 			// must lead the instructions rather than trail them.
-			const requestedMode = typeof params.planOnly === "boolean" ? params.planOnly : undefined;
-			const modeChanged = requestedMode !== undefined && requestedMode !== (worker.planOnly === true);
-			const instructions = modeChanged ? `${buildModeChangeDirective(requestedMode!)}\n\n${params.instructions}` : params.instructions;
-			if (modeChanged) worker.planOnly = requestedMode;
+			const policy = applyWorkerPolicyTransition(worker, {
+				...(typeof params.planOnly === "boolean" ? { planOnly: params.planOnly } : {}),
+				...(params.prCreationRequested === true ? { prCreationRequested: true } : {}),
+				...(typeof params.needsWorktree === "boolean" ? { needsWorktree: params.needsWorktree } : {}),
+				...(typeof params.needsHeavyWork === "boolean" ? { needsHeavyWork: params.needsHeavyWork } : {}),
+				...(typeof params.needsBrowser === "boolean" ? { needsBrowser: params.needsBrowser } : {}),
+				...(typeof params.needsSecrets === "boolean" ? { needsSecrets: params.needsSecrets } : {}),
+				backend: worker.profile.backend,
+			});
+			const { modeChanged, requestedMode } = policy;
+			const contextSections = buildWorkerPromptSections(params.instructions, {
+				...(Array.isArray(params.knownFacts) ? { knownFacts: params.knownFacts } : {}),
+				...(Array.isArray(params.validationCommands) ? { validationCommands: params.validationCommands } : {}),
+			});
+			const policyWarnings = lintWorkerTaskPolicyDuplication(params.instructions);
+			const instructions = [...policy.directives, ...contextSections, params.instructions].join("\n\n");
 			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: instructions });
 			if (!sendWorkerInstruction(worker, instructions, true)) {
 				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
@@ -1533,7 +1617,9 @@ export default function orchestrator(pi: ExtensionAPI) {
 			} else if (completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
 			recordWorkerSteer(worker.name, kind);
 			refreshWorkerWidget();
-			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}`);
+			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}`, {
+				...(policyWarnings.length ? { warnings: policyWarnings.map((warning) => warning.message) } : {}),
+			});
 		},
 	});
 
