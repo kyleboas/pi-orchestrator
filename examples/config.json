@@ -10,6 +10,14 @@
   },
   "checkInMinutes": 15,
   "rolloverContextPercent": 38,
+  "supervisor": {
+    "enabled": false,
+    "model": "openai-codex/gpt-5.6-sol",
+    "thinking": "medium",
+    "batchMs": 30000,
+    "timeoutMs": 60000,
+    "workers": ["Builder"]
+  },
   "workers": {
     "Builder": {
       "backend": "pi-rpc",
