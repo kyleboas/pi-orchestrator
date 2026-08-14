@@ -41,22 +41,23 @@ export function appendTranscript(
  * call with the same callId (how pi pairs them) instead of appending a row;
  * everything else appends, bounded to TRANSCRIPT_MAX_ENTRIES.
  */
-export function mergeTranscriptEntry(transcript: TranscriptEntry[], entry: TranscriptEntry): void {
+export function mergeTranscriptEntry(transcript: TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry | undefined {
 	const result = entry.tool?.result;
 	if (result && entry.tool?.callId && !entry.tool.name) {
 		for (let index = transcript.length - 1; index >= 0; index -= 1) {
 			const candidate = transcript[index]!;
 			if (candidate.tool && candidate.tool.callId === entry.tool.callId && !candidate.tool.result) {
 				candidate.tool.result = result;
-				return;
+				return candidate;
 			}
 		}
 		// No matching call (e.g. trimmed out): keep the output as plain text.
-		if (!entry.text.trim()) return;
+		if (!entry.text.trim()) return undefined;
 	}
-	if (!entry.text.trim() && !entry.tool) return;
+	if (!entry.text.trim() && !entry.tool) return undefined;
 	transcript.push(entry);
 	if (transcript.length > TRANSCRIPT_MAX_ENTRIES) transcript.splice(0, transcript.length - TRANSCRIPT_MAX_ENTRIES);
+	return entry;
 }
 
 type ContentPart = Record<string, unknown>;

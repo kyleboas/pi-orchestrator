@@ -5,6 +5,17 @@ import type { ClaudeAccountsConfig } from "./orchestrator-accounts.ts";
 import { defaultClaudeAccountStatePath } from "./orchestrator-accounts.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "./orchestrator-checkin.ts";
 import { CLAUDE_EFFORTS, PI_THINKING_LEVELS, type ClaudeEffort, type PiThinkingLevel, type WorkerProfile } from "./orchestrator-core.ts";
+import {
+	DEFAULT_SUPERVISOR_BATCH_MS,
+	DEFAULT_SUPERVISOR_MODEL,
+	DEFAULT_SUPERVISOR_THINKING,
+	DEFAULT_SUPERVISOR_TIMEOUT_MS,
+	MAX_SUPERVISOR_BATCH_MS,
+	MAX_SUPERVISOR_TIMEOUT_MS,
+	MIN_SUPERVISOR_BATCH_MS,
+	MIN_SUPERVISOR_TIMEOUT_MS,
+	type SupervisorConfig,
+} from "./orchestrator-supervisor.ts";
 
 export type CoordinatorConfig = { provider?: string; id?: string; thinking: PiThinkingLevel };
 export type OrchestratorConfig = {
@@ -19,6 +30,8 @@ export type OrchestratorConfig = {
 	rolloverContextPercent: number;
 	/** Most workers that may hold a live process at once; 0 disables the cap. */
 	maxConcurrentWorkers: number;
+	/** Optional isolated active supervision; never counted as a worker. */
+	supervisor: SupervisorConfig;
 	warning?: string;
 };
 
@@ -131,12 +144,63 @@ function maxConcurrentWorkers(value: unknown): number {
 	if (value === undefined) return DEFAULT_MAX_CONCURRENT_WORKERS;
 	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : DEFAULT_MAX_CONCURRENT_WORKERS;
 }
+
+const SUPERVISOR_NAME = /^[A-Za-z][A-Za-z0-9 .\-]{0,48}$/;
+function boundedSupervisorNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return Math.min(maximum, Math.max(minimum, Math.floor(value)));
+}
+
+function disabledSupervisor(): SupervisorConfig {
+	return {
+		enabled: false,
+		model: DEFAULT_SUPERVISOR_MODEL,
+		thinking: DEFAULT_SUPERVISOR_THINKING,
+		batchMs: DEFAULT_SUPERVISOR_BATCH_MS,
+		timeoutMs: DEFAULT_SUPERVISOR_TIMEOUT_MS,
+		workers: [],
+	};
+}
+
+function parseSupervisor(value: unknown, catalog: Record<string, WorkerProfile>): SupervisorConfig {
+	if (value === undefined) return disabledSupervisor();
+	if (!object(value)) return disabledSupervisor();
+	const enabled = value.enabled === undefined ? false : value.enabled;
+	if (typeof enabled !== "boolean") return disabledSupervisor();
+	const model = value.model === undefined ? DEFAULT_SUPERVISOR_MODEL : value.model;
+	const thinking = value.thinking === undefined ? DEFAULT_SUPERVISOR_THINKING : value.thinking;
+	const rawWorkers = value.workers;
+	if (!piModel(model) || !THINKING.has(thinking as PiThinkingLevel)) return disabledSupervisor();
+	if (model.trim() === SOL_MODEL && !SOL_THINKING.has(thinking as PiThinkingLevel)) return disabledSupervisor();
+	if ((value.batchMs !== undefined && (typeof value.batchMs !== "number" || !Number.isFinite(value.batchMs))) ||
+		(value.timeoutMs !== undefined && (typeof value.timeoutMs !== "number" || !Number.isFinite(value.timeoutMs)))) return disabledSupervisor();
+	if (rawWorkers !== undefined && (!Array.isArray(rawWorkers) || rawWorkers.length !== new Set(rawWorkers).size)) return disabledSupervisor();
+	const workers = rawWorkers === undefined ? [] : rawWorkers;
+	if (!workers.every((name): name is string => typeof name === "string" && SUPERVISOR_NAME.test(name) && Object.prototype.hasOwnProperty.call(catalog, name))) return disabledSupervisor();
+	const lower = new Set<string>();
+	for (const name of workers) {
+		if (lower.has(name.toLowerCase())) return disabledSupervisor();
+		lower.add(name.toLowerCase());
+	}
+	// Enabling supervision without an explicit, nonempty catalog allowlist is
+	// rejected. A bad supervisor section never invalidates the worker catalog.
+	if (enabled && workers.length === 0) return disabledSupervisor();
+	return {
+		enabled,
+		model: model.trim(),
+		thinking: thinking as PiThinkingLevel,
+		batchMs: boundedSupervisorNumber(value.batchMs, DEFAULT_SUPERVISOR_BATCH_MS, MIN_SUPERVISOR_BATCH_MS, MAX_SUPERVISOR_BATCH_MS),
+		timeoutMs: boundedSupervisorNumber(value.timeoutMs, DEFAULT_SUPERVISOR_TIMEOUT_MS, MIN_SUPERVISOR_TIMEOUT_MS, MAX_SUPERVISOR_TIMEOUT_MS),
+		workers: [...workers],
+	};
+}
+
 function joinWarnings(...warnings: (string | undefined)[]): string | undefined {
 	const present = warnings.filter(nonempty);
 	return present.length ? present.join(" ") : undefined;
 }
 function defaults(env: NodeJS.ProcessEnv, warning?: string): OrchestratorConfig {
-	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, maxConcurrentWorkers: DEFAULT_MAX_CONCURRENT_WORKERS, ...(warning ? { warning } : {}) };
+	return { coordinator: { thinking: "high" }, commands: { pi: command(env.PI_ORCHESTRATOR_PI_BIN, "pi"), claude: command(env.PI_ORCHESTRATOR_CLAUDE_BIN, "claude") }, workers: { ...DEFAULT_WORKERS }, checkInMinutes: DEFAULT_CHECKIN_MINUTES, rolloverContextPercent: DEFAULT_ROLLOVER_CONTEXT_PERCENT, maxConcurrentWorkers: DEFAULT_MAX_CONCURRENT_WORKERS, supervisor: disabledSupervisor(), ...(warning ? { warning } : {}) };
 }
 
 /** Load once at extension initialization. Invalid files deliberately disclose no paths or contents. */
@@ -162,6 +226,7 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 	// default catalog; only a present-but-invalid catalog rejects the file.
 	const configuredWorkers = raw.workers === undefined ? { ...DEFAULT_WORKERS } : workers(raw.workers);
 	if (!configuredWorkers) return invalid();
+	const configuredSupervisor = parseSupervisor(raw.supervisor, configuredWorkers);
 	const coordinatorRaw = raw.coordinator === undefined ? {} : raw.coordinator;
 	const coordinatorThinking = (coordinatorRaw && object(coordinatorRaw) ? coordinatorRaw.thinking : undefined) ?? "high";
 	const explicitSolCoordinator = object(coordinatorRaw) && coordinatorRaw.provider === "openai-codex" && coordinatorRaw.id === "gpt-5.6-sol";
@@ -184,6 +249,7 @@ export function loadOrchestratorConfig(env: NodeJS.ProcessEnv = process.env): Or
 		checkInMinutes: checkInMinutes(raw.checkInMinutes),
 		rolloverContextPercent: rolloverContextPercent(raw.rolloverContextPercent),
 		maxConcurrentWorkers: maxConcurrentWorkers(raw.maxConcurrentWorkers),
+		supervisor: configuredSupervisor,
 		...(raw.claudeAccounts !== undefined && claudeAccounts(raw.claudeAccounts) ? { claudeAccounts: claudeAccounts(raw.claudeAccounts) } : {}),
 	};
 }

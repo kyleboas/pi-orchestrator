@@ -108,6 +108,13 @@ import {
 import { assessWorkerCheckIn, buildCheckInDigest, deliverCheckIn, isCheckInDue, shouldWakeForCheckIn } from "./orchestrator-lib/orchestrator-checkin.ts";
 import { accumulateReportedUsage, piMessageUsage, shouldAccumulatePiUsage } from "./orchestrator-lib/orchestrator-usage.ts";
 import {
+	createActiveWorkerSupervisor,
+	isSupervisorSteerCurrent,
+	type SupervisorDecision,
+	type SupervisorSteerBinding,
+	type SupervisorWorkerView,
+} from "./orchestrator-lib/orchestrator-supervisor.ts";
+import {
 	OUTCOME_ROLLOVER_INSTRUCTIONS,
 	beginOutcomeRollover,
 	completeOutcomeRollover,
@@ -238,8 +245,12 @@ function recordBackgroundJobEvents(worker: Worker, message: unknown): void {
 }
 
 function recordWorkerActivity(worker: Worker, entry: TranscriptEntry): void {
-	mergeTranscriptEntry(worker.transcript ??= [], entry);
+	const stored = mergeTranscriptEntry(worker.transcript ??= [], entry);
 	worker.transcriptRevision = (worker.transcriptRevision ?? 0) + 1;
+	// Supervision sees the canonical post-merge semantic entry. In particular,
+	// a tool result updates the original call rather than creating a duplicate
+	// wakeup. The supervisor has no ExtensionAPI and cannot deliver to Sol.
+	if (stored) getOrchestratorRuntime().supervisor?.observe(worker, stored);
 	// The row timer shows time since the worker was last instructed (delegate
 	// or steer), so only user entries reset it — worker output does not.
 	if (entry.role === "user") {
@@ -291,6 +302,7 @@ function recordRunOutcome(worker: Worker, status: WorkerRunStatus): void {
 
 function failWorker(worker: Worker, message: string, status: WorkerRunStatus = "failed"): void {
 	if (worker.state === "stopped" || worker.state === "failed") return;
+	getOrchestratorRuntime().supervisor?.stop(worker.id, worker.run);
 	clearBackgroundJobs(worker);
 	worker.backgroundSettlementHeldRun = undefined;
 	worker.state = "failed";
@@ -442,6 +454,7 @@ function holdClaudeMergeVerdict(worker: Worker, settlement: ClaudeResultSettleme
 
 /** Settle or fail the worker on a result that owns the last outstanding turn. */
 function applyClaudeSettlement(worker: Worker, settlement: ClaudeResultSettlement): void {
+	getOrchestratorRuntime().supervisor?.settle(worker.id, worker.run);
 	const run = beginWorkerSettlement(worker);
 	if (run === undefined) return;
 	// Some Claude Code result events omit result even though the last assistant
@@ -550,6 +563,7 @@ function handleRpcLine(worker: Worker, line: string): void {
 		}
 		case "agent_end":
 		case "agent_settled":
+			getOrchestratorRuntime().supervisor?.settle(worker.id, worker.run);
 			// Pi 0.80.x emits agent_end; agent_settled remains accepted for
 			// compatibility with runtimes that expose the later idle boundary.
 			// An initial completion is deliberately held while a worker-owned
@@ -745,6 +759,8 @@ function failoverClaudeWorker(worker: Worker, config: OrchestratorConfig, reason
 	if (!pick) return false;
 	// killWorkerProcessTree tolerates an already-gone limited process.
 	killWorkerProcessTree(worker.process);
+	// The old result belongs to an account transition, not the resumed run.
+	getOrchestratorRuntime().supervisor?.runChanged(worker.id, worker.run);
 	let child: Worker["process"];
 	try {
 		child = spawnClaudeChild(worker.profile, worker.cwd, config, pick.configDir, worker.claudeSessionId);
@@ -886,6 +902,123 @@ export default function orchestrator(pi: ExtensionAPI) {
 	let stopWorkerWidgetTimer = () => {};
 	let takeoverReason = "explicit user request";
 	const solToolMode = new SolToolMode();
+
+	type SteerSource = "manual" | "automatic";
+	type SteerOutcome = { accepted: boolean; message: string; rejected?: boolean };
+	type ExpectedAutomaticSteer = SupervisorSteerBinding;
+	const automaticSteerGenerations = new Map<string, number>();
+
+	function invalidateAutomaticSteer(workerId: string): void {
+		automaticSteerGenerations.set(workerId, (automaticSteerGenerations.get(workerId) ?? 0) + 1);
+	}
+
+	function automaticSteerIsCurrent(worker: Worker, expected: ExpectedAutomaticSteer | undefined, run = expected?.run): boolean {
+		if (!expected) return true;
+		const current = runtime.workers.get(expected.id);
+		return current === worker && isSupervisorSteerCurrent(expected, worker, automaticSteerGenerations.get(worker.id) ?? 0, () => canSteerWorker(worker, worker.process), run);
+	}
+
+	/**
+	 * One shared steer path. Manual and isolated automatic corrections use the
+	 * same generation, correction budget, interrupt, transcript, and ledger
+	 * rules; automatic rejection is deliberately silent to the coordinator.
+	 */
+	async function steerWorker(worker: Worker, instructions: string, kind: "correction" | "continuation", interrupt: boolean, planOnly: boolean | undefined, source: SteerSource, expected?: ExpectedAutomaticSteer): Promise<SteerOutcome> {
+		if (source === "manual") {
+			invalidateAutomaticSteer(worker.id);
+			runtime.supervisor?.manualSteer(worker.id, worker.run);
+		}
+		if (!automaticSteerIsCurrent(worker, expected)) return { accepted: false, message: "" };
+		if (!canSteerWorker(worker, worker.process)) return { accepted: false, message: `${worker.id} is not live or is still settling (state: ${worker.state}).` };
+		if (kind === "correction" && !rootCorrectionAvailable(worker.rootTaskId)) {
+			return { accepted: false, rejected: true, message: `Correction not sent for ${worker.id}: the root task's one correction has already been used. Delegate one concrete retry with retryOf ${worker.id}.` };
+		}
+		const completedAttempt = worker.state === "idle" && worker.reportedRun === worker.run;
+		const correctionBudgetKey = `${worker.id}:${worker.rootTaskId}`;
+		if (kind === "correction" && completedAttempt && (correctionSteerCounts.get(correctionBudgetKey) ?? 0) >= 1) {
+			return { accepted: false, message: `Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.id}, or report/ask about the blocker.` };
+		}
+		let interruptNote = "";
+		if (interrupt) {
+			if (worker.profile.backend === "pi-rpc" && shouldAbortPiWorkerRun(worker)) {
+				worker.interruptedRun = worker.run;
+				const aborted = await Promise.race([
+					requestWorkerRpc(worker, { type: "abort" }).then(() => true, () => false),
+					new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 10_000)),
+				]);
+				if (!automaticSteerIsCurrent(worker, expected)) {
+					if (!expected || worker.run === expected.run) worker.interruptedRun = undefined;
+					return { accepted: false, message: "" };
+				}
+				for (let i = 0; i < 20 && worker.interruptedRun === worker.run; i++) {
+					await new Promise((resolve) => setTimeout(resolve, 100));
+					if (!automaticSteerIsCurrent(worker, expected)) {
+						if (!expected || worker.run === expected.run) worker.interruptedRun = undefined;
+						return { accepted: false, message: "" };
+					}
+				}
+				worker.interruptedRun = undefined;
+				interruptNote = aborted ? " Its in-flight run was aborted first; the partial result was discarded." : " The abort did not confirm in time; the instructions were delivered anyway.";
+			} else if (worker.profile.backend === "pi-rpc") {
+				interruptNote = " Its prior turn had already settled while waiting for a background job, so no abort was sent.";
+			} else if (worker.profile.backend === "claude-code") {
+				interruptNote = " Claude workers cannot be aborted mid-turn; the instructions are queued for the next turn boundary.";
+			}
+		}
+		if (!automaticSteerIsCurrent(worker, expected)) return { accepted: false, message: "" };
+		if (worker.state === "idle" && worker.reportedRun === worker.run) updateWorkerRunStatus(worker.runId, kind === "correction" ? "rework" : "accepted", undefined, "completed");
+		const previousRun = worker.run;
+		beginWorkerRun(worker);
+		runtime.supervisor?.runChanged(worker.id, previousRun);
+		worker.runId = `${worker.id}:run-${worker.run}`;
+		worker.lastResult = undefined;
+		worker.lastError = undefined;
+		worker.claudeAuthFailed = undefined;
+		const requestedMode = planOnly;
+		const modeChanged = requestedMode !== undefined && requestedMode !== (worker.planOnly === true);
+		const finalInstructions = modeChanged ? `${buildModeChangeDirective(requestedMode!)}\n\n${instructions}` : instructions;
+		if (modeChanged) worker.planOnly = requestedMode;
+		if (!automaticSteerIsCurrent(worker, expected, expected ? expected.run + 1 : undefined)) return { accepted: false, message: "" };
+		recordWorkerActivity(worker, { at: Date.now(), role: "user", text: finalInstructions });
+		if (!canSteerWorker(worker, worker.process)) return { accepted: false, message: "" };
+		if (!sendWorkerInstruction(worker, finalInstructions, true)) {
+			failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
+			return { accepted: false, message: `${worker.id} could not accept follow-up instructions.` };
+		}
+		if (kind === "correction") {
+			consumeRootCorrection(worker.rootTaskId);
+			if (completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
+		} else if (completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
+		recordWorkerSteer(worker.name, kind);
+		refreshWorkerWidget();
+		const modeNote = modeChanged ? ` It switched to ${requestedMode ? "planning only, keeping any work already on disk" : "implementing"}.` : "";
+		return { accepted: true, message: `Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}` };
+	}
+
+	const supervisor = createActiveWorkerSupervisor({
+		config: config.supervisor,
+		command: config.commands.pi,
+		env: process.env,
+		isLive: (candidate) => {
+			const worker = runtime.workers.get(candidate.id);
+			return !!worker && worker.name === candidate.name && worker.run === candidate.run && canSteerWorker(worker, worker.process);
+		},
+		onDecision: async (candidate: SupervisorWorkerView, decision: Extract<SupervisorDecision, { action: "steer" }>) => {
+			const worker = runtime.workers.get(candidate.id);
+			if (!worker || worker.name !== candidate.name || worker.run !== candidate.run || !config.supervisor.workers.includes(worker.name) || !canSteerWorker(worker, worker.process)) return;
+			// Automatic supervision is correction-only and never reports its
+			// decision. Bind the decision to the exact reviewed worker generation;
+			// manual steering and stopping invalidate it before it can write.
+			const expected: ExpectedAutomaticSteer = {
+				id: candidate.id,
+				name: candidate.name,
+				run: candidate.run,
+				generation: automaticSteerGenerations.get(candidate.id) ?? 0,
+			};
+			await steerWorker(worker, decision.instructions, "correction", decision.interrupt, undefined, "automatic", expected);
+		},
+	});
+	runtime.supervisor = supervisor;
 
 	const activate = async (ctx: { modelRegistry: { find(provider: string, id: string): unknown }; cwd: string }) => {
 		if (config.coordinator.provider && config.coordinator.id) {
@@ -1466,74 +1599,13 @@ export default function orchestrator(pi: ExtensionAPI) {
 		execute: async (_toolCallId, params) => {
 			const worker = runtime.workers.get(params.workerId);
 			if (!worker) return content(`No worker exists with ID ${params.workerId}.`);
-			if (!canSteerWorker(worker, worker.process)) {
-				return content(`${worker.id} is not live or is still settling (state: ${worker.state}).`);
-			}
 			const kind = params.kind === "continuation" ? "continuation" : "correction";
-			if (kind === "correction" && !rootCorrectionAvailable(worker.rootTaskId)) {
-				return content(`Correction not sent for ${worker.id}: the root task's one correction has already been used. Delegate one concrete retry with retryOf ${worker.id}.`, { rejected: true, rootTaskId: worker.rootTaskId });
-			}
-			const completedAttempt = worker.state === "idle" && worker.reportedRun === worker.run;
-			const correctionBudgetKey = `${worker.id}:${worker.rootTaskId}`;
-			if (kind === "correction" && completedAttempt && (correctionSteerCounts.get(correctionBudgetKey) ?? 0) >= 1) {
-				return content(`Correction not sent for ${worker.id}: its one silent correction steer for this failed attempt already failed. Delegate one concrete retry with retryOf ${worker.id}, or report/ask about the blocker.`);
-			}
-			let interruptNote = "";
-			if (params.interrupt === true) {
-				if (worker.profile.backend === "pi-rpc" && shouldAbortPiWorkerRun(worker)) {
-					// Flag before aborting: the aborted run's agent_settled must be
-					// swallowed (see handleRpcLine) rather than reported as a result.
-					worker.interruptedRun = worker.run;
-					const aborted = await Promise.race([
-						requestWorkerRpc(worker, { type: "abort" }).then(() => true, () => false),
-						new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 10_000)),
-					]);
-					// The settled event normally precedes the abort response on the
-					// pipe, but wait briefly for the flag to be consumed so a late
-					// settlement cannot land in the new generation below.
-					for (let i = 0; i < 20 && worker.interruptedRun === worker.run; i++) await new Promise((resolve) => setTimeout(resolve, 100));
-					worker.interruptedRun = undefined;
-					interruptNote = aborted
-						? " Its in-flight run was aborted first; the partial result was discarded."
-						: " The abort did not confirm in time; the instructions were delivered anyway.";
-				} else if (worker.profile.backend === "pi-rpc") {
-					interruptNote = " Its prior turn had already settled while waiting for a background job, so no abort was sent.";
-				} else if (worker.profile.backend === "claude-code") {
-					interruptNote = " Claude workers cannot be aborted mid-turn; the instructions are queued for the next turn boundary.";
-				}
-			}
-			// Resolve a completed reported attempt before creating the next unique
-			// attempt ID. An active run has no completion to relabel yet.
-			if (worker.state === "idle" && worker.reportedRun === worker.run) {
-				updateWorkerRunStatus(worker.runId, kind === "correction" ? "rework" : "accepted", undefined, "completed");
-			}
-			// A stream-json Claude turn (and a Pi RPC steer) belongs to a new
-			// lifecycle generation before it is written, so a late prior result
-			// cannot settle or report this follow-up.
-			beginWorkerRun(worker);
-			worker.runId = `${worker.id}:run-${worker.run}`;
-			worker.lastResult = undefined;
-			worker.lastError = undefined;
-			worker.claudeAuthFailed = undefined;
-			// The launch prompt issued the opposite standing order, so a mode switch
-			// must lead the instructions rather than trail them.
-			const requestedMode = typeof params.planOnly === "boolean" ? params.planOnly : undefined;
-			const modeChanged = requestedMode !== undefined && requestedMode !== (worker.planOnly === true);
-			const instructions = modeChanged ? `${buildModeChangeDirective(requestedMode!)}\n\n${params.instructions}` : params.instructions;
-			if (modeChanged) worker.planOnly = requestedMode;
-			recordWorkerActivity(worker, { at: Date.now(), role: "user", text: instructions });
-			if (!sendWorkerInstruction(worker, instructions, true)) {
-				failWorker(worker, "Worker stdin failed while sending follow-up instructions.", "unavailable");
-				return content(`${worker.id} could not accept follow-up instructions.`);
-			}
-			const modeNote = modeChanged ? ` It switched to ${requestedMode ? "planning only, keeping any work already on disk" : "implementing"}.` : "";
-			if (kind === "correction") {
-				consumeRootCorrection(worker.rootTaskId);
-				if (completedAttempt) correctionSteerCounts.set(correctionBudgetKey, (correctionSteerCounts.get(correctionBudgetKey) ?? 0) + 1);
-			} else if (completedAttempt) correctionSteerCounts.delete(correctionBudgetKey);
-			recordWorkerSteer(worker.name, kind);
-			refreshWorkerWidget();
-			return content(`Sent ${kind} follow-up instructions to ${worker.id}.${interruptNote}${modeNote}`);
+			const outcome = await steerWorker(worker, params.instructions, kind, params.interrupt === true, typeof params.planOnly === "boolean" ? params.planOnly : undefined, "manual");
+			return content(outcome.message, {
+				...(outcome.rejected ? { rejected: true } : {}),
+				...(kind === "correction" ? { rootTaskId: worker.rootTaskId } : {}),
+			});
+
 		},
 	});
 

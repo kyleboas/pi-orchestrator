@@ -2,6 +2,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { WorkerProfile } from "./orchestrator-core.ts";
 import type { TranscriptEntry } from "./orchestrator-transcript.ts";
+import type { SupervisorLifecycle } from "./orchestrator-supervisor.ts";
 import { stopWorker, type WorkerLifecycle } from "./worker-lifecycle.ts";
 
 /** Process-wide key: extension modules are replaced by /reload, globalThis is not. */
@@ -88,6 +89,8 @@ export function isWorkerProcessLive(child: Pick<OrchestratorWorker["process"], "
 
 /** Keep lifecycle invalidation and process-tree termination as one operation. */
 export function stopWorkerProcess(worker: OrchestratorWorker): void {
+	const runtime = getOrchestratorRuntime();
+	runtime.supervisor?.stop(worker.id, worker.run);
 	stopWorker(worker);
 	if (isWorkerProcessLive(worker.process)) killWorkerProcessTree(worker.process);
 }
@@ -117,6 +120,8 @@ export type OrchestratorRuntime = {
 	workerStatusRevision: number;
 	rolloverInFlight?: number;
 	rolloverCompletedVersion?: number;
+	/** Isolated active supervisor owned by the current extension generation. */
+	supervisor?: SupervisorLifecycle;
 };
 
 function createRuntime(): OrchestratorRuntime {
@@ -166,6 +171,8 @@ export function disposeOrchestratorCheckInTimer(runtime: OrchestratorRuntime): v
 export function bindOrchestratorApi(runtime: OrchestratorRuntime, api: ExtensionAPI): symbol {
 	disposeCurrentUi(runtime);
 	disposeOrchestratorCheckInTimer(runtime);
+	runtime.supervisor?.dispose();
+	runtime.supervisor = undefined;
 	const generation = Symbol("orchestrator-extension-generation");
 	runtime.generation = generation;
 	runtime.api = api;
@@ -201,6 +208,8 @@ export function bindOrchestratorSession(
 export function releaseOrchestratorSession(runtime: OrchestratorRuntime, generation: symbol): boolean {
 	if (runtime.generation !== generation) return false;
 	disposeCurrentUi(runtime);
+	runtime.supervisor?.dispose();
+	runtime.supervisor = undefined;
 	disposeOrchestratorCheckInTimer(runtime);
 	runtime.api = undefined;
 	runtime.onStateChange = undefined;
@@ -302,7 +311,9 @@ export function ensureOrchestratorExitHook(
 	runtime.exitHookInstalled = true;
 	register("exit", () => {
 		// /reload retains this process and runtime; only an actual process exit
-		// invokes this hook, at which point no worker child may be left behind.
+		// invokes this hook, at which point no worker or supervisor child may be left behind.
+		runtime.supervisor?.dispose();
+		runtime.supervisor = undefined;
 		for (const worker of runtime.workers.values()) {
 			if (isWorkerProcessLive(worker.process)) killWorkerProcessTree(worker.process);
 		}

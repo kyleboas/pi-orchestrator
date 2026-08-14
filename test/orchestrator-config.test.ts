@@ -6,6 +6,7 @@ import test from "node:test";
 import { DEFAULT_MAX_CONCURRENT_WORKERS, DEFAULT_ROLLOVER_CONTEXT_PERCENT, DEFAULT_WORKERS, loadOrchestratorConfig } from "../extensions/orchestrator-lib/orchestrator-config.ts";
 import { DEFAULT_CHECKIN_MINUTES } from "../extensions/orchestrator-lib/orchestrator-checkin.ts";
 import { BACKGROUND_JOB_WORKER_EXTENSION_PATH, catalogText, piRpcWorkerArgs, workerDescription, workerNames } from "../extensions/orchestrator-lib/orchestrator-core.ts";
+import { DEFAULT_SUPERVISOR_BATCH_MS, DEFAULT_SUPERVISOR_MODEL, DEFAULT_SUPERVISOR_TIMEOUT_MS, MAX_SUPERVISOR_BATCH_MS, MAX_SUPERVISOR_TIMEOUT_MS, MIN_SUPERVISOR_BATCH_MS, MIN_SUPERVISOR_TIMEOUT_MS } from "../extensions/orchestrator-lib/orchestrator-supervisor.ts";
 import { claudeCodeArgs } from "../extensions/orchestrator-lib/orchestrator-claude.ts";
 import { coordinatorInstructions, createWorkerSchema } from "../extensions/orchestrator.ts";
 
@@ -118,5 +119,36 @@ test("worker descriptions are accepted, sanitized, and surfaced", () => {
 	const file = configFile({ workers: { Builder: { backend: "pi-rpc", model: "p/m", thinking: "low", description: "Line one\nline two\t end  " } } });
 	const config = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
 	assert.equal(config.workers.Builder!.description, "Line one line two end");
+});
+
+test("active supervision is opt-in with safe defaults and a validated allowlist", () => {
+	const absent = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: join(tmpdir(), "missing-supervisor") });
+	assert.equal(absent.supervisor.enabled, false);
+	assert.equal(absent.supervisor.model, DEFAULT_SUPERVISOR_MODEL);
+	assert.equal(absent.supervisor.batchMs, DEFAULT_SUPERVISOR_BATCH_MS);
+	assert.equal(absent.supervisor.timeoutMs, DEFAULT_SUPERVISOR_TIMEOUT_MS);
+	const file = configFile({ workers: { Builder: { backend: "pi-rpc", model: "p/m", thinking: "low" } }, supervisor: { enabled: true, workers: ["Builder"], batchMs: -1, timeoutMs: Number.MAX_SAFE_INTEGER } });
+	try {
+		const configured = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: file });
+		assert.deepEqual(configured.supervisor.workers, ["Builder"]);
+		assert.equal(configured.supervisor.enabled, true);
+		assert.equal(configured.supervisor.batchMs, MIN_SUPERVISOR_BATCH_MS);
+		assert.equal(configured.supervisor.timeoutMs, MAX_SUPERVISOR_TIMEOUT_MS);
+	} finally { remove(file); }
+	for (const supervisor of [
+		{ enabled: true, workers: ["Missing"] },
+		{ enabled: true, workers: [] },
+		{ enabled: true, workers: ["Builder"], model: "bad" },
+		{ enabled: true, workers: ["Builder"], batchMs: "30" },
+	]) {
+		const invalid = configFile({ workers: { Builder: { backend: "pi-rpc", model: "p/m", thinking: "low" } }, supervisor });
+		try {
+			const parsed = loadOrchestratorConfig({ PI_ORCHESTRATOR_CONFIG: invalid });
+			assert.deepEqual(workerNames(parsed.workers), ["Builder"], "catalog remains valid when supervision is invalid");
+			assert.equal(parsed.supervisor.enabled, false);
+		} finally { remove(invalid); }
+	}
+	assert.ok(MIN_SUPERVISOR_BATCH_MS < MAX_SUPERVISOR_BATCH_MS);
+	assert.ok(MIN_SUPERVISOR_TIMEOUT_MS < MAX_SUPERVISOR_TIMEOUT_MS);
 });
 
