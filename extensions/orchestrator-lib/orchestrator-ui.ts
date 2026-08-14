@@ -100,28 +100,13 @@ function glyphFor(state: WorkerPanelState): string {
 	}
 }
 
-function formatEstimate(ms: number): string {
-	const seconds = Math.round(ms / 1_000);
-	return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
-}
-
 /**
- * Space-separated glanceable fields: `23m ~20m`. Elapsed and the estimate
- * measure the same thing — time since the last instruction — because the
- * ledger records run durations from that same anchor, so an overrun reads
- * honestly. A trailing asterisk marks a p50 drawn from a widened class.
- *
  * Token totals are deliberately absent: providers report usage only at the end
  * of a turn, so a live row could show nothing at all for a single-turn run and
  * a stale carried-over total for the rest.
  */
 function statusFor(worker: WorkerPanelItem, now: number): string {
 	const fields = [elapsed(worker, now)];
-	const estimate = worker.estimateMs;
-	const live = worker.state === "starting" || worker.state === "working";
-	if (live && estimate !== undefined && Number.isFinite(estimate) && estimate > 0) {
-		fields.push(`~${formatEstimate(estimate)}${worker.estimateWidened ? "*" : ""}`);
-	}
 	if (worker.state === "failed") fields.push("failed");
 	else if (worker.state === "stopped") fields.push("stopped");
 	return fields.join(" ");

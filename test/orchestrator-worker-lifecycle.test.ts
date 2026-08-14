@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { applyWorkerPolicyTransition, type WorkerPolicyState } from "../extensions/orchestrator-lib/orchestrator-core.ts";
 import {
 	beginWorkerRun,
 	completeClaudeTurn,
@@ -24,6 +25,29 @@ function worker(overrides: Partial<WorkerLifecycle> = {}): WorkerLifecycle {
 function process(overrides: Partial<WorkerProcessState> = {}): WorkerProcessState {
 	return { exitCode: null, signalCode: null, killed: false, stdin: { writable: true }, ...overrides };
 }
+
+test("planning-to-PR implementation adds each newly required policy once", () => {
+	const state: WorkerPolicyState = { planOnly: true };
+	const first = applyWorkerPolicyTransition(state, { planOnly: false, prCreationRequested: true });
+	assert.equal(first.directives.filter((text) => text.includes("Worktree lifecycle contract")).length, 1);
+	assert.equal(first.directives.filter((text) => text.includes("newly pushed commit representing the final PR contents")).length, 1);
+	assert.equal(state.planOnly, false);
+	assert.equal(state.prCreationRequested, true);
+
+	const repeated = applyWorkerPolicyTransition(state, { planOnly: false, prCreationRequested: true });
+	assert.deepEqual(repeated.directives, []);
+});
+
+test("a later explicit PR intent adds PR guidance once without repeating worktree rules", () => {
+	const state: WorkerPolicyState = { planOnly: false, implementationPolicySent: true };
+	const review = applyWorkerPolicyTransition(state, {});
+	assert.deepEqual(review.directives, []);
+	const create = applyWorkerPolicyTransition(state, { prCreationRequested: true });
+	assert.equal(create.directives.length, 1);
+	assert.match(create.directives[0]!, /newly pushed commit representing the final PR contents/);
+	assert.doesNotMatch(create.directives[0]!, /Worktree lifecycle contract/);
+	assert.deepEqual(applyWorkerPolicyTransition(state, { prCreationRequested: true }).directives, []);
+});
 
 test("settlement retrieves the authoritative final text when message events had none", () => {
 	assert.equal(selectFinalWorkerText(undefined, " Luna final report "), "Luna final report");
